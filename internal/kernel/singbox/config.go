@@ -11,6 +11,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/panel"
+	"github.com/go-viper/mapstructure/v2"
 )
 
 // M is a shorthand for building JSON-like maps
@@ -678,47 +679,64 @@ func buildTLSConfig(nc *panel.NodeConfig, certFile, keyFile string) M {
 
 func buildRealityConfig(nc *panel.NodeConfig) M {
 	tls := M{"enabled": true}
-
 	if nc.TLSSettings == nil {
 		return tls
 	}
 
 	reality := M{"enabled": true}
-
-	if pk, ok := nc.TLSSettings["private_key"]; ok {
-		reality["private_key"] = pk
+	var settings struct {
+		PrivateKey string `mapstructure:"private_key"`
+		ShortID    any    `mapstructure:"short_id"`
+		Dest       string `mapstructure:"dest"`
+		ServerName string `mapstructure:"server_name"`
+		ServerPort int    `mapstructure:"server_port"`
 	}
-	if sid, ok := nc.TLSSettings["short_id"]; ok {
-		switch v := sid.(type) {
-		case string:
-			reality["short_id"] = []string{v}
-		case []interface{}:
-			reality["short_id"] = v
+
+	decoderConfig := &mapstructure.DecoderConfig{
+		Metadata:         nil,
+		Result:           &settings,
+		WeaklyTypedInput: true,
+	}
+	decoder, _ := mapstructure.NewDecoder(decoderConfig)
+	_ = decoder.Decode(nc.TLSSettings)
+
+	if settings.PrivateKey != "" {
+		reality["private_key"] = settings.PrivateKey
+	}
+
+	switch v := settings.ShortID.(type) {
+	case string:
+		reality["short_id"] = []string{v}
+	case []any:
+		ids := make([]string, 0, len(v))
+		for _, item := range v {
+			ids = append(ids, fmt.Sprintf("%v", item))
 		}
+		reality["short_id"] = ids
+	case []string:
+		reality["short_id"] = v
 	}
 
-	handshake := M{}
-	if dest, ok := nc.TLSSettings["dest"]; ok {
-		destStr := fmt.Sprintf("%v", dest)
-		parts := strings.SplitN(destStr, ":", 2)
-		handshake["server"] = parts[0]
-		if len(parts) == 2 {
-			if port, err := strconv.Atoi(parts[1]); err == nil {
-				handshake["server_port"] = port
+	dest := settings.Dest
+	if dest == "" {
+		dest = settings.ServerName
+	}
+
+	if dest != "" {
+		handshake := M{"server": dest, "server_port": 443}
+		if parts := strings.SplitN(dest, ":", 2); len(parts) == 2 {
+			handshake["server"] = parts[0]
+			if p, err := strconv.Atoi(parts[1]); err == nil {
+				handshake["server_port"] = p
 			}
-		} else {
-			handshake["server_port"] = 443
+		} else if settings.ServerPort > 0 {
+			handshake["server_port"] = settings.ServerPort
 		}
-	}
-	if sn, ok := nc.TLSSettings["server_name"]; ok {
-		handshake["server"] = sn
-		if _, exists := handshake["server_port"]; !exists {
-			handshake["server_port"] = 443
-		}
+		reality["handshake"] = handshake
 	}
 
-	if len(handshake) > 0 {
-		reality["handshake"] = handshake
+	if settings.ServerName != "" {
+		tls["server_name"] = settings.ServerName
 	}
 
 	tls["reality"] = reality

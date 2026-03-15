@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/config"
-	"github.com/mitchellh/mapstructure"
+	"github.com/go-viper/mapstructure/v2"
 )
 
 // Client communicates with the Xboard panel API

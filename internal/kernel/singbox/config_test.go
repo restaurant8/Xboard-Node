@@ -217,9 +217,8 @@ func TestBuildInbound_VLESS_Reality_ShortIDArray(t *testing.T) {
 		},
 	}
 	inbound := buildInbound(nc, testUsers, "", "")
-	tls := inbound["tls"].(M)
-	reality := tls["reality"].(M)
-	ids := reality["short_id"].([]interface{})
+	reality := inbound["tls"].(M)["reality"].(M)
+	ids := reality["short_id"].([]string)
 	if len(ids) != 2 {
 		t.Errorf("short_id: got %d entries, want 2", len(ids))
 	}
