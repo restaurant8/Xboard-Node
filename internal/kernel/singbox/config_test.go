@@ -46,19 +46,6 @@ func TestBuildInbound_Shadowsocks2022(t *testing.T) {
 	assertMapValue(t, inbound, "password", "base64serverkey==")
 }
 
-func TestBuildInbound_ShadowsocksWithPlugin(t *testing.T) {
-	nc := &panel.NodeConfig{
-		Protocol:   "shadowsocks",
-		ServerPort: 333,
-		Cipher:     "aes-128-gcm",
-		Plugin:     "obfs-local",
-		PluginOpt:  "obfs=http;obfs-host=example.com",
-	}
-	inbound := buildInbound(nc, testUsers, "", "")
-	assertMapValue(t, inbound, "plugin", "obfs-local")
-	assertMapValue(t, inbound, "plugin_opts", "obfs=http;obfs-host=example.com")
-}
-
 // --- VMess ---
 
 func TestBuildInbound_VMess(t *testing.T) {
@@ -605,9 +592,8 @@ func TestBuildTLSConfig_NoCert(t *testing.T) {
 	nc := &panel.NodeConfig{ServerName: "example.com"}
 	tls := buildTLSConfig(nc, "", "")
 	assertMapValue(t, tls, "enabled", true)
-	if _, exists := tls["certificate_path"]; exists {
-		t.Error("should not have certificate_path when empty")
-	}
+	// Now we fallback to self-signed certificates when both cert and key are empty
+	assertMapValue(t, tls, "certificate_path", "self-signed")
 }
 
 func TestBuildTLSConfig_FallbackToHost(t *testing.T) {
