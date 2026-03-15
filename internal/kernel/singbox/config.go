@@ -17,18 +17,30 @@ import (
 type M = map[string]interface{}
 
 func buildConfig(kcfg config.KernelConfig, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
-	outbounds := []M{
-		{"type": "direct", "tag": "direct"},
-		{"type": "block", "tag": "block"},
-	}
+	var outbounds []M
+	tags := make(map[string]bool)
 
 	// Panel-defined custom outbounds (structured, converted to sing-box native)
 	for _, co := range nc.CustomOutbounds {
 		outbounds = append(outbounds, outboundConfigToSingbox(co))
+		tags[strings.ToLower(co.Tag)] = true
 	}
-	// Static outbounds from local config file (already kernel-native format)
+
+	// Static outbounds from local config file
 	for _, co := range kcfg.CustomOutbound {
+		tag, _ := co["tag"].(string)
+		if tag != "" {
+			tags[strings.ToLower(tag)] = true
+		}
 		outbounds = append(outbounds, M(co))
+	}
+
+	// Add default outbounds only if not already defined
+	if !tags["direct"] {
+		outbounds = append([]M{{"type": "direct", "tag": "direct"}}, outbounds...)
+	}
+	if !tags["block"] {
+		outbounds = append(outbounds, M{"type": "block", "tag": "block"})
 	}
 
 	cfg := M{
@@ -361,19 +373,7 @@ func buildShadowsocks(base M, nc *panel.NodeConfig, users []panel.User) M {
 	base["users"] = userList
 
 	if nc.Plugin != "" {
-		base["plugin"] = nc.Plugin
-		if nc.PluginOpt != "" {
-			opts := M{}
-			for _, part := range strings.Split(nc.PluginOpt, ";") {
-				kv := strings.SplitN(part, "=", 2)
-				if len(kv) == 2 {
-					opts[kv[0]] = kv[1]
-				} else {
-					opts[kv[0]] = true
-				}
-			}
-			base["plugin_opts"] = opts
-		}
+		slog.Warn("sing-box shadowsocks inbound does not support plugin, ignoring", "plugin", nc.Plugin)
 	}
 
 	return base

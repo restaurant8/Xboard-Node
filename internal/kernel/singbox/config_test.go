@@ -469,6 +469,55 @@ func TestBuildConfig(t *testing.T) {
 	assertMapValue(t, inbounds[0], "type", "shadowsocks")
 }
 
+func TestBuildConfig_OutboundPriority(t *testing.T) {
+	kcfg := config.KernelConfig{
+		LogLevel: "info",
+		CustomOutbound: []map[string]any{
+			{"tag": "block", "type": "dns"}, // Local static override
+		},
+	}
+	nc := &panel.NodeConfig{
+		Protocol:   "shadowsocks",
+		ServerPort: 111,
+		Cipher:     "aes-128-gcm",
+		CustomOutbounds: []panel.OutboundConfig{
+			{Tag: "direct", Protocol: "socks", Settings: map[string]any{"address": "1.2.3.4"}}, // Panel override
+		},
+	}
+
+	cfg := buildConfig(kcfg, nc, testUsers, "", "")
+	outbounds := cfg["outbounds"].([]M)
+
+	// We have 2 overrides in input, so we should have exactly 2 outbounds total
+	// (no auto-generated defaults for these tags)
+	if len(outbounds) != 2 {
+		t.Errorf("outbounds: got %d, want 2", len(outbounds))
+	}
+
+	foundDirect := false
+	foundBlock := false
+
+	for _, o := range outbounds {
+		tag := o["tag"].(string)
+		if tag == "direct" {
+			foundDirect = true
+			if o["type"] != "socks" {
+				t.Errorf("expected 'direct' outbound to be type 'socks' (panel priority), got %v", o["type"])
+			}
+		}
+		if tag == "block" {
+			foundBlock = true
+			if o["type"] != "dns" {
+				t.Errorf("expected 'block' outbound to be type 'dns' (static config priority), got %v", o["type"])
+			}
+		}
+	}
+
+	if !foundDirect || !foundBlock {
+		t.Errorf("missing outbounds: direct=%v, block=%v", foundDirect, foundBlock)
+	}
+}
+
 func TestBuildConfig_AllProtocols_ValidJSON(t *testing.T) {
 	protocols := []struct {
 		name string

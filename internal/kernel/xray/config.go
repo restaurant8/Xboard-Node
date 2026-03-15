@@ -14,18 +14,31 @@ import (
 type M = map[string]interface{}
 
 func buildConfig(kcfg config.KernelConfig, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
-	outbounds := []M{
-		{"protocol": "freedom", "tag": "direct"},
-		{"protocol": "blackhole", "tag": "block"},
-	}
+	var outbounds []M
+	tags := make(map[string]bool)
 
 	// Panel-defined custom outbounds (structured, converted to Xray native)
 	for _, co := range nc.CustomOutbounds {
 		outbounds = append(outbounds, outboundConfigToXray(co))
+		tags[strings.ToLower(co.Tag)] = true
 	}
-	// Static outbounds from local config file (already kernel-native format)
+
+	// Static outbounds from local config file
 	for _, co := range kcfg.CustomOutbound {
+		tag, _ := co["tag"].(string)
+		if tag != "" {
+			tags[strings.ToLower(tag)] = true
+		}
 		outbounds = append(outbounds, M(co))
+	}
+
+	// Add default outbounds only if not already defined (Issue #1: Panel priority)
+	if !tags["direct"] {
+		outbounds = append([]M{{"protocol": "freedom", "tag": "direct"}}, outbounds...)
+	}
+	if !tags["block"] {
+		// block is often added after direct but before others for safety
+		outbounds = append(outbounds, M{"protocol": "blackhole", "tag": "block"})
 	}
 
 	cfg := M{

@@ -18,6 +18,55 @@ var testUsers = []panel.User{
 	{ID: 5, UUID: "4d5965c8-a60c-452a-a943-af83ec0bb0db"},
 }
 
+func TestBuildConfig_OutboundPriority(t *testing.T) {
+	kcfg := config.KernelConfig{
+		LogLevel: "info",
+		CustomOutbound: []map[string]any{
+			{"tag": "block", "protocol": "dns"}, // Local static override
+		},
+	}
+	nc := &panel.NodeConfig{
+		Protocol:   "shadowsocks",
+		ServerPort: 111,
+		Cipher:     "aes-128-gcm",
+		CustomOutbounds: []panel.OutboundConfig{
+			{Tag: "direct", Protocol: "socks", Settings: map[string]any{"address": "1.2.3.4"}}, // Panel override
+		},
+	}
+
+	cfg := buildConfig(kcfg, nc, testUsers, "", "")
+	outbounds := cfg["outbounds"].([]M)
+
+	// Since we overrode both 'direct' and 'block', the result should contain
+	// exactly these two custom outbounds, without auto-generated defaults.
+	if len(outbounds) != 2 {
+		t.Errorf("outbounds: got %d, want 2", len(outbounds))
+	}
+
+	foundDirect := false
+	foundBlock := false
+
+	for _, o := range outbounds {
+		tag := o["tag"].(string)
+		if tag == "direct" {
+			foundDirect = true
+			if o["protocol"] != "socks" {
+				t.Errorf("expected 'direct' protocol to be 'socks' (panel priority), got %v", o["protocol"])
+			}
+		}
+		if tag == "block" {
+			foundBlock = true
+			if o["protocol"] != "dns" {
+				t.Errorf("expected 'block' protocol to be 'dns' (static config priority), got %v", o["protocol"])
+			}
+		}
+	}
+
+	if !foundDirect || !foundBlock {
+		t.Errorf("missing outbounds: direct=%v, block=%v", foundDirect, foundBlock)
+	}
+}
+
 func TestBuildConfig_AllProtocols_ValidJSON(t *testing.T) {
 	protocols := []struct {
 		name string
