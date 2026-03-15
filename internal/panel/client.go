@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/config"
+	"github.com/mitchellh/mapstructure"
 )
 
 // Client communicates with the Xboard panel API
@@ -118,6 +119,23 @@ func (c *Client) Report(traffic map[int][2]int64, alive map[int][]string, online
 	return c.postJSON("/api/v2/server/report", payload)
 }
 
+// decodeWeakRaw decodes an interface (from JSON map) into a struct using weak type conversion.
+func decodeWeakRaw(input interface{}, output interface{}) error {
+	config := &mapstructure.DecoderConfig{
+		Metadata:         nil,
+		Result:           output,
+		WeaklyTypedInput: true,
+		TagName:          "json", // Follow JSON tags
+	}
+
+	decoder, err := mapstructure.NewDecoder(config)
+	if err != nil {
+		return err
+	}
+
+	return decoder.Decode(input)
+}
+
 // GetConfig fetches node configuration. Returns nil if not modified (304).
 func (c *Client) GetConfig() (*NodeConfig, error) {
 	resp, err := c.doRequest("GET", "/api/v1/server/UniProxy/config", nil, c.configETag)
@@ -134,9 +152,20 @@ func (c *Client) GetConfig() (*NodeConfig, error) {
 		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, body)
 	}
 
+	var raw map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, fmt.Errorf("decode raw config: %w", err)
+	}
+
 	var cfg NodeConfig
-	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("decode: %w", err)
+	// Use mapstructure for weak type conversion (string -> int, bool -> string, etc.)
+	if err := decodeWeakRaw(raw, &cfg); err != nil {
+		return nil, fmt.Errorf("weak decode config: %w", err)
+	}
+
+	// Basic validation
+	if cfg.Protocol == "" {
+		return nil, fmt.Errorf("invalid config: missing protocol")
 	}
 
 	if etag := resp.Header.Get("ETag"); etag != "" {

@@ -268,11 +268,20 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 	var event WSEvent
 	event.Type = msg.Event
 
+	// Helper to unmarshal and decode with weak Typing
+	decodeData := func(data []byte, target interface{}) error {
+		var raw map[string]interface{}
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return err
+		}
+		return decodeWeakRaw(raw, target)
+	}
+
 	switch msg.Event {
 	case WSEventSyncConfig:
 		slog.Info("ws sync config event received")
 		var p syncConfigPayload
-		if err := json.Unmarshal(msg.Data, &p); err != nil {
+		if err := decodeData(msg.Data, &p); err != nil {
 			slog.Warn("ws: cannot decode config payload", "error", err)
 			return
 		}
@@ -281,7 +290,7 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 	case WSEventSyncUsers:
 		slog.Info("ws sync users event received")
 		var p syncUsersPayload
-		if err := json.Unmarshal(msg.Data, &p); err != nil {
+		if err := decodeData(msg.Data, &p); err != nil {
 			slog.Warn("ws: cannot decode users payload", "error", err)
 			return
 		}
@@ -290,7 +299,7 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 	case WSEventSyncUserDelta:
 		slog.Info("ws sync user delta event received")
 		var p syncUserDeltaPayload
-		if err := json.Unmarshal(msg.Data, &p); err != nil {
+		if err := decodeData(msg.Data, &p); err != nil {
 			slog.Warn("ws: cannot decode user delta payload", "error", err)
 			return
 		}

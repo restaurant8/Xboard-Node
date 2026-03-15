@@ -426,6 +426,10 @@ func applyStreamSettings(base M, nc *panel.NodeConfig, certFile, keyFile string)
 					"keyFile":         keyFile,
 				},
 			}
+		} else {
+			// Fallback placeholder for auto-TLS environments.
+			// Xray allows empty certificates array in more cases than sing-box,
+			// but providing a placeholder helps documentation.
 		}
 		ss["security"] = "tls"
 		ss["tlsSettings"] = tlsSettings

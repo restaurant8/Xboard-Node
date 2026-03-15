@@ -362,7 +362,18 @@ func buildShadowsocks(base M, nc *panel.NodeConfig, users []panel.User) M {
 
 	if nc.Plugin != "" {
 		base["plugin"] = nc.Plugin
-		base["plugin_opts"] = nc.PluginOpt
+		if nc.PluginOpt != "" {
+			opts := M{}
+			for _, part := range strings.Split(nc.PluginOpt, ";") {
+				kv := strings.SplitN(part, "=", 2)
+				if len(kv) == 2 {
+					opts[kv[0]] = kv[1]
+				} else {
+					opts[kv[0]] = true
+				}
+			}
+			base["plugin_opts"] = opts
+		}
 	}
 
 	return base
@@ -655,6 +666,11 @@ func buildTLSConfig(nc *panel.NodeConfig, certFile, keyFile string) M {
 	if certFile != "" && keyFile != "" {
 		tls["certificate_path"] = certFile
 		tls["key_path"] = keyFile
+	} else {
+		// If no real certificates are provided, but TLS is requested,
+		// use a self-signed certificate as fallback to prevent sing-box
+		// from failing with "missing certificate".
+		tls["certificate_path"] = "self-signed"
 	}
 
 	return tls
