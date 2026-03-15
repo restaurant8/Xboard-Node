@@ -1,0 +1,24 @@
+# Binaries
+/xboard-node
+/xboard-node-linux-*
+*.exe
+
+# Config files (may contain secrets)
+config.yml
+
+# Generated sing-box config
+singbox.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
+config.json
