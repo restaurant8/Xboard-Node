@@ -411,3 +411,29 @@ func TestBuildConfig_Shadowsocks_MultiUser(t *testing.T) {
 		t.Fatalf("expected 2 clients, got %d", len(clients))
 	}
 }
+
+func TestBuildConfig_SocksStats(t *testing.T) {
+	nc := panel.NodeConfig{
+		Protocol:   "socks",
+		ServerPort: 1080,
+	}
+	cfg := buildConfig(testKernelCfg, &nc, testUsers, "", "")
+	data, _ := json.Marshal(cfg)
+
+	var parsed map[string]interface{}
+	json.Unmarshal(data, &parsed)
+
+	inbounds := parsed["inbounds"].([]interface{})
+	ib := inbounds[0].(map[string]interface{})
+	settings := ib["settings"].(map[string]interface{})
+	accounts := settings["accounts"].([]interface{})
+	
+	if len(accounts) == 0 {
+		t.Fatal("no accounts in socks config")
+	}
+
+	a1 := accounts[0].(map[string]interface{})
+	if a1["email"] != "user@1" {
+		t.Errorf("expected email user@1 for socks account, got %v", a1["email"])
+	}
+}

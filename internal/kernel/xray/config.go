@@ -44,6 +44,8 @@ func buildConfig(kcfg config.KernelConfig, nc *panel.NodeConfig, users []panel.U
 	cfg := M{
 		"log": M{
 			"loglevel": xrayLogLevel(kcfg.LogLevel),
+			"error":    "stdout",
+			"access":   "stdout",
 		},
 		"stats": M{},
 		"policy": M{
@@ -202,6 +204,11 @@ func buildInbound(nc *panel.NodeConfig, users []panel.User, certFile, keyFile st
 		"listen":   listenAddr,
 		"port":     nc.ServerPort,
 		"protocol": nc.Protocol,
+		"streamSettings": M{
+			"sockopt": M{
+				"reusePort": true,
+			},
+		},
 	}
 
 	switch nc.Protocol {
@@ -314,8 +321,9 @@ func buildSocks(base M, users []panel.User) M {
 	accounts := make([]M, 0, len(users))
 	for _, u := range users {
 		accounts = append(accounts, M{
-			"user": u.UUID,
-			"pass": u.UUID,
+			"user":  u.UUID,
+			"pass":  u.UUID,
+			"email": userEmail(u.ID),
 		})
 	}
 	base["settings"] = M{
@@ -331,8 +339,9 @@ func buildHTTP(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFi
 	accounts := make([]M, 0, len(users))
 	for _, u := range users {
 		accounts = append(accounts, M{
-			"user": u.UUID,
-			"pass": u.UUID,
+			"user":  u.UUID,
+			"pass":  u.UUID,
+			"email": userEmail(u.ID),
 		})
 	}
 	base["settings"] = M{

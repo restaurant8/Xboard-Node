@@ -1,9 +1,11 @@
 package limiter
 
 import (
+	"log/slog"
 	"sync"
 	"sync/atomic"
 
+	"github.com/cedar2025/xboard-node/internal/panel"
 	"golang.org/x/time/rate"
 )
 
@@ -31,29 +33,35 @@ func NewSpeedTracker(l *Limiter) *SpeedTracker {
 	}
 }
 
-// UpdateBuckets rebuilds rate limiter buckets based on current user config.
-// Call this whenever the user list changes.
+// UpdateBuckets performs an incremental update of rate limiter buckets.
+// It reuses existing rate.Limiter instances to avoid burst resets and
+// minimizes memory allocations.
 func (t *SpeedTracker) UpdateBuckets() {
+	t.limiter.mu.RLock()
+	currentUsers := make([]panel.User, 0, len(t.limiter.users))
+	for _, u := range t.limiter.users {
+		currentUsers = append(currentUsers, u)
+	}
+	t.limiter.mu.RUnlock()
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	t.limiter.mu.RLock()
-	defer t.limiter.mu.RUnlock()
+	newUUIDMap := make(map[string]int, len(currentUsers))
+	activeIDs := make(map[int]struct{}, len(currentUsers))
 
-	newBuckets := make(map[int]*rate.Limiter, len(t.limiter.users))
-	newUUIDMap := make(map[string]int, len(t.limiter.users))
-	for uid, user := range t.limiter.users {
+	for _, user := range currentUsers {
+		activeIDs[user.ID] = struct{}{}
 		if user.UUID != "" {
-			newUUIDMap[user.UUID] = uid
+			newUUIDMap[user.UUID] = user.ID
 		}
+
 		if user.SpeedLimit <= 0 {
+			delete(t.buckets, user.ID)
 			continue
 		}
-		bytesPerSec := int(user.SpeedLimit) * 1_000_000 / 8 // Mbps → bytes/s
-		// Burst = 1 second of data, floored at 64 KiB, capped at 4 s.
-		// A generous burst ensures downloads ramp up quickly (good UX) while
-		// the token bucket still converges to the target rate within seconds.
-		// The 4 s cap prevents excessive burst at very high limits.
+
+		bytesPerSec := int(user.SpeedLimit) * 1_000_000 / 8
 		burst := bytesPerSec
 		if burst < 64*1024 {
 			burst = 64 * 1024
@@ -61,17 +69,27 @@ func (t *SpeedTracker) UpdateBuckets() {
 		if cap4s := bytesPerSec * 4; cap4s > 64*1024 && burst > cap4s {
 			burst = cap4s
 		}
-		if existing, ok := t.buckets[uid]; ok {
+
+		if existing, ok := t.buckets[user.ID]; ok {
+			// Thread-safe in-place update. Existing connections continue
+			// using this limiter with the new rate immediately.
 			existing.SetLimit(rate.Limit(bytesPerSec))
 			existing.SetBurst(burst)
-			newBuckets[uid] = existing
 		} else {
-			newBuckets[uid] = rate.NewLimiter(rate.Limit(bytesPerSec), burst)
+			t.buckets[user.ID] = rate.NewLimiter(rate.Limit(bytesPerSec), burst)
 		}
 	}
-	t.buckets = newBuckets
+
+	// Remove limiters for users who are no longer in the list
+	for id := range t.buckets {
+		if _, ok := activeIDs[id]; !ok {
+			delete(t.buckets, id)
+		}
+	}
+
 	t.uuidMap = newUUIDMap
-	t.hasLimits.Store(len(newBuckets) > 0)
+	t.hasLimits.Store(len(t.buckets) > 0)
+	slog.Info("speedtracker: buckets updated", "active_limiters", len(t.buckets))
 }
 
 // GetLimiter returns the rate limiter for the given user UUID, or nil if

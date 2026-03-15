@@ -29,10 +29,9 @@ const drainTimeout = 5 * time.Second
 
 // SingBox implements kernel.Kernel by embedding sing-box as a Go library.
 //
-// Connection tracking is done entirely in-process via ConnTracker, which is
-// registered as an adapter.ConnectionTracker with sing-box's router. This
-// avoids the HTTP/JSON overhead of the Clash API (saves 5-15 MB at 500+
-// concurrent connections).
+// User operations (AddUsers/RemoveUsers/UpdateUsers) use sing-box's native
+// UpdatableInbound interface, which hot-swaps user credentials without
+// restarting listeners — zero connection disruption.
 type SingBox struct {
 	cfg config.KernelConfig
 
@@ -41,9 +40,14 @@ type SingBox struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	users      []panel.User
+	nodeConfig *panel.NodeConfig
+	certFile   string
+	keyFile    string
+
 	// connTracker is our lightweight in-process byte/IP tracker.
-	// Created fresh on every ApplyConfig (full restart).
-	// Survives ReloadUsers (hot-swap) since live connections persist.
+	// Created fresh on every Start (full restart).
+	// Survives Reload (hot-swap) since live connections persist.
 	connTracker *ConnTracker
 
 	// speedLimitFunc resolves a user UUID to a *rate.Limiter.
@@ -51,7 +55,7 @@ type SingBox struct {
 	speedLimitFunc func(string) *rate.Limiter
 
 	// trackerRegistered prevents duplicate AppendTracker calls on the same
-	// Router instance during ReloadUsers. Reset to false on full restart.
+	// Router instance during Reload. Reset to false on full restart.
 	trackerRegistered bool
 }
 
@@ -59,9 +63,18 @@ func New(cfg config.KernelConfig) *SingBox {
 	return &SingBox{cfg: cfg}
 }
 
+var _ kernel.Kernel = (*SingBox)(nil)
+
 func (s *SingBox) Name() string { return "sing-box" }
 
-func (s *SingBox) ApplyConfig(nodeConfig *panel.NodeConfig, users []panel.User, certFile, keyFile string) error {
+func (s *SingBox) Protocols() []string {
+	return []string{
+		"vmess", "vless", "trojan", "shadowsocks",
+		"hysteria2", "tuic", "naive", "socks", "http", "anytls",
+	}
+}
+
+func (s *SingBox) Start(nodeConfig *panel.NodeConfig, users []panel.User, certFile, keyFile string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -102,6 +115,10 @@ func (s *SingBox) ApplyConfig(nodeConfig *panel.NodeConfig, users []panel.User, 
 	s.box = instance
 	s.ctx = ctx
 	s.cancel = cancel
+	s.users = users
+	s.nodeConfig = nodeConfig
+	s.certFile = certFile
+	s.keyFile = keyFile
 
 	// Fresh tracker on full restart (all connections were terminated by s.stop).
 	s.connTracker = NewConnTracker(0)
@@ -113,7 +130,7 @@ func (s *SingBox) ApplyConfig(nodeConfig *panel.NodeConfig, users []panel.User, 
 	s.trackerRegistered = false
 	s.registerTracker(ctx)
 
-	slog.Info("sing-box started (in-process)", "users", len(users))
+	slog.Info("sing-box started", "users", len(users))
 	return nil
 }
 
@@ -225,6 +242,10 @@ func (s *SingBox) Reload(nodeConfig *panel.NodeConfig, users []panel.User, certF
 	}
 
 	slog.Info("sing-box reloaded (users and routes hot-swapped)", "users", len(users))
+	s.users = users
+	s.nodeConfig = nodeConfig
+	s.certFile = certFile
+	s.keyFile = keyFile
 	return nil
 }
 
@@ -312,8 +333,192 @@ func (s *SingBox) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) {
 	}
 }
 
-// GetConnections returns a snapshot of all active and recently-closed
-// connections directly from the in-process ConnTracker.
+// ─── User management (non-disruptive) ───────────────────────────────────────
+
+// AddUsers hot-swaps users into running inbounds. Zero connection disruption.
+func (s *SingBox) AddUsers(users []panel.User) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.box == nil {
+		return 0, fmt.Errorf("not running")
+	}
+
+	existing := make(map[int]struct{}, len(s.users))
+	for _, u := range s.users {
+		existing[u.ID] = struct{}{}
+	}
+	var toAdd []panel.User
+	for _, u := range users {
+		if _, dup := existing[u.ID]; !dup {
+			toAdd = append(toAdd, u)
+		}
+	}
+	if len(toAdd) == 0 {
+		return 0, nil
+	}
+
+	merged := append(append([]panel.User{}, s.users...), toAdd...)
+	if err := s.reloadInboundsLocked(merged); err != nil {
+		return 0, err
+	}
+	s.users = merged
+	return len(toAdd), nil
+}
+
+// RemoveUsers hot-swaps users out of running inbounds. Zero connection disruption
+// for remaining users.
+func (s *SingBox) RemoveUsers(users []panel.User) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.box == nil {
+		return 0, fmt.Errorf("not running")
+	}
+
+	removeSet := make(map[int]struct{}, len(users))
+	for _, u := range users {
+		removeSet[u.ID] = struct{}{}
+	}
+	var kept []panel.User
+	removed := 0
+	for _, u := range s.users {
+		if _, rm := removeSet[u.ID]; rm {
+			removed++
+		} else {
+			kept = append(kept, u)
+		}
+	}
+	if removed == 0 {
+		return 0, nil
+	}
+
+	if err := s.reloadInboundsLocked(kept); err != nil {
+		return 0, err
+	}
+	s.users = kept
+	return removed, nil
+}
+
+// UpdateUsers replaces the entire user set atomically via hot-swap.
+func (s *SingBox) UpdateUsers(users []panel.User) (added, removed int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.box == nil {
+		return 0, 0, fmt.Errorf("not running")
+	}
+
+	toAdd, toRemove := kernel.UserDiff(s.users, users)
+	added, removed = len(toAdd), len(toRemove)
+
+	if added == 0 && removed == 0 {
+		// Only limits may have changed — update tracker map.
+		if s.connTracker != nil {
+			s.connTracker.SetUserMap(buildUserMap(users))
+		}
+		s.users = users
+		return 0, 0, nil
+	}
+
+	if err = s.reloadInboundsLocked(users); err != nil {
+		return 0, 0, err
+	}
+	s.users = users
+	return
+}
+
+// reloadInboundsLocked hot-swaps inbound users using UpdatableInbound.
+// Must be called with s.mu held.
+func (s *SingBox) reloadInboundsLocked(users []panel.User) error {
+	cfgMap := buildConfig(s.cfg, s.nodeConfig, users, s.certFile, s.keyFile)
+	data, err := json.Marshal(cfgMap)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+
+	opts, err := singJSON.UnmarshalExtendedContext[option.Options](s.ctx, data)
+	if err != nil {
+		return fmt.Errorf("parse options: %w", err)
+	}
+
+	im := service.FromContext[adapter.InboundManager](s.ctx)
+	if im == nil {
+		return fmt.Errorf("inbound manager not available")
+	}
+
+	router := service.FromContext[adapter.Router](s.ctx)
+	if router == nil {
+		return fmt.Errorf("router not available")
+	}
+
+	nopFactory := singLog.NewNOPFactory()
+
+	for _, inb := range opts.Inbounds {
+		tag := inb.Tag
+		if existing, ok := im.Get(tag); ok && existing.Type() == inb.Type {
+			var err error
+			switch v := existing.(type) {
+			case adapter.UpdatableInbound[option.VMessUser]:
+				if opts, ok := inb.Options.(*option.VMessInboundOptions); ok {
+					err = v.UpdateUsers(opts.Users)
+				}
+			case adapter.UpdatableInbound[option.VLESSUser]:
+				if opts, ok := inb.Options.(*option.VLESSInboundOptions); ok {
+					err = v.UpdateUsers(opts.Users)
+				}
+			case adapter.UpdatableInbound[option.TrojanUser]:
+				if opts, ok := inb.Options.(*option.TrojanInboundOptions); ok {
+					err = v.UpdateUsers(opts.Users)
+				}
+			case adapter.UpdatableInbound[option.Hysteria2User]:
+				if opts, ok := inb.Options.(*option.Hysteria2InboundOptions); ok {
+					err = v.UpdateUsers(opts.Users)
+				}
+			case adapter.UpdatableShadowsocksInbound:
+				if opts, ok := inb.Options.(*option.ShadowsocksInboundOptions); ok {
+					err = v.UpdateUsersByOptions(opts.Users)
+				}
+			case adapter.UpdatableInbound[option.TUICUser]:
+				if opts, ok := inb.Options.(*option.TUICInboundOptions); ok {
+					err = v.UpdateUsers(opts.Users)
+				}
+			case adapter.UpdatableInbound[option.AnyTLSUser]:
+				if opts, ok := inb.Options.(*option.AnyTLSInboundOptions); ok {
+					err = v.UpdateUsers(opts.Users)
+				}
+			case adapter.UpdatableInbound[auth.User]:
+				switch opts := inb.Options.(type) {
+				case *option.NaiveInboundOptions:
+					err = v.UpdateUsers(opts.Users)
+				case *option.SocksInboundOptions:
+					err = v.UpdateUsers(opts.Users)
+				case *option.HTTPMixedInboundOptions:
+					err = v.UpdateUsers(opts.Users)
+				}
+			}
+			if err == nil {
+				continue
+			}
+			slog.Warn("incremental update failed, recreating inbound", "tag", tag, "error", err)
+		}
+
+		_ = im.Remove(tag)
+		logger := nopFactory.NewLogger(fmt.Sprintf("inbound/%s[%s]", inb.Type, tag))
+		if err := im.Create(s.ctx, router, logger, tag, inb.Type, inb.Options); err != nil {
+			return fmt.Errorf("recreate inbound %s: %w", tag, err)
+		}
+	}
+
+	if s.connTracker != nil {
+		s.connTracker.SetUserMap(buildUserMap(users))
+	}
+
+	slog.Info("sing-box users hot-swapped", "users", len(users))
+	return nil
+}
+
+// ─── Observability ──────────────────────────────────────────────────────────
 func (s *SingBox) GetConnections(_ context.Context) ([]kernel.Connection, error) {
 	ct := s.connTrackerSafe()
 	if ct == nil {

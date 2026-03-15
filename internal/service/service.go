@@ -121,8 +121,13 @@ func (s *Service) Run(ctx context.Context) error {
 	trackTicker := time.NewTicker(10 * time.Second)
 	pushInterval := time.Duration(math.Max(float64(s.pushInterval), 5)) * time.Second
 	pullInterval := time.Duration(s.pullInterval) * time.Second
+	if pullInterval < 10*time.Second {
+		pullInterval = 60 * time.Second
+	}
 	reportTicker := time.NewTicker(pushInterval)
 	pullTicker := time.NewTicker(pullInterval)
+
+	slog.Info("tickers initialized", "push", pushInterval, "pull", pullInterval)
 
 	// WS discovery: when in REST-only mode, periodically re-handshake to check
 	// if WS has been enabled. When WS is disconnected for too long, re-check
@@ -281,10 +286,9 @@ func (s *Service) initialSetup(ctx context.Context) error {
 	s.lastAppliedIP = nodeConfig.ListenIP
 
 	certFile, keyFile := s.cert.CertFile(), s.cert.KeyFile()
-	if err := s.kernel.ApplyConfig(nodeConfig, users, certFile, keyFile); err != nil {
-		return fmt.Errorf("apply config: %w", err)
+	if err := s.kernel.Start(nodeConfig, users, certFile, keyFile); err != nil {
+		return fmt.Errorf("start kernel: %w", err)
 	}
-
 	return nil
 }
 
@@ -548,9 +552,9 @@ func (s *Service) pullViaAPI(ctx context.Context) {
 		if usersChanged && !configChanged {
 			s.applyUserUpdate(ctx, users, newHash)
 		} else if usersChanged {
-			// Config is also changing — ApplyConfig will restart the kernel with the
-			// updated user list, so skip the intermediate ReloadUsers.
-			s.syncUserState(ctx, users, newHash, false)
+			// Config is also changing — Start will restart the kernel with the
+			// updated user list, so skip the intermediate UpdateUsers.
+			s.updateUserState(users)
 		}
 	}
 
@@ -559,118 +563,171 @@ func (s *Service) pullViaAPI(ctx context.Context) {
 	}
 }
 
-// syncUserState updates user tracking state (limiter, speedTracker, lastUsers)
-// without touching the kernel. Set kickRemoved=false when a full kernel restart
-// is about to happen anyway — removed users' connections will be killed then.
-func (s *Service) syncUserState(ctx context.Context, users []panel.User, newHash string, kickRemoved bool) {
-	removedIDs := s.limiter.UpdateUsers(users)
-	s.speedTracker.UpdateBuckets()
+// ─── User state helpers ─────────────────────────────────────────────────────
 
-	if kickRemoved && len(removedIDs) > 0 && s.kernel.IsRunning() {
-		conns, err := s.kernel.GetConnections(ctx)
-		if err == nil {
-			kicks := s.limiter.KickUsers(conns, removedIDs)
-			s.executeKicks(ctx, kicks)
-			slog.Info("kicked removed users", "removed_ids", removedIDs, "kicked_conns", len(kicks))
-		}
+// updateUserState is the single point that refreshes limiter, speedTracker,
+// and the cached user list/hash. Every code path that changes the user set
+// MUST go through here to keep the three data structures in sync.
+func (s *Service) updateUserState(users []panel.User) {
+	s.limiter.UpdateUsers(users)
+	s.speedTracker.UpdateBuckets()
+	s.lastUsers = users
+	s.lastUserHash = computeUserHash(users)
+}
+
+// startKernel starts (or restarts) the kernel with the given config/users and
+// records the bound port/IP. Returns false on error (already logged).
+func (s *Service) startKernel(nc *panel.NodeConfig, users []panel.User) bool {
+	certFile, keyFile := s.cert.CertFile(), s.cert.KeyFile()
+	if err := s.kernel.Start(nc, users, certFile, keyFile); err != nil {
+		slog.Error("failed to start kernel", "error", err)
+		return false
+	}
+	s.lastAppliedPort = nc.ServerPort
+	s.lastAppliedIP = nc.ListenIP
+	return true
+}
+
+// ensureRunning starts the kernel if it is not running and there are users +
+// config available. Returns true if the kernel is running afterwards.
+func (s *Service) ensureRunning() bool {
+	if s.kernel.IsRunning() {
+		return true
+	}
+	if len(s.lastUsers) > 0 && s.lastConfig != nil {
+		return s.startKernel(s.lastConfig, s.lastUsers)
+	}
+	return false
+}
+
+// ─── User update entry points ───────────────────────────────────────────────
+
+// applyUserUpdate replaces the full user set and hot-swaps the kernel.
+// Called from WS sync.users and REST polling.
+func (s *Service) applyUserUpdate(ctx context.Context, users []panel.User, newHash string) {
+	// Update limiter/speed state first so even if kernel ops fail,
+	// the in-memory limits are already correct.
+	s.updateUserState(users)
+
+	if !s.ensureRunning() {
+		return
 	}
 
-	s.lastUsers = users
-	s.lastUserHash = newHash
-	slog.Info("users updated", "count", len(users))
+	added, removed, err := s.kernel.UpdateUsers(users)
+	if err != nil {
+		slog.Warn("UpdateUsers failed, falling back to full restart", "error", err)
+		s.startKernel(s.lastConfig, users)
+		return
+	}
+	slog.Info("users updated via kernel", "added", added, "removed", removed)
 }
 
-// applyUserUpdate updates user state and hot-reloads the kernel inbounds.
-func (s *Service) applyUserUpdate(ctx context.Context, users []panel.User, newHash string) {
-	s.syncUserState(ctx, users, newHash, true)
-	s.applyChanges(ctx, false, true)
-}
-
-// applyUserDelta applies an incremental user change (add or remove).
+// applyUserDelta applies an incremental user change (add or remove) directly
+// via the kernel's atomic user API.
 func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers []panel.User) {
 	switch action {
 	case "add":
-		// Build a map of current users for fast lookup
-		userMap := make(map[int]panel.User, len(s.lastUsers))
-		for _, u := range s.lastUsers {
-			userMap[u.ID] = u
+		merged := mergeUsers(s.lastUsers, deltaUsers)
+		s.updateUserState(merged)
+
+		if !s.ensureRunning() {
+			return
 		}
-		for _, u := range deltaUsers {
-			userMap[u.ID] = u // add or update
+
+		added, err := s.kernel.AddUsers(deltaUsers)
+		if err != nil {
+			slog.Warn("AddUsers failed, falling back to full UpdateUsers", "error", err)
+			if _, _, err := s.kernel.UpdateUsers(merged); err != nil {
+				slog.Error("UpdateUsers fallback also failed", "error", err)
+			}
+		} else {
+			slog.Info("users added via kernel", "added", added)
 		}
-		merged := make([]panel.User, 0, len(userMap))
-		for _, u := range userMap {
-			merged = append(merged, u)
-		}
-		newHash := computeUserHash(merged)
-		s.applyUserUpdate(ctx, merged, newHash)
 
 	case "remove":
-		removeSet := make(map[int]struct{}, len(deltaUsers))
-		for _, u := range deltaUsers {
-			removeSet[u.ID] = struct{}{}
+		filtered := subtractUsers(s.lastUsers, deltaUsers)
+		s.updateUserState(filtered)
+
+		if !s.kernel.IsRunning() {
+			return
 		}
-		filtered := make([]panel.User, 0, len(s.lastUsers))
-		for _, u := range s.lastUsers {
-			if _, ok := removeSet[u.ID]; !ok {
-				filtered = append(filtered, u)
+
+		removed, err := s.kernel.RemoveUsers(deltaUsers)
+		if err != nil {
+			slog.Warn("RemoveUsers failed, falling back to full UpdateUsers", "error", err)
+			if _, _, err := s.kernel.UpdateUsers(filtered); err != nil {
+				slog.Error("UpdateUsers fallback also failed", "error", err)
 			}
+		} else {
+			slog.Info("users removed via kernel", "removed", removed)
 		}
-		newHash := computeUserHash(filtered)
-		s.applyUserUpdate(ctx, filtered, newHash)
+
 	default:
 		slog.Warn("ws: unknown user delta action", "action", action)
 	}
 }
 
-// applyChanges applies config and/or user changes to the kernel
+// mergeUsers overlays deltaUsers onto base (keyed by ID). New users are
+// appended, existing users have their properties overwritten.
+func mergeUsers(base, delta []panel.User) []panel.User {
+	m := make(map[int]panel.User, len(base))
+	for _, u := range base {
+		m[u.ID] = u
+	}
+	for _, u := range delta {
+		m[u.ID] = u
+	}
+	out := make([]panel.User, 0, len(m))
+	for _, u := range m {
+		out = append(out, u)
+	}
+	return out
+}
+
+// subtractUsers returns base with all users in delta removed.
+func subtractUsers(base, delta []panel.User) []panel.User {
+	removeSet := make(map[int]struct{}, len(delta))
+	for _, u := range delta {
+		removeSet[u.ID] = struct{}{}
+	}
+	out := make([]panel.User, 0, len(base))
+	for _, u := range base {
+		if _, ok := removeSet[u.ID]; !ok {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// applyChanges applies config changes to the kernel. User-only changes are
+// handled by applyUserUpdate/applyUserDelta directly via the atomic user API.
 func (s *Service) applyChanges(ctx context.Context, configChanged, usersChanged bool) {
-	certFile, keyFile := s.cert.CertFile(), s.cert.KeyFile()
+	if !configChanged {
+		return
+	}
 
-	if configChanged {
-		if s.lastConfig != nil && len(s.lastUsers) > 0 {
-			// If the port or listen IP has changed, we MUST perform a full restart
-			// because hot-reload (s.kernel.Reload) typically only updates users/rules
-			// and doesn't re-bind existing listeners in most kernels.
-			needsRestart := s.kernel.IsRunning() && (s.lastConfig.ServerPort != s.lastAppliedPort || s.lastConfig.ListenIP != s.lastAppliedIP)
-
-			if !needsRestart {
-				// Try hot-reload for other config changes (could be route/user changes).
-				if err := s.kernel.Reload(s.lastConfig, s.lastUsers, certFile, keyFile); err != nil {
-					slog.Warn("reload failed, falling back to full restart", "error", err)
-					needsRestart = true
-				}
-			}
-
-			if needsRestart || !s.kernel.IsRunning() {
-				if err := s.kernel.ApplyConfig(s.lastConfig, s.lastUsers, certFile, keyFile); err != nil {
-					slog.Error("failed to apply config", "error", err)
-				} else {
-					// Update tracking state for next change
-					s.lastAppliedPort = s.lastConfig.ServerPort
-					s.lastAppliedIP = s.lastConfig.ListenIP
-				}
-			}
-		} else if len(s.lastUsers) == 0 {
+	if s.lastConfig == nil || len(s.lastUsers) == 0 {
+		if len(s.lastUsers) == 0 {
 			slog.Warn("no users, stopping kernel")
 			s.kernel.Stop()
 		}
-	} else if usersChanged && s.kernel.IsRunning() {
-		// Hot-reload for user-only changes
+		return
+	}
+
+	// If port or listen IP changed, must do full restart.
+	needsRestart := s.kernel.IsRunning() &&
+		(s.lastConfig.ServerPort != s.lastAppliedPort || s.lastConfig.ListenIP != s.lastAppliedIP)
+
+	if !needsRestart && s.kernel.IsRunning() {
+		certFile, keyFile := s.cert.CertFile(), s.cert.KeyFile()
 		if err := s.kernel.Reload(s.lastConfig, s.lastUsers, certFile, keyFile); err != nil {
-			slog.Warn("inbound reload failed, falling back to full restart", "error", err)
-			if err := s.kernel.ApplyConfig(s.lastConfig, s.lastUsers, certFile, keyFile); err != nil {
-				slog.Error("failed to apply config (fallback)", "error", err)
-			} else {
-				s.lastAppliedPort = s.lastConfig.ServerPort
-				s.lastAppliedIP = s.lastConfig.ListenIP
-			}
+			slog.Warn("reload failed, falling back to full restart", "error", err)
+			needsRestart = true
 		}
-	} else if usersChanged && !s.kernel.IsRunning() && len(s.lastUsers) > 0 {
-		// Kernel was stopped (no users), now we have users — start it
-		if err := s.kernel.ApplyConfig(s.lastConfig, s.lastUsers, certFile, keyFile); err != nil {
-			slog.Error("failed to start kernel with new users", "error", err)
-		}
+	}
+
+	if needsRestart || !s.kernel.IsRunning() {
+		s.startKernel(s.lastConfig, s.lastUsers)
 	}
 }
 
@@ -687,6 +744,7 @@ func (s *Service) trackAndEnforce(ctx context.Context) {
 
 	s.tracker.Process(conns)
 	s.tracker.LogStats()
+	slog.Debug("kernel connection snapshot", "count", len(conns))
 
 	kicks := s.limiter.Check(conns)
 	s.executeKicks(ctx, kicks)
@@ -719,24 +777,7 @@ func (s *Service) pushReport() {
 
 	metrics := s.buildMetrics(status)
 
-	if len(traffic) == 0 && len(aliveIPs) == 0 && len(online) == 0 {
-		// Still send status periodically
-		if err := s.panel.Report(
-			nil, nil, nil,
-			status.CPU,
-			[2]uint64{status.MemTotal, status.MemUsed},
-			[2]uint64{status.SwapTotal, status.SwapUsed},
-			[2]uint64{status.DiskTotal, status.DiskUsed},
-			metrics,
-		); err != nil {
-			slog.Error("failed to push status report", "error", err)
-			s.pushBackoff.onFailure()
-			return
-		}
-		s.pushBackoff.onSuccess()
-		return
-	}
-
+	// Always report even if no traffic, to maintain heartbeats and status.
 	if err := s.panel.Report(
 		traffic, aliveIPs, online,
 		status.CPU,
@@ -746,14 +787,18 @@ func (s *Service) pushReport() {
 		metrics,
 	); err != nil {
 		slog.Error("failed to push report", "error", err)
-		s.tracker.RestoreTraffic(traffic)
-		s.tracker.RestoreAliveIPs(aliveIPs)
+		if len(traffic) > 0 {
+			s.tracker.RestoreTraffic(traffic)
+		}
+		if len(aliveIPs) > 0 {
+			s.tracker.RestoreAliveIPs(aliveIPs)
+		}
 		s.pushBackoff.onFailure()
 		return
 	}
 
 	s.pushBackoff.onSuccess()
-	slog.Info("report pushed", "users", len(traffic))
+	slog.Info("report pushed", "users_with_traffic", len(traffic), "online", len(online))
 }
 
 // buildMetrics aggregates node-level metrics to be reported to the panel.

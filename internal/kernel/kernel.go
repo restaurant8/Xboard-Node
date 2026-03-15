@@ -7,36 +7,91 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// Kernel is the interface for proxy kernel backends (sing-box, xray, etc.)
+// Kernel is the interface for proxy kernel backends (sing-box, xray, etc.).
+//
+// The interface is split into lifecycle, user management, and observability
+// groups. User operations (AddUsers/RemoveUsers) are designed to be atomic
+// and non-disruptive — they MUST NOT restart listeners or drop existing
+// connections. Only Start and Reload may (re)bind ports.
+//
+// Implementors: singbox.SingBox, xray.Xray
 type Kernel interface {
-	// Name returns the kernel identifier (e.g. "sing-box")
+	// ─── Identity ───────────────────────────────────────────────────────
+	// Name returns the kernel identifier (e.g. "sing-box", "xray").
 	Name() string
-	// ApplyConfig generates kernel config from panel data and (re)starts the process
-	ApplyConfig(nodeConfig *panel.NodeConfig, users []panel.User, certFile, keyFile string) error
-	// Stop gracefully stops the kernel process
+	// Protocols returns the protocol names this kernel supports.
+	Protocols() []string
+
+	// ─── Lifecycle ──────────────────────────────────────────────────────
+	// Start initialises the kernel with the given node config and initial
+	// user set, binds listeners, and begins accepting connections.
+	// Calling Start on an already-running kernel stops the old instance first.
+	Start(nodeConfig *panel.NodeConfig, users []panel.User, certFile, keyFile string) error
+	// Stop gracefully shuts down the kernel, draining active connections.
 	Stop()
-	// IsRunning returns whether the kernel is currently active
+	// IsRunning returns whether the kernel is currently accepting connections.
 	IsRunning() bool
-	// GetConnections returns all active proxy connections
-	GetConnections(ctx context.Context) ([]Connection, error)
-	// CloseConnection terminates a specific connection by ID
-	CloseConnection(ctx context.Context, connID string) error
-	// SetSpeedLimitFunc configures optional per-user bandwidth throttling.
-	// The function resolves a user UUID to a *rate.Limiter (nil = unlimited).
-	// For sing-box, the limiter is embedded in the connection tracker wrapper
-	// so both byte counting and rate limiting happen in a single CountFunc
-	// callback, allowing splice/zero-copy paths.
-	SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter)
-	// Reload hot-swaps the inbound users and routing rules without full kernel restart.
-	// Existing connections may be briefly interrupted, but routes/outbounds stay alive.
+	// Reload re-generates the full config and hot-swaps listeners/routes.
+	// Use this when port, protocol, or TLS settings change.
+	// Existing connections MAY be briefly interrupted.
 	Reload(nodeConfig *panel.NodeConfig, users []panel.User, certFile, keyFile string) error
+
+	// ─── User management (non-disruptive) ───────────────────────────────
+	// AddUsers registers new users with the running kernel.
+	// Existing connections are unaffected. Returns the count actually added
+	// (duplicates are silently skipped).
+	AddUsers(users []panel.User) (added int, err error)
+	// RemoveUsers deregisters users from the running kernel.
+	// Active connections of removed users are terminated. Returns the count
+	// actually removed (unknown IDs are silently skipped).
+	RemoveUsers(users []panel.User) (removed int, err error)
+	// UpdateUsers replaces the entire user set atomically.
+	// This is equivalent to computing the diff and calling Add/Remove, but
+	// may be more efficient for bulk changes. Returns (added, removed) counts.
+	UpdateUsers(users []panel.User) (added, removed int, err error)
+
+	// ─── Observability ──────────────────────────────────────────────────
+	// GetConnections returns a snapshot of all active proxy connections.
+	GetConnections(ctx context.Context) ([]Connection, error)
+	// CloseConnection terminates a specific connection by ID.
+	CloseConnection(ctx context.Context, connID string) error
+	// SetSpeedLimitFunc configures per-user bandwidth throttling.
+	// The function resolves a user UUID to a *rate.Limiter (nil = unlimited).
+	SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter)
 }
 
-// Connection represents an active proxy connection reported by the kernel
+// Connection represents an active proxy connection reported by the kernel.
 type Connection struct {
 	ID       string
 	UserID   int    // extracted user ID (0 if unknown)
 	Upload   int64  // cumulative upload bytes
 	Download int64  // cumulative download bytes
 	SourceIP string // client source IP (cleaned, no port/brackets)
+}
+
+// UserDiff computes which users to add and which to remove when transitioning
+// from oldUsers to newUsers. This is a pure helper used by callers; kernels
+// may also use it internally.
+func UserDiff(oldUsers, newUsers []panel.User) (toAdd, toRemove []panel.User) {
+	oldMap := make(map[int]panel.User, len(oldUsers))
+	for _, u := range oldUsers {
+		oldMap[u.ID] = u
+	}
+	newMap := make(map[int]panel.User, len(newUsers))
+	for _, u := range newUsers {
+		newMap[u.ID] = u
+	}
+
+	for _, u := range newUsers {
+		old, exists := oldMap[u.ID]
+		if !exists || old.UUID != u.UUID {
+			toAdd = append(toAdd, u)
+		}
+	}
+	for _, u := range oldUsers {
+		if _, exists := newMap[u.ID]; !exists {
+			toRemove = append(toRemove, u)
+		}
+	}
+	return
 }

@@ -9,12 +9,23 @@ import (
 	"log/slog"
 	"os"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/uuid"
 	xrayCore "github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/infra/conf/serial"
+	xrayProxy "github.com/xtls/xray-core/proxy"
+	"github.com/xtls/xray-core/proxy/shadowsocks"
+	ss2022 "github.com/xtls/xray-core/proxy/shadowsocks_2022"
+	"github.com/xtls/xray-core/proxy/trojan"
+	"github.com/xtls/xray-core/proxy/vless"
+	"github.com/xtls/xray-core/proxy/vmess"
 	"golang.org/x/time/rate"
 
 	_ "github.com/xtls/xray-core/main/distro/all"
@@ -25,38 +36,42 @@ import (
 	"github.com/cedar2025/xboard-node/internal/panel"
 )
 
-// drainTimeout is how long stop() waits for in-flight connections to finish
-// naturally before hard-killing the xray instance.
-const drainTimeout = 5 * time.Second
+const (
+	// drainTimeout is how long Stop waits for in-flight connections to finish
+	// before hard-killing the instance. Skipped during hot-reload for speed.
+	drainTimeout = 5 * time.Second
+	// startTimeout caps how long instance.Start() may block.
+	startTimeout = 30 * time.Second
+)
 
 // Xray implements kernel.Kernel by embedding xray-core as a Go library.
 //
-// Device limits and speed limits are enforced through a custom dispatcher
-// wrapper (LimitDispatcher) that hooks into session.InboundFromContext(ctx)
-// — the same approach used by V2bX and XrayR. This works for ALL protocols
-// because the dispatcher is called AFTER the protocol handler has identified
-// the user and recorded the source IP in the session context.
+// Lifecycle:  Start  →  running  →  Stop / Reload
+//
+// Lock discipline:
+//   - mu is held only for brief field swaps (microseconds).
+//   - instance.Start() and instance.Close() run OUTSIDE the lock.
+//   - running (atomic) gates fast-path checks in IsRunning / GetConnections.
 type Xray struct {
 	cfg config.KernelConfig
 
-	mu       sync.Mutex
-	instance *xrayCore.Instance
-	users    []panel.User
-	protocol string
-
-	inboundTag string
-
-	// limitDispatcher is the per-instance LimitDispatcher created during
-	// xrayCore.New(). Stored here (instead of using the global pointer)
-	// so that multi-node mode with multiple Xray instances works correctly.
+	// mu protects instance, limitDispatcher, users, protocol, inboundTag,
+	// lastKernelHash, and cumTraffic. Never held during slow I/O.
+	mu              sync.Mutex
+	instance        *xrayCore.Instance
 	limitDispatcher *LimitDispatcher
+	users           []panel.User
+	nodeConfig      *panel.NodeConfig
+	certFile        string
+	keyFile         string
+	protocol        string
+	inboundTag      string
+	lastKernelHash  string
+	cumTraffic      map[int][2]int64
 
-	// lastKernelHash caches a hash of the kernel-affecting config + user
-	// identities. Used by Reload to skip unnecessary full restarts.
-	lastKernelHash string
-
-	// cumTraffic keeps running totals for the aggregate stats fallback.
-	cumTraffic map[int][2]int64
+	// running is set after a successful Start and cleared before shutdown.
+	// Atomic so IsRunning / GetConnections never block.
+	running atomic.Bool
 }
 
 func New(cfg config.KernelConfig) *Xray {
@@ -68,138 +83,136 @@ func New(cfg config.KernelConfig) *Xray {
 
 func (x *Xray) Name() string { return "xray" }
 
-func (x *Xray) ApplyConfig(nodeConfig *panel.NodeConfig, users []panel.User, certFile, keyFile string) error {
-	x.mu.Lock()
-	defer x.mu.Unlock()
-
-	// Auto-download geo databases and set XRAY_LOCATION_ASSET when panel
-	// routes reference geoip:/geosite: entries.
-	if kernel.NeedsGeoIP(nodeConfig.Routes) || kernel.NeedsGeoSite(nodeConfig.Routes) {
-		geoDataDir := x.cfg.GeoDataDir
-		if err := geodata.Ensure(geoDataDir,
-			kernel.NeedsGeoIP(nodeConfig.Routes),
-			kernel.NeedsGeoSite(nodeConfig.Routes),
-			"xray",
-		); err != nil {
-			slog.Warn("geo database unavailable; geoip/geosite rules may not match", "error", err)
-		}
-		os.Setenv("XRAY_LOCATION_ASSET", geoDataDir)
+func (x *Xray) Protocols() []string {
+	return []string{
+		"vmess", "vless", "trojan", "shadowsocks",
+		"socks", "http", "dokodemo-door",
 	}
+}
 
-	cfgMap := buildConfig(x.cfg, nodeConfig, users, certFile, keyFile)
-	data, err := json.Marshal(cfgMap)
+// ─── Lifecycle ──────────────────────────────────────────────────────────────
+
+// Start builds a new xray-core instance and atomically replaces the old
+// one. The method is organised in four non-overlapping phases so that the
+// kernel mutex is never held during slow operations (Start / Close).
+//
+//	Phase 1 – Build:   generate protobuf config  (no lock, pure computation)
+//	Phase 2 – Create:  xrayCore.New + capture LD (brief global lock)
+//	Phase 3 – Swap:    stop old instance          (brief kernel lock)
+//	Phase 4 – Start:   instance.Start             (no lock, potentially slow)
+//	Phase 5 – Commit:  store new state            (brief kernel lock)
+func (x *Xray) Start(nodeConfig *panel.NodeConfig, users []panel.User, certFile, keyFile string) error {
+	// ── Phase 1: Build config (no shared state) ─────────────────────────
+	x.ensureGeoData(nodeConfig)
+
+	data, err := marshalConfig(x.cfg, nodeConfig, users, certFile, keyFile)
 	if err != nil {
-		return fmt.Errorf("marshal config: %w", err)
+		return err
 	}
-
-	slog.Debug("xray config generated", "len", len(data))
 
 	pbConfig, err := serial.LoadJSONConfig(bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("parse xray config: %w", err)
 	}
 
-	x.stop()
-
-	// Hold the global creation mutex around xrayCore.New() + capture so that
-	// concurrent Xray instances (multi-node) don't clobber each other's
-	// LimitDispatcher reference.
+	// ── Phase 2: Create instance (global lock for LD capture) ───────────
 	xrayCreationMu.Lock()
-	instance, err := xrayCore.New(pbConfig)
-	if err != nil {
-		xrayCreationMu.Unlock()
-		return fmt.Errorf("create xray instance: %w", err)
-	}
-	x.limitDispatcher = globalLimitDispatcher.Load()
+	inst, err := xrayCore.New(pbConfig)
+	ld := globalLimitDispatcher.Load()
 	xrayCreationMu.Unlock()
-
-	if err := instance.Start(); err != nil {
-		instance.Close()
-		return fmt.Errorf("start xray: %w", err)
+	if err != nil {
+		return fmt.Errorf("create xray: %w", err)
 	}
 
-	x.instance = instance
+	// ── Phase 3: Stop old (brief kernel lock, no drain) ─────────────────
+	x.mu.Lock()
+	x.running.Store(false)
+	old := x.instance
+	x.instance = nil
+	oldLD := x.limitDispatcher
+	x.limitDispatcher = nil
+	x.mu.Unlock()
+
+	closeOld(old, oldLD)
+
+	// ── Phase 4: Start new (no lock, potentially slow) ──────────────────
+	if err := startWithTimeout(inst, startTimeout); err != nil {
+		inst.Close()
+		return err
+	}
+
+	// ── Phase 5: Commit (brief kernel lock) ─────────────────────────────
+	x.mu.Lock()
+	x.instance = inst
+	x.limitDispatcher = ld
 	x.users = users
+	x.nodeConfig = nodeConfig
+	x.certFile = certFile
+	x.keyFile = keyFile
 	x.protocol = nodeConfig.Protocol
 	x.inboundTag = nodeConfig.Protocol + "-in"
 	x.cumTraffic = make(map[int][2]int64)
 	x.lastKernelHash = computeKernelHash(nodeConfig, users)
+	x.running.Store(true)
+	x.mu.Unlock()
 
-	// Configure the limit dispatcher with user limits
 	x.updateDispatcherLimits(users)
 
-	slog.Info("xray started (in-process)",
+	slog.Info("xray started",
 		"users", len(users),
 		"protocol", nodeConfig.Protocol,
-		"device_limits", "enabled (all protocols via dispatcher hook)",
-		"speed_limits", "enabled (all protocols via dispatcher hook)",
 	)
-
 	return nil
 }
 
+// Reload hot-swaps dispatcher limits and, only when kernel-affecting fields
+// have changed (user identities, routes, protocol), triggers a full restart.
 func (x *Xray) Reload(nodeConfig *panel.NodeConfig, users []panel.User, certFile, keyFile string) error {
-	// Always update dispatcher limits (instant, no restart).
 	x.updateDispatcherLimits(users)
 
-	// Skip full restart if kernel-affecting fields are unchanged.
-	// This covers user-only limit changes where identities (ID, UUID) and
-	// config (routes, protocol settings, port) haven't changed.
 	newHash := computeKernelHash(nodeConfig, users)
+
 	x.mu.Lock()
 	same := x.lastKernelHash == newHash
-	x.mu.Unlock()
 	if same {
-		x.mu.Lock()
 		x.users = users
 		x.mu.Unlock()
-		slog.Info("xray: config/users unchanged, limits updated without restart")
+		slog.Info("xray: limits updated, kernel unchanged")
 		return nil
 	}
+	x.mu.Unlock()
 
-	return x.ApplyConfig(nodeConfig, users, certFile, keyFile)
+	return x.Start(nodeConfig, users, certFile, keyFile)
 }
 
+// Stop gracefully shuts down the kernel, draining active connections first.
 func (x *Xray) Stop() {
+	x.running.Store(false)
+
 	x.mu.Lock()
-	defer x.mu.Unlock()
-	x.stop()
-}
+	inst := x.instance
+	ld := x.limitDispatcher
+	x.instance = nil
+	x.limitDispatcher = nil
+	x.mu.Unlock()
 
-func (x *Xray) stop() {
-	if x.instance != nil {
-		// Drain: wait for in-flight connections to finish naturally.
-		if x.limitDispatcher != nil {
-			deadline := time.Now().Add(drainTimeout)
-			for time.Now().Before(deadline) {
-				x.limitDispatcher.mu.RLock()
-				n := len(x.limitDispatcher.conns)
-				x.limitDispatcher.mu.RUnlock()
-				if n == 0 {
-					break
-				}
-				time.Sleep(100 * time.Millisecond)
-			}
-		}
-		x.instance.Close()
-		x.instance = nil
+	if ld != nil {
+		drainConns(ld, drainTimeout)
 	}
-	if x.limitDispatcher != nil {
-		x.limitDispatcher.ResetConns()
-		x.limitDispatcher = nil
-	}
+	closeOld(inst, ld)
 }
 
-func (x *Xray) IsRunning() bool {
-	x.mu.Lock()
-	defer x.mu.Unlock()
-	return x.instance != nil
-}
+func (x *Xray) IsRunning() bool { return x.running.Load() }
 
-// GetConnections returns per-connection data from the dispatcher.
-// Each connection has a real source IP and user ID, enabling device limit
-// enforcement by the upper-layer limiter.
+// ─── Connection queries ─────────────────────────────────────────────────────
+
+// GetConnections returns a snapshot of active proxy connections.
+// The lock is safe to take here because mu is never held during slow I/O.
 func (x *Xray) GetConnections(ctx context.Context) ([]kernel.Connection, error) {
+	if !x.running.Load() {
+		return nil, nil
+	}
+
 	x.mu.Lock()
 	defer x.mu.Unlock()
 
@@ -207,58 +220,13 @@ func (x *Xray) GetConnections(ctx context.Context) ([]kernel.Connection, error) 
 		return nil, nil
 	}
 
-	// Primary: use LimitDispatcher's per-connection tracking
 	if x.limitDispatcher != nil {
-		conns := x.limitDispatcher.Snapshot()
-		if len(conns) > 0 {
+		if conns := x.limitDispatcher.Snapshot(); len(conns) > 0 {
 			return conns, nil
 		}
 	}
 
-	// Fallback: aggregate stats (for edge cases)
-	return x.getAggregateStats()
-}
-
-func (x *Xray) getAggregateStats() ([]kernel.Connection, error) {
-	sm := x.instance.GetFeature(stats.ManagerType())
-	if sm == nil {
-		return nil, nil
-	}
-	statsManager, ok := sm.(stats.Manager)
-	if !ok {
-		return nil, nil
-	}
-
-	var conns []kernel.Connection
-	for _, u := range x.users {
-		email := userEmail(u.ID)
-
-		var deltaUp, deltaDown int64
-		if c := statsManager.GetCounter(fmt.Sprintf("user>>>%s>>>traffic>>>uplink", email)); c != nil {
-			deltaUp = c.Set(0)
-		}
-		if c := statsManager.GetCounter(fmt.Sprintf("user>>>%s>>>traffic>>>downlink", email)); c != nil {
-			deltaDown = c.Set(0)
-		}
-
-		if deltaUp > 0 || deltaDown > 0 {
-			cum := x.cumTraffic[u.ID]
-			cum[0] += deltaUp
-			cum[1] += deltaDown
-			x.cumTraffic[u.ID] = cum
-		}
-
-		cum := x.cumTraffic[u.ID]
-		if cum[0] > 0 || cum[1] > 0 {
-			conns = append(conns, kernel.Connection{
-				ID:       fmt.Sprintf("xray-%d", u.ID),
-				UserID:   u.ID,
-				Upload:   cum[0],
-				Download: cum[1],
-			})
-		}
-	}
-	return conns, nil
+	return x.aggregateStats()
 }
 
 func (x *Xray) CloseConnection(_ context.Context, connID string) error {
@@ -273,10 +241,477 @@ func (x *Xray) CloseConnection(_ context.Context, connID string) error {
 
 func (x *Xray) SetSpeedLimitFunc(_ func(string) *rate.Limiter) {}
 
+// ─── User management (non-disruptive where possible) ────────────────────────
+
+// AddUsers adds new users to the running kernel via xray's UserManager API.
+// For protocols that support UserManager (vmess, vless, trojan, shadowsocks),
+// this is truly hitless — no restart, no connection disruption.
+// For unsupported protocols (socks, http), falls back to full restart.
+//
+// Delta "add" events also carry property updates (speed/device limits) for
+// existing users, so this method always merges properties and refreshes the
+// dispatcher limits — even when no brand-new users need to be added.
+func (x *Xray) AddUsers(users []panel.User) (int, error) {
+	x.mu.Lock()
+	if x.instance == nil {
+		x.mu.Unlock()
+		return 0, fmt.Errorf("not running")
+	}
+
+	// Merge: overwrite existing users' properties, collect truly new ones.
+	userMap := make(map[int]panel.User, len(x.users))
+	for _, u := range x.users {
+		userMap[u.ID] = u
+	}
+	var toAdd []panel.User
+	for _, u := range users {
+		if _, exists := userMap[u.ID]; !exists {
+			toAdd = append(toAdd, u)
+		}
+		userMap[u.ID] = u // always overwrite properties
+	}
+	merged := make([]panel.User, 0, len(userMap))
+	for _, u := range userMap {
+		merged = append(merged, u)
+	}
+
+	if len(toAdd) == 0 {
+		// No new kernel users, but properties (limits) may have changed.
+		x.users = merged
+		x.mu.Unlock()
+		x.updateDispatcherLimits(merged)
+		return 0, nil
+	}
+
+	um, err := x.getUserManager()
+	if err != nil {
+		// Protocol doesn't support UserManager → full restart
+		nc, cf, kf := x.nodeConfig, x.certFile, x.keyFile
+		x.mu.Unlock()
+		slog.Debug("xray: AddUsers fallback to restart", "reason", err)
+		if err := x.Start(nc, merged, cf, kf); err != nil {
+			return 0, err
+		}
+		return len(toAdd), nil
+	}
+
+	proto := x.protocol
+	nc := x.nodeConfig
+	x.mu.Unlock()
+
+	ctx := context.Background()
+	added := 0
+	for _, u := range toAdd {
+		mu, err := toMemoryUser(proto, nc, u)
+		if err != nil {
+			slog.Warn("xray: skip user, cannot build account", "user", u.ID, "error", err)
+			continue
+		}
+		if err := um.AddUser(ctx, mu); err != nil {
+			slog.Warn("xray: AddUser failed", "user", u.ID, "error", err)
+			continue
+		}
+		added++
+	}
+
+	// Update bookkeeping with full merged list (new users + updated properties).
+	x.mu.Lock()
+	x.users = merged
+	x.mu.Unlock()
+	x.updateDispatcherLimits(merged)
+
+	slog.Info("xray: users added via UserManager", "added", added, "total", len(merged))
+	return added, nil
+}
+
+// RemoveUsers removes users from the running kernel via xray's UserManager API.
+// Truly hitless for supported protocols — remaining connections unaffected.
+func (x *Xray) RemoveUsers(users []panel.User) (int, error) {
+	x.mu.Lock()
+	if x.instance == nil {
+		x.mu.Unlock()
+		return 0, fmt.Errorf("not running")
+	}
+	removeSet := make(map[int]struct{}, len(users))
+	for _, u := range users {
+		removeSet[u.ID] = struct{}{}
+	}
+	var kept []panel.User
+	removed := 0
+	for _, u := range x.users {
+		if _, rm := removeSet[u.ID]; rm {
+			removed++
+		} else {
+			kept = append(kept, u)
+		}
+	}
+	if removed == 0 {
+		x.mu.Unlock()
+		return 0, nil
+	}
+
+	if len(kept) == 0 {
+		x.mu.Unlock()
+		x.Stop()
+		return removed, nil
+	}
+
+	um, err := x.getUserManager()
+	if err != nil {
+		nc, cf, kf := x.nodeConfig, x.certFile, x.keyFile
+		x.mu.Unlock()
+		slog.Debug("xray: RemoveUsers fallback to restart", "reason", err)
+		if err := x.Start(nc, kept, cf, kf); err != nil {
+			return 0, err
+		}
+		return removed, nil
+	}
+	x.mu.Unlock()
+
+	ctx := context.Background()
+	actualRemoved := 0
+	for _, u := range users {
+		email := userEmail(u.ID)
+		if err := um.RemoveUser(ctx, email); err != nil {
+			slog.Debug("xray: RemoveUser skipped", "user", u.ID, "error", err)
+			continue
+		}
+		actualRemoved++
+	}
+
+	x.mu.Lock()
+	x.users = kept
+	x.mu.Unlock()
+	x.updateDispatcherLimits(kept)
+
+	slog.Info("xray: users removed via UserManager", "removed", actualRemoved, "total", len(kept))
+	return actualRemoved, nil
+}
+
+// UpdateUsers replaces the entire user set. If only speed/device limits
+// changed, updates the dispatcher without restarting. Otherwise uses
+// UserManager for hitless add/remove where supported.
+func (x *Xray) UpdateUsers(users []panel.User) (added, removed int, err error) {
+	x.mu.Lock()
+	if x.instance == nil {
+		x.mu.Unlock()
+		return 0, 0, fmt.Errorf("not running")
+	}
+	toAdd, toRemove := kernel.UserDiff(x.users, users)
+	added, removed = len(toAdd), len(toRemove)
+
+	if added == 0 && removed == 0 {
+		// Only limits changed — update dispatcher without restart.
+		x.users = users
+		x.mu.Unlock()
+		x.updateDispatcherLimits(users)
+		slog.Info("xray: limits updated, kernel unchanged")
+		return 0, 0, nil
+	}
+
+	um, umErr := x.getUserManager()
+	if umErr != nil {
+		// Protocol doesn't support UserManager → full restart
+		nc, cf, kf := x.nodeConfig, x.certFile, x.keyFile
+		x.mu.Unlock()
+		slog.Debug("xray: UpdateUsers fallback to restart", "reason", umErr)
+		if err = x.Start(nc, users, cf, kf); err != nil {
+			return 0, 0, err
+		}
+		return
+	}
+
+	proto := x.protocol
+	nc := x.nodeConfig
+	x.mu.Unlock()
+
+	ctx := context.Background()
+
+	// Remove first, then add (order matters for UUID changes on same ID)
+	for _, u := range toRemove {
+		email := userEmail(u.ID)
+		if err := um.RemoveUser(ctx, email); err != nil {
+			slog.Debug("xray: RemoveUser skipped in UpdateUsers", "user", u.ID, "error", err)
+		}
+	}
+	for _, u := range toAdd {
+		mu, err := toMemoryUser(proto, nc, u)
+		if err != nil {
+			slog.Warn("xray: skip user in UpdateUsers", "user", u.ID, "error", err)
+			continue
+		}
+		if err := um.AddUser(ctx, mu); err != nil {
+			slog.Warn("xray: AddUser failed in UpdateUsers", "user", u.ID, "error", err)
+		}
+	}
+
+	x.mu.Lock()
+	x.users = users
+	x.mu.Unlock()
+	x.updateDispatcherLimits(users)
+
+	slog.Info("xray: users updated via UserManager", "added", added, "removed", removed, "total", len(users))
+	return
+}
+
 var _ kernel.Kernel = (*Xray)(nil)
 
-// updateDispatcherLimits configures the global LimitDispatcher with
-// per-user device limits and speed limits.
+// ─── Internal helpers ───────────────────────────────────────────────────────
+
+// getUserManager extracts the UserManager from the running xray instance's
+// inbound handler. Must be called with x.mu held.
+// Returns error for protocols that don't support UserManager (socks, http).
+func (x *Xray) getUserManager() (xrayProxy.UserManager, error) {
+	if x.instance == nil {
+		return nil, fmt.Errorf("instance is nil")
+	}
+
+	im := x.instance.GetFeature(inbound.ManagerType())
+	if im == nil {
+		return nil, fmt.Errorf("inbound manager not available")
+	}
+	inboundMgr, ok := im.(inbound.Manager)
+	if !ok {
+		return nil, fmt.Errorf("inbound manager type assertion failed")
+	}
+
+	handler, err := inboundMgr.GetHandler(context.Background(), x.inboundTag)
+	if err != nil {
+		return nil, fmt.Errorf("get handler %q: %w", x.inboundTag, err)
+	}
+
+	gi, ok := handler.(xrayProxy.GetInbound)
+	if !ok {
+		return nil, fmt.Errorf("handler does not implement GetInbound")
+	}
+
+	um, ok := gi.GetInbound().(xrayProxy.UserManager)
+	if !ok {
+		return nil, fmt.Errorf("protocol %q does not support UserManager", x.protocol)
+	}
+
+	return um, nil
+}
+
+// toMemoryUser converts a panel.User into an xray protocol.MemoryUser for the
+// given protocol. Each protocol needs a different Account type.
+func toMemoryUser(proto string, nc *panel.NodeConfig, u panel.User) (*protocol.MemoryUser, error) {
+	email := userEmail(u.ID)
+	mu := &protocol.MemoryUser{Email: email, Level: 0}
+
+	switch proto {
+	case "vmess":
+		id, err := uuid.ParseString(u.UUID)
+		if err != nil {
+			return nil, fmt.Errorf("parse vmess UUID: %w", err)
+		}
+		mu.Account = &vmess.MemoryAccount{
+			ID:       protocol.NewID(id),
+			Security: protocol.SecurityType_AUTO,
+		}
+
+	case "vless":
+		id, err := uuid.ParseString(u.UUID)
+		if err != nil {
+			return nil, fmt.Errorf("parse vless UUID: %w", err)
+		}
+		account := &vless.MemoryAccount{
+			ID:         protocol.NewID(id),
+			Encryption: "none",
+		}
+		if nc.Flow != "" {
+			account.Flow = nc.Flow
+		}
+		mu.Account = account
+
+	case "trojan":
+		mu.Account = &trojan.MemoryAccount{
+			Password: u.UUID,
+			Key:      trojanHexSha224(u.UUID),
+		}
+
+	case "shadowsocks":
+		if strings.HasPrefix(nc.Cipher, "2022-blake3-") {
+			// 2022-blake3 multi-user mode
+			mu.Account = &ss2022.MemoryAccount{Key: u.UUID}
+		} else {
+			// Traditional SS — build via getCipher path
+			ct := parseCipherType(nc.Cipher)
+			cipherObj, err := (&shadowsocks.Account{CipherType: ct, Password: u.UUID}).AsAccount()
+			if err != nil {
+				return nil, fmt.Errorf("build ss account: %w", err)
+			}
+			mu.Account = cipherObj
+		}
+
+	default:
+		return nil, fmt.Errorf("protocol %q does not support MemoryUser", proto)
+	}
+
+	return mu, nil
+}
+
+// parseCipherType maps a cipher name string to the xray CipherType enum.
+func parseCipherType(cipher string) shadowsocks.CipherType {
+	switch cipher {
+	case "aes-128-gcm":
+		return shadowsocks.CipherType_AES_128_GCM
+	case "aes-256-gcm":
+		return shadowsocks.CipherType_AES_256_GCM
+	case "chacha20-ietf-poly1305", "chacha20-poly1305":
+		return shadowsocks.CipherType_CHACHA20_POLY1305
+	case "xchacha20-ietf-poly1305", "xchacha20-poly1305":
+		return shadowsocks.CipherType_XCHACHA20_POLY1305
+	case "none", "plain":
+		return shadowsocks.CipherType_NONE
+	default:
+		return shadowsocks.CipherType_AES_256_GCM
+	}
+}
+
+// trojanHexSha224 computes the SHA-224 hex key used by trojan protocol.
+func trojanHexSha224(password string) []byte {
+	// Replicates the exact logic from xray-core/proxy/trojan/config.go hexSha224
+	h := sha256.New224()
+	h.Write([]byte(password))
+	buf := make([]byte, 56)
+	hexEncode(buf, h.Sum(nil))
+	return buf
+}
+
+// hexEncode is a minimal hex encoder (avoids importing encoding/hex).
+func hexEncode(dst, src []byte) {
+	const hextable = "0123456789abcdef"
+	for i, v := range src {
+		dst[i*2] = hextable[v>>4]
+		dst[i*2+1] = hextable[v&0x0f]
+	}
+}
+
+// ensureGeoData downloads geo databases when routes reference geoip/geosite.
+func (x *Xray) ensureGeoData(nc *panel.NodeConfig) {
+	needIP, needSite := kernel.NeedsGeoIP(nc.Routes), kernel.NeedsGeoSite(nc.Routes)
+	if !needIP && !needSite {
+		return
+	}
+	dir := x.cfg.GeoDataDir
+	if err := geodata.Ensure(dir, needIP, needSite, "xray"); err != nil {
+		slog.Warn("geo database unavailable", "error", err)
+	}
+	os.Setenv("XRAY_LOCATION_ASSET", dir)
+}
+
+// marshalConfig builds the xray JSON config and returns the raw bytes.
+func marshalConfig(cfg config.KernelConfig, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) ([]byte, error) {
+	cfgMap := buildConfig(cfg, nc, users, certFile, keyFile)
+	data, err := json.Marshal(cfgMap)
+	if err != nil {
+		return nil, fmt.Errorf("marshal config: %w", err)
+	}
+	slog.Debug("xray config generated", "len", len(data))
+	return data, nil
+}
+
+// startWithTimeout runs instance.Start() with a bounded deadline.
+func startWithTimeout(inst *xrayCore.Instance, timeout time.Duration) error {
+	done := make(chan error, 1)
+	go func() { done <- inst.Start() }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("start xray: %w", err)
+		}
+		return nil
+	case <-time.After(timeout):
+		return fmt.Errorf("start xray: timeout after %v", timeout)
+	}
+}
+
+// closeOld shuts down a previously running instance and its dispatcher.
+// Recycling happens in a background goroutine to prevent the main thread
+// from blocking on slow connection draining, enabling "hitless" reload.
+func closeOld(inst *xrayCore.Instance, ld *LimitDispatcher) {
+	if inst == nil {
+		return
+	}
+	go func() {
+		// 1. Drain connections gracefully (best effort, e.g. 5 minutes)
+		// We use a much longer timeout here than the default Stop() because
+		// it's running in background and doesn't block new user connections.
+		if ld != nil {
+			drainConns(ld, 5*time.Minute)
+		}
+		// 2. Hard close
+		inst.Close()
+		if ld != nil {
+			ld.ResetConns()
+		}
+		slog.Debug("xray: old instance recycled")
+	}()
+}
+
+// drainConns waits up to timeout for the dispatcher's active connections to
+// reach zero. Used only during graceful Stop, not during hot-reload.
+func drainConns(ld *LimitDispatcher, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		ld.mu.RLock()
+		n := len(ld.conns)
+		ld.mu.RUnlock()
+		if n == 0 {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// aggregateStats is a fallback path that reads xray's built-in stats counters
+// when LimitDispatcher has no active connections (e.g. short-lived UDP flows).
+// Must be called with x.mu held.
+func (x *Xray) aggregateStats() ([]kernel.Connection, error) {
+	sm := x.instance.GetFeature(stats.ManagerType())
+	if sm == nil {
+		return nil, nil
+	}
+	mgr, ok := sm.(stats.Manager)
+	if !ok {
+		return nil, nil
+	}
+
+	var conns []kernel.Connection
+	for _, u := range x.users {
+		email := userEmail(u.ID)
+
+		var dUp, dDown int64
+		if c := mgr.GetCounter(fmt.Sprintf("user>>>%s>>>traffic>>>uplink", email)); c != nil {
+			dUp = c.Set(0)
+		}
+		if c := mgr.GetCounter(fmt.Sprintf("user>>>%s>>>traffic>>>downlink", email)); c != nil {
+			dDown = c.Set(0)
+		}
+
+		if dUp > 0 || dDown > 0 {
+			cum := x.cumTraffic[u.ID]
+			cum[0] += dUp
+			cum[1] += dDown
+			x.cumTraffic[u.ID] = cum
+		}
+
+		if cum := x.cumTraffic[u.ID]; cum[0] > 0 || cum[1] > 0 {
+			conns = append(conns, kernel.Connection{
+				ID:       fmt.Sprintf("xray-%d", u.ID),
+				UserID:   u.ID,
+				Upload:   cum[0],
+				Download: cum[1],
+			})
+		}
+	}
+	return conns, nil
+}
+
+// updateDispatcherLimits configures the LimitDispatcher with per-user
+// device and speed limits.
 func (x *Xray) updateDispatcherLimits(users []panel.User) {
 	x.mu.Lock()
 	ld := x.limitDispatcher
@@ -285,16 +720,13 @@ func (x *Xray) updateDispatcherLimits(users []panel.User) {
 		return
 	}
 
-	emailToUID := make(map[string]int, len(users))
+	emailToUID := make(map[string]int, len(users)*2)
 	deviceLimits := make(map[string]int)
 	speedLimits := make(map[string]int)
 
 	for _, u := range users {
 		email := userEmail(u.ID)
 		emailToUID[email] = u.ID
-		// SOCKS/HTTP protocols use the raw UUID as User.Email in xray's session,
-		// while VMess/VLESS/Trojan use the "user@<id>" format. Map both so that
-		// limits work for all protocols.
 		emailToUID[u.UUID] = u.ID
 		if u.DeviceLimit > 0 {
 			deviceLimits[email] = u.DeviceLimit
@@ -314,9 +746,8 @@ func (x *Xray) updateDispatcherLimits(users []panel.User) {
 // own LimitDispatcher.
 var xrayCreationMu sync.Mutex
 
-// computeKernelHash returns a hash of the config + user identities (ID, UUID)
-// that would require a kernel restart if changed. Limit-only changes are
-// excluded so they can be applied without restart.
+// computeKernelHash returns a hash of config + user identities that would
+// require a kernel restart if changed. Limit-only changes are excluded.
 func computeKernelHash(nc *panel.NodeConfig, users []panel.User) string {
 	h := sha256.New()
 	configData, _ := json.Marshal(nc)
