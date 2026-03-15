@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main, master, dev]
+    tags: ["v*"]
   pull_request:
     branches: [main, master]
 
@@ -23,7 +24,7 @@ jobs:
           cache: true
 
       - name: Run tests
-        run: go test -v -race -count=1 ./internal/...
+        run: make test
 
   build:
     name: Build
@@ -46,16 +47,12 @@ jobs:
           cache: true
 
       - name: Build
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 0
         run: |
-          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
-          COMMIT=$(git rev-parse --short HEAD)
-          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE}"
-          go build -ldflags "${LDFLAGS}" -tags "with_clash_api,with_quic" -o xboard-node-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/xboard-node
+          if [ "${{ matrix.goarch }}" = "amd64" ]; then
+            make build-linux
+          else
+            make build-linux-arm64
+          fi
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
@@ -105,12 +102,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Download all artifacts
         uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            xboard-node-linux-amd64/xboard-node-linux-amd64
-            xboard-node-linux-arm64/xboard-node-linux-arm64
+            xboard-node-linux-amd64
+            xboard-node-linux-arm64
           draft: false
           prerelease: false
         env:
