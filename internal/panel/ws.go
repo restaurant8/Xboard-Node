@@ -303,7 +303,7 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 
 	// Helper to unmarshal and decode with weak Typing
 	decodeData := func(data []byte, target interface{}) error {
-		var raw any
+		var raw map[string]interface{}
 		if err := json.Unmarshal(data, &raw); err != nil {
 			return err
 		}

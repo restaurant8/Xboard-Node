@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -145,19 +146,31 @@ func (c *Client) Report(traffic map[int][2]int64, alive map[int][]string, online
 }
 
 // decodeWeakRaw decodes an interface (from JSON map) into a struct using weak type conversion.
-func decodeWeakRaw(input interface{}, output interface{}) error {
+func decodeWeakRaw(input map[string]interface{}, output interface{}) error {
 	config := &mapstructure.DecoderConfig{
 		Metadata:         nil,
 		Result:           output,
 		WeaklyTypedInput: true,
-		TagName:          "json", // Follow JSON tags
+		TagName:          "json",
+		DecodeHook: mapstructure.ComposeDecodeHookFunc(
+			func(f, t reflect.Type, v interface{}) (interface{}, error) {
+				// Handle []interface{} -> StringOrArray
+				if t == reflect.TypeOf(StringOrArray("")) && f.Kind() == reflect.Slice {
+					arr, _ := v.([]interface{})
+					var strs []string
+					for _, x := range arr {
+						if s, ok := x.(string); ok {
+							strs = append(strs, s)
+						}
+					}
+					return StringOrArray(strings.Join(strs, "\n")), nil
+				}
+				return v, nil
+			},
+			mapstructure.StringToSliceHookFunc(","),
+		),
 	}
-
-	decoder, err := mapstructure.NewDecoder(config)
-	if err != nil {
-		return err
-	}
-
+	decoder, _ := mapstructure.NewDecoder(config)
 	return decoder.Decode(input)
 }
 

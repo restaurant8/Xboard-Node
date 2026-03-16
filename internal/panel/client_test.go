@@ -293,3 +293,45 @@ func TestClient_NodeTypeInQuery(t *testing.T) {
 	})
 	client.GetConfig()
 }
+
+func TestStringOrArrayDecodeHook(t *testing.T) {
+	// Test case: []interface{} -> StringOrArray
+	input := map[string]interface{}{
+		"padding_scheme": []interface{}{"stop=8", "0=30-30", "1=100-400"},
+	}
+
+	type TestConfig struct {
+		PaddingScheme StringOrArray `json:"padding_scheme"`
+	}
+
+	var cfg TestConfig
+	if err := decodeWeakRaw(input, &cfg); err != nil {
+		t.Fatalf("decodeWeakRaw failed: %v", err)
+	}
+
+	want := "stop=8\n0=30-30\n1=100-400"
+	if string(cfg.PaddingScheme) != want {
+		t.Errorf("got %q, want %q", cfg.PaddingScheme, want)
+	}
+}
+
+func TestStringOrArrayDecodeHook_String(t *testing.T) {
+	// Test case: string -> StringOrArray
+	input := map[string]interface{}{
+		"padding_scheme": "stop=8\n0=30-30",
+	}
+
+	type TestConfig struct {
+		PaddingScheme StringOrArray `json:"padding_scheme"`
+	}
+
+	var cfg TestConfig
+	if err := decodeWeakRaw(input, &cfg); err != nil {
+		t.Fatalf("decodeWeakRaw failed: %v", err)
+	}
+
+	want := "stop=8\n0=30-30"
+	if string(cfg.PaddingScheme) != want {
+		t.Errorf("got %q, want %q", cfg.PaddingScheme, want)
+	}
+}
