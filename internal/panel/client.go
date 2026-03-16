@@ -10,11 +10,18 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/go-viper/mapstructure/v2"
+)
+
+var (
+	trafficMapPool = sync.Pool{New: func() interface{} { return make(map[string][2]int64) }}
+	aliveMapPool   = sync.Pool{New: func() interface{} { return make(map[string][]string) }}
+	onlineMapPool  = sync.Pool{New: func() interface{} { return make(map[string]int) }}
 )
 
 // Client communicates with the Xboard panel API
@@ -78,30 +85,48 @@ func (c *Client) Report(traffic map[int][2]int64, alive map[int][]string, online
 	cpu float64, mem, swap, disk [2]uint64,
 	metrics map[string]interface{},
 ) error {
-	payload := map[string]interface{}{}
+	payload := make(map[string]interface{})
 
 	if len(traffic) > 0 {
-		t := make(map[string][2]int64, len(traffic))
+		t := trafficMapPool.Get().(map[string][2]int64)
 		for uid, d := range traffic {
 			t[strconv.Itoa(uid)] = d
 		}
 		payload["traffic"] = t
+		defer func() {
+			for k := range t {
+				delete(t, k)
+			}
+			trafficMapPool.Put(t)
+		}()
 	}
 
 	if len(alive) > 0 {
-		a := make(map[string][]string, len(alive))
+		a := aliveMapPool.Get().(map[string][]string)
 		for uid, ips := range alive {
 			a[strconv.Itoa(uid)] = ips
 		}
 		payload["alive"] = a
+		defer func() {
+			for k := range a {
+				delete(a, k)
+			}
+			aliveMapPool.Put(a)
+		}()
 	}
 
 	if len(online) > 0 {
-		o := make(map[string]int, len(online))
+		o := onlineMapPool.Get().(map[string]int)
 		for uid, count := range online {
 			o[strconv.Itoa(uid)] = count
 		}
 		payload["online"] = o
+		defer func() {
+			for k := range o {
+				delete(o, k)
+			}
+			onlineMapPool.Put(o)
+		}()
 	}
 
 	status := map[string]interface{}{

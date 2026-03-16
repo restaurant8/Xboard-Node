@@ -3,8 +3,10 @@ package service
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"sort"
@@ -33,8 +35,12 @@ type Service struct {
 	lastConfig *panel.NodeConfig
 	lastUsers  []panel.User
 
-	lastAppliedPort int    // the port currently bound by the kernel
-	lastAppliedIP   string // the listen IP currently bound by the kernel
+	// appliedState tracks the configuration and users that are currently
+	// successfully running in the kernel.
+	appliedState struct {
+		Config *panel.NodeConfig
+		Users  []panel.User
+	}
 
 	pushInterval int // seconds
 	pullInterval int // seconds
@@ -282,13 +288,14 @@ func (s *Service) initialSetup(ctx context.Context) error {
 	// Update service-level config overrides from remote NodeConfig if present
 	s.applyRemoteOverrides(ctx, nodeConfig)
 
-	s.lastAppliedPort = nodeConfig.ServerPort
-	s.lastAppliedIP = nodeConfig.ListenIP
-
-	certFile, keyFile := s.cert.CertFile(), s.cert.KeyFile()
-	if err := s.kernel.Start(nodeConfig, users, certFile, keyFile); err != nil {
+	if err := s.kernel.Start(nodeConfig, users, s.cert.CertFile(), s.cert.KeyFile()); err != nil {
 		return fmt.Errorf("start kernel: %w", err)
 	}
+
+	// record applied state on success
+	s.appliedState.Config = nodeConfig
+	s.appliedState.Users = users
+
 	return nil
 }
 
@@ -380,6 +387,12 @@ func (s *Service) newWSClient(wsURL string) *panel.WSClient {
 			case s.wsStatusCh <- status:
 			default:
 			}
+		},
+		func() map[string]interface{} {
+			status := monitor.Collect()
+			m := s.buildMetrics(status)
+			m["kernel_status"] = s.kernel.IsRunning()
+			return m
 		},
 	)
 }
@@ -576,15 +589,22 @@ func (s *Service) updateUserState(users []panel.User) {
 }
 
 // startKernel starts (or restarts) the kernel with the given config/users and
-// records the bound port/IP. Returns false on error (already logged).
+// records the successfully applied state. Returns false on error.
 func (s *Service) startKernel(nc *panel.NodeConfig, users []panel.User) bool {
-	certFile, keyFile := s.cert.CertFile(), s.cert.KeyFile()
-	if err := s.kernel.Start(nc, users, certFile, keyFile); err != nil {
+	if err := s.kernel.Start(nc, users, s.cert.CertFile(), s.cert.KeyFile()); err != nil {
 		slog.Error("failed to start kernel", "error", err)
 		return false
 	}
-	s.lastAppliedPort = nc.ServerPort
-	s.lastAppliedIP = nc.ListenIP
+
+	s.appliedState.Config = nc
+	s.appliedState.Users = users
+
+	slog.Info("kernel started successfully",
+		"node_id", s.cfg.Panel.NodeID,
+		"protocol", nc.Protocol,
+		"port", nc.ServerPort,
+		"users", len(users),
+	)
 	return true
 }
 
@@ -710,26 +730,27 @@ func (s *Service) applyChanges(ctx context.Context, configChanged, usersChanged 
 		if len(s.lastUsers) == 0 {
 			slog.Warn("no users, stopping kernel")
 			s.kernel.Stop()
+			s.appliedState.Users = nil
 		}
 		return
 	}
 
-	// If port or listen IP changed, must do full restart.
-	needsRestart := s.kernel.IsRunning() &&
-		(s.lastConfig.ServerPort != s.lastAppliedPort || s.lastConfig.ListenIP != s.lastAppliedIP)
-
-	if !needsRestart && s.kernel.IsRunning() {
-		certFile, keyFile := s.cert.CertFile(), s.cert.KeyFile()
-		if err := s.kernel.Reload(s.lastConfig, s.lastUsers, certFile, keyFile); err != nil {
+	// If config changed, delegate to kernel.Reload. The kernel implementation
+	// decides whether to hot-swap users, reconstruct inbounds, or restart itself.
+	if configChanged && s.kernel.IsRunning() {
+		if err := s.kernel.Reload(s.lastConfig, s.lastUsers, s.cert.CertFile(), s.cert.KeyFile()); err != nil {
 			slog.Warn("reload failed, falling back to full restart", "error", err)
-			needsRestart = true
+			s.startKernel(s.lastConfig, s.lastUsers)
+		} else {
+			s.appliedState.Config = s.lastConfig
+			s.appliedState.Users = s.lastUsers
 		}
-	}
-
-	if needsRestart || !s.kernel.IsRunning() {
+	} else if !s.kernel.IsRunning() {
 		s.startKernel(s.lastConfig, s.lastUsers)
 	}
 }
+
+// updateUserState is the single point that refreshes limiter, speedTracker,
 
 func (s *Service) trackAndEnforce(ctx context.Context) {
 	if !s.kernel.IsRunning() {
@@ -776,6 +797,7 @@ func (s *Service) pushReport() {
 	status := monitor.Collect()
 
 	metrics := s.buildMetrics(status)
+	metrics["kernel_status"] = s.kernel.IsRunning()
 
 	// Always report even if no traffic, to maintain heartbeats and status.
 	if err := s.panel.Report(
@@ -806,12 +828,16 @@ func (s *Service) pushReport() {
 // WebSocket status, and limiter hit counts.
 func (s *Service) buildMetrics(status monitor.Status) map[string]interface{} {
 	m := make(map[string]interface{})
+	online := s.tracker.CurrentOnline()
 
 	m["uptime"] = status.Uptime
+	m["goroutines"] = status.Goroutines
 
 	// Active connections (last measured during tracker.Process()).
 	m["active_connections"] = s.tracker.ActiveConnections()
 	m["total_connections"] = s.tracker.TotalConnections()
+	m["active_users"] = len(online)
+	m["total_users"] = len(s.lastUsers)
 
 	// Speed
 	m["inbound_speed"] = s.tracker.InboundSpeed()
@@ -820,6 +846,12 @@ func (s *Service) buildMetrics(status monitor.Status) map[string]interface{} {
 	// Per-core CPU usage (if available).
 	if len(status.CPUPerCore) > 0 {
 		m["cpu_per_core"] = status.CPUPerCore
+	}
+
+	m["load"] = map[string]interface{}{
+		"load1":  status.Load1,
+		"load5":  status.Load5,
+		"load15": status.Load15,
 	}
 
 	// Speed Limiter metrics
@@ -859,21 +891,19 @@ func (s *Service) buildMetrics(status monitor.Status) map[string]interface{} {
 	return m
 }
 
-// computeConfigHash returns a SHA-256 hash of the kernel-relevant node config
-// fields. BaseConfig (PushInterval/PullInterval) is excluded because it only
-// affects service-layer polling intervals and must not trigger a kernel restart.
+// computeConfigHash returns a deterministic hash of the node config.
+// It uses JSON marshaling to ensure all fields are captured, ensuring that
+// any configuration change correctly triggers a kernel reload.
 func computeConfigHash(cfg *panel.NodeConfig) string {
 	if cfg == nil {
 		return ""
 	}
-	tmp := *cfg
-	tmp.BaseConfig = panel.BaseConfig{}
-	data, err := json.Marshal(&tmp)
-	if err != nil {
-		return ""
-	}
-	h := sha256.Sum256(data)
-	return fmt.Sprintf("%x", h)
+	h := sha256.New()
+	// We marshal the entire config to be safe. Node config updates are low-frequency,
+	// so the robustness of capturing all fields outweighs the micro-performance of manual hashing.
+	data, _ := json.Marshal(cfg)
+	h.Write(data)
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 // computeUserHash returns a deterministic hash of the user list for change detection.
@@ -886,33 +916,12 @@ func computeUserHash(users []panel.User) string {
 	h := sha256.New()
 	var buf [8]byte
 	for _, u := range sorted {
-		buf[0] = byte(u.ID)
-		buf[1] = byte(u.ID >> 8)
-		buf[2] = byte(u.ID >> 16)
-		buf[3] = byte(u.ID >> 24)
-		buf[4] = byte(u.ID >> 32)
-		buf[5] = byte(u.ID >> 40)
-		buf[6] = byte(u.ID >> 48)
-		buf[7] = byte(u.ID >> 56)
+		binary.LittleEndian.PutUint64(buf[:], uint64(u.ID))
 		h.Write(buf[:])
-		h.Write([]byte(u.UUID))
-		buf[0] = byte(u.SpeedLimit)
-		buf[1] = byte(u.SpeedLimit >> 8)
-		buf[2] = byte(u.SpeedLimit >> 16)
-		buf[3] = byte(u.SpeedLimit >> 24)
-		buf[4] = byte(u.SpeedLimit >> 32)
-		buf[5] = byte(u.SpeedLimit >> 40)
-		buf[6] = byte(u.SpeedLimit >> 48)
-		buf[7] = byte(u.SpeedLimit >> 56)
+		io.WriteString(h, u.UUID)
+		binary.LittleEndian.PutUint64(buf[:], uint64(u.SpeedLimit))
 		h.Write(buf[:])
-		buf[0] = byte(u.DeviceLimit)
-		buf[1] = byte(u.DeviceLimit >> 8)
-		buf[2] = byte(u.DeviceLimit >> 16)
-		buf[3] = byte(u.DeviceLimit >> 24)
-		buf[4] = byte(u.DeviceLimit >> 32)
-		buf[5] = byte(u.DeviceLimit >> 40)
-		buf[6] = byte(u.DeviceLimit >> 48)
-		buf[7] = byte(u.DeviceLimit >> 56)
+		binary.LittleEndian.PutUint64(buf[:], uint64(u.DeviceLimit))
 		h.Write(buf[:])
 	}
 	return fmt.Sprintf("%x", h.Sum(nil))

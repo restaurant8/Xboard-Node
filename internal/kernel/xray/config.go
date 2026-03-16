@@ -460,6 +460,16 @@ func applyStreamSettings(base M, nc *panel.NodeConfig, certFile, keyFile string)
 		ss["realitySettings"] = buildRealitySettings(nc)
 	}
 
+	// Proxy Protocol
+	if nc.AcceptProxyProtocol {
+		sockopt, ok := base["streamSettings"].(M)["sockopt"].(M)
+		if !ok {
+			sockopt = M{}
+		}
+		sockopt["acceptProxyProtocol"] = true
+		ss["sockopt"] = sockopt
+	}
+
 	base["streamSettings"] = ss
 }
 

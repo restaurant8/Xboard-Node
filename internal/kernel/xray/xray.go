@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -152,7 +151,7 @@ func (x *Xray) Start(nodeConfig *panel.NodeConfig, users []panel.User, certFile,
 	x.protocol = nodeConfig.Protocol
 	x.inboundTag = nodeConfig.Protocol + "-in"
 	x.cumTraffic = make(map[int][2]int64)
-	x.lastKernelHash = computeKernelHash(nodeConfig, users)
+	x.lastKernelHash = kernel.ComputeHash(nodeConfig, users)
 	x.running.Store(true)
 	x.mu.Unlock()
 
@@ -165,23 +164,26 @@ func (x *Xray) Start(nodeConfig *panel.NodeConfig, users []panel.User, certFile,
 	return nil
 }
 
-// Reload hot-swaps dispatcher limits and, only when kernel-affecting fields
-// have changed (user identities, routes, protocol), triggers a full restart.
+// Reload updates dispatcher limits and handles configuration changes.
+// Since Xray does not support granular inbound reconstruction without an
+// instance restart for most transport/TLS settings, it triggers a full restart
+// if any kernel-affecting fields (hash mismatch) have changed.
 func (x *Xray) Reload(nodeConfig *panel.NodeConfig, users []panel.User, certFile, keyFile string) error {
 	x.updateDispatcherLimits(users)
 
-	newHash := computeKernelHash(nodeConfig, users)
+	newHash := kernel.ComputeHash(nodeConfig, users)
 
 	x.mu.Lock()
 	same := x.lastKernelHash == newHash
 	if same {
 		x.users = users
 		x.mu.Unlock()
-		slog.Info("xray: limits updated, kernel unchanged")
+		slog.Debug("xray: limits updated, kernel configuration unchanged")
 		return nil
 	}
 	x.mu.Unlock()
 
+	slog.Info("xray: configuration changed, performing full restart")
 	return x.Start(nodeConfig, users, certFile, keyFile)
 }
 
@@ -745,18 +747,3 @@ func (x *Xray) updateDispatcherLimits(users []panel.User) {
 // so that concurrent Xray instances in multi-node mode each capture their
 // own LimitDispatcher.
 var xrayCreationMu sync.Mutex
-
-// computeKernelHash returns a hash of config + user identities that would
-// require a kernel restart if changed. Limit-only changes are excluded.
-func computeKernelHash(nc *panel.NodeConfig, users []panel.User) string {
-	h := sha256.New()
-	configData, _ := json.Marshal(nc)
-	h.Write(configData)
-	sorted := make([]panel.User, len(users))
-	copy(sorted, users)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID < sorted[j].ID })
-	for _, u := range sorted {
-		fmt.Fprintf(h, "%d:%s,", u.ID, u.UUID)
-	}
-	return fmt.Sprintf("%x", h.Sum(nil))
-}

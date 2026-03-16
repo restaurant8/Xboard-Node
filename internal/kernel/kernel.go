@@ -2,6 +2,10 @@ package kernel
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"sort"
 
 	"github.com/cedar2025/xboard-node/internal/panel"
 	"golang.org/x/time/rate"
@@ -58,6 +62,21 @@ type Kernel interface {
 	// SetSpeedLimitFunc configures per-user bandwidth throttling.
 	// The function resolves a user UUID to a *rate.Limiter (nil = unlimited).
 	SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter)
+}
+
+// ComputeHash returns a hash of config + user identities that would
+// require a kernel restart/reconstruction if changed.
+func ComputeHash(nc *panel.NodeConfig, users []panel.User) string {
+	h := sha256.New()
+	configData, _ := json.Marshal(nc)
+	h.Write(configData)
+	sorted := make([]panel.User, len(users))
+	copy(sorted, users)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID < sorted[j].ID })
+	for _, u := range sorted {
+		fmt.Fprintf(h, "%d:%s,", u.ID, u.UUID)
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 // Connection represents an active proxy connection reported by the kernel.

@@ -351,9 +351,31 @@ func buildInbound(nc *panel.NodeConfig, users []panel.User, certFile, keyFile st
 		return buildSocks(base, users)
 	case "http":
 		return buildHTTP(base, nc, users, certFile, keyFile)
+	case "mieru":
+		return buildMieru(base, nc, users)
 	default:
 		return nil
 	}
+}
+
+func buildMieru(base M, nc *panel.NodeConfig, users []panel.User) M {
+	base["type"] = "mieru"
+	if nc.Transport != "" {
+		base["transport"] = nc.Transport
+	}
+	if nc.TrafficPattern != "" {
+		base["traffic_pattern"] = nc.TrafficPattern
+	}
+
+	userList := make([]M, 0, len(users))
+	for _, u := range users {
+		userList = append(userList, M{
+			"name":     u.UUID,
+			"password": u.UUID,
+		})
+	}
+	base["users"] = userList
+	return base
 }
 
 func buildShadowsocks(base M, nc *panel.NodeConfig, users []panel.User) M {
@@ -394,6 +416,8 @@ func buildVMess(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyF
 	base["users"] = userList
 
 	applyTransport(base, nc)
+	applyMultiplex(base, nc)
+
 	if nc.TLS == 1 {
 		base["tls"] = buildTLSConfig(nc, certFile, keyFile)
 	}
@@ -418,6 +442,7 @@ func buildVLESS(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyF
 	base["users"] = userList
 
 	applyTransport(base, nc)
+	applyMultiplex(base, nc)
 
 	if nc.TLS == 1 {
 		base["tls"] = buildTLSConfig(nc, certFile, keyFile)
@@ -441,6 +466,8 @@ func buildTrojan(base M, nc *panel.NodeConfig, users []panel.User, certFile, key
 	base["users"] = userList
 
 	applyTransport(base, nc)
+	applyMultiplex(base, nc)
+
 	if nc.TLS == 1 {
 		base["tls"] = buildTLSConfig(nc, certFile, keyFile)
 	} else if nc.TLS == 2 {
@@ -741,4 +768,32 @@ func buildRealityConfig(nc *panel.NodeConfig) M {
 
 	tls["reality"] = reality
 	return tls
+}
+
+func applyMultiplex(base M, nc *panel.NodeConfig) {
+	if nc.Multiplex == nil || !nc.Multiplex.Enabled {
+		return
+	}
+
+	mux := M{
+		"enabled": true,
+	}
+	if nc.Multiplex.Padding {
+		mux["padding"] = true
+	}
+
+	if nc.Multiplex.Brutal != nil && nc.Multiplex.Brutal.Enabled {
+		brutal := M{
+			"enabled": true,
+		}
+		if nc.Multiplex.Brutal.UpMbps > 0 {
+			brutal["up_mbps"] = nc.Multiplex.Brutal.UpMbps
+		}
+		if nc.Multiplex.Brutal.DownMbps > 0 {
+			brutal["down_mbps"] = nc.Multiplex.Brutal.DownMbps
+		}
+		mux["brutal"] = brutal
+	}
+
+	base["multiplex"] = mux
 }

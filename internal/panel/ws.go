@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"net/url"
 	"strconv"
 	"sync/atomic"
@@ -67,6 +68,7 @@ type WSClient struct {
 	nodeID   int
 	onEvent  func(WSEvent)
 	onStatus func(WSStatusChange)
+	onPing   func() map[string]interface{}
 
 	connected atomic.Bool
 }
@@ -74,13 +76,14 @@ type WSClient struct {
 // NewWSClient creates a new WebSocket client.
 // wsURL is the base WebSocket URL (e.g. "ws://panel.example.com:8076").
 // token and nodeID are used for authentication via query parameters.
-func NewWSClient(wsURL string, token string, nodeID int, onEvent func(WSEvent), onStatus func(WSStatusChange)) *WSClient {
+func NewWSClient(wsURL string, token string, nodeID int, onEvent func(WSEvent), onStatus func(WSStatusChange), onPing func() map[string]interface{}) *WSClient {
 	return &WSClient{
 		wsURL:    wsURL,
 		token:    token,
 		nodeID:   nodeID,
 		onEvent:  onEvent,
 		onStatus: onStatus,
+		onPing:   onPing,
 	}
 }
 
@@ -122,15 +125,19 @@ func (w *WSClient) Run(ctx context.Context) {
 			backoff = time.Second
 		}
 
-		timer := time.NewTimer(backoff)
+		// Apply exponential backoff with jitter to prevent thundering herd.
+		jitter := time.Duration(rand.Int63n(int64(backoff / 5)))
+		wait := backoff + jitter
+
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 			return
 		case <-timer.C:
 		}
-		if backoff < 30*time.Second {
-			backoff = min(backoff*2, 30*time.Second)
+		if backoff < 60*time.Second {
+			backoff = min(backoff*2, 60*time.Second)
 		}
 	}
 }
@@ -186,8 +193,9 @@ func (w *WSClient) connect(ctx context.Context) error {
 		slog.Info("ws connected and authenticated")
 	}
 
-	// Ping interval: send pong responses to server pings
-	const pingInterval = 50 * time.Second
+	// Ping interval: send pong responses to server pings.
+	// We also use this timer to trigger periodic status pushes (10s interval).
+	const reportInterval = 10 * time.Second
 
 	msgCh := make(chan wsMessage, 16)
 	errCh := make(chan error, 1)
@@ -211,8 +219,11 @@ func (w *WSClient) connect(ctx context.Context) error {
 		}
 	}()
 
-	pingTimer := time.NewTimer(pingInterval)
-	defer pingTimer.Stop()
+	reportTicker := time.NewTicker(reportInterval)
+	defer reportTicker.Stop()
+
+	// writeCh decouples data collection from network I/O.
+	writeCh := make(chan wsMessage, 8)
 
 	for {
 		select {
@@ -227,16 +238,38 @@ func (w *WSClient) connect(ctx context.Context) error {
 			return fmt.Errorf("read: %w", err)
 
 		case msg := <-msgCh:
-			pingTimer.Reset(pingInterval)
 			w.handleMessage(msg)
-
-		case <-pingTimer.C:
-			// Send pong to keep connection alive
-			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := conn.WriteJSON(wsMessage{Event: "pong"}); err != nil {
-				return fmt.Errorf("pong: %w", err)
+			if msg.Event == "ping" {
+				// Queue an immediate pong
+				select {
+				case writeCh <- wsMessage{Event: "pong"}:
+				default:
+					slog.Warn("ws write channel full, skipping pong")
+				}
 			}
-			pingTimer.Reset(pingInterval)
+
+		case <-reportTicker.C:
+			// Send periodic node.status via WebSocket
+			if w.onPing != nil {
+				msg := wsMessage{Event: "node.status"}
+				if stats := w.onPing(); stats != nil {
+					data, _ := json.Marshal(stats)
+					msg.Data = data
+					msg.Timestamp = time.Now().Unix()
+				}
+				select {
+				case writeCh <- msg:
+				default:
+					slog.Warn("ws write channel full, skipping status push (network slow?)")
+				}
+			}
+
+		case msg := <-writeCh:
+			// Perform the actual network write asynchronously in this loop.
+			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := conn.WriteJSON(msg); err != nil {
+				return fmt.Errorf("write: %w", err)
+			}
 		}
 	}
 }
@@ -270,7 +303,7 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 
 	// Helper to unmarshal and decode with weak Typing
 	decodeData := func(data []byte, target interface{}) error {
-		var raw map[string]interface{}
+		var raw any
 		if err := json.Unmarshal(data, &raw); err != nil {
 			return err
 		}
@@ -279,25 +312,25 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 
 	switch msg.Event {
 	case WSEventSyncConfig:
-		slog.Info("ws sync config event received")
+		slog.Debug("ws sync config event received")
 		var p syncConfigPayload
-		if err := decodeData(msg.Data, &p); err != nil {
+		if err := decodeData(msg.Data, &p); err != nil && p.Config.Protocol != "" {
 			slog.Warn("ws: cannot decode config payload", "error", err)
 			return
 		}
 		event.Config = &p.Config
 
 	case WSEventSyncUsers:
-		slog.Info("ws sync users event received")
+		slog.Debug("ws sync users event received")
 		var p syncUsersPayload
-		if err := decodeData(msg.Data, &p); err != nil {
+		if err := decodeData(msg.Data, &p); err != nil && len(p.Users) > 0 {
 			slog.Warn("ws: cannot decode users payload", "error", err)
 			return
 		}
 		event.Users = p.Users
 
 	case WSEventSyncUserDelta:
-		slog.Info("ws sync user delta event received")
+		slog.Debug("ws sync user delta event received")
 		var p syncUserDeltaPayload
 		if err := decodeData(msg.Data, &p); err != nil {
 			slog.Warn("ws: cannot decode user delta payload", "error", err)

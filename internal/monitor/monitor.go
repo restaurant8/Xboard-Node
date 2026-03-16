@@ -7,6 +7,7 @@ import (
 
 	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/disk"
+	"github.com/shirou/gopsutil/v4/load"
 	"github.com/shirou/gopsutil/v4/mem"
 )
 
@@ -24,12 +25,16 @@ type Status struct {
 	Uptime     uint64
 	CPU        float64
 	CPUPerCore []float64
+	Load1      float64
+	Load5      float64
+	Load15     float64
 	MemTotal   uint64
 	MemUsed    uint64
 	SwapTotal  uint64
 	SwapUsed   uint64
 	DiskTotal  uint64
 	DiskUsed   uint64
+	Goroutines int
 
 	// GC metrics (process-wide)
 	NumGC       uint32
@@ -53,6 +58,12 @@ func Collect() Status {
 		s.CPUPerCore = perCore
 	}
 
+	if loadAvg, err := load.Avg(); err == nil {
+		s.Load1 = loadAvg.Load1
+		s.Load5 = loadAvg.Load5
+		s.Load15 = loadAvg.Load15
+	}
+
 	if vmStat, err := mem.VirtualMemory(); err == nil {
 		s.MemTotal = vmStat.Total
 		s.MemUsed = vmStat.Used
@@ -71,6 +82,7 @@ func Collect() Status {
 	// GC metrics
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
+	s.Goroutines = runtime.NumGoroutine()
 	s.NumGC = ms.NumGC
 	if ms.NumGC > 0 {
 		// PauseNs is a ring buffer of the most recent GC pause times.

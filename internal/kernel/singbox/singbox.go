@@ -70,7 +70,7 @@ func (s *SingBox) Name() string { return "sing-box" }
 func (s *SingBox) Protocols() []string {
 	return []string{
 		"vmess", "vless", "trojan", "shadowsocks",
-		"hysteria2", "tuic", "naive", "socks", "http", "anytls",
+		"hysteria2", "tuic", "naive", "socks", "http", "anytls", "mieru",
 	}
 }
 
@@ -175,55 +175,61 @@ func (s *SingBox) Reload(nodeConfig *panel.NodeConfig, users []panel.User, certF
 
 	nopFactory := singLog.NewNOPFactory()
 
+	// Configuration hash check for inbound reconstruction
+	configChanged := s.nodeConfig == nil || kernel.ComputeHash(nodeConfig, users) != kernel.ComputeHash(s.nodeConfig, s.users)
+
 	for _, inb := range opts.Inbounds {
 		tag := inb.Tag
-		if existing, ok := im.Get(tag); ok && existing.Type() == inb.Type {
-			var err error
-			switch v := existing.(type) {
-			case adapter.UpdatableInbound[option.VMessUser]:
-				if opts, ok := inb.Options.(*option.VMessInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
+		if !configChanged {
+			if existing, ok := im.Get(tag); ok && existing.Type() == inb.Type {
+				var err error
+				switch v := existing.(type) {
+				case adapter.UpdatableInbound[option.VMessUser]:
+					if opts, ok := inb.Options.(*option.VMessInboundOptions); ok {
+						err = v.UpdateUsers(opts.Users)
+					}
+				case adapter.UpdatableInbound[option.VLESSUser]:
+					if opts, ok := inb.Options.(*option.VLESSInboundOptions); ok {
+						err = v.UpdateUsers(opts.Users)
+					}
+				case adapter.UpdatableInbound[option.TrojanUser]:
+					if opts, ok := inb.Options.(*option.TrojanInboundOptions); ok {
+						err = v.UpdateUsers(opts.Users)
+					}
+				case adapter.UpdatableInbound[option.Hysteria2User]:
+					if opts, ok := inb.Options.(*option.Hysteria2InboundOptions); ok {
+						err = v.UpdateUsers(opts.Users)
+					}
+				case adapter.UpdatableShadowsocksInbound:
+					if opts, ok := inb.Options.(*option.ShadowsocksInboundOptions); ok {
+						err = v.UpdateUsersByOptions(opts.Users)
+					}
+				case adapter.UpdatableInbound[option.TUICUser]:
+					if opts, ok := inb.Options.(*option.TUICInboundOptions); ok {
+						err = v.UpdateUsers(opts.Users)
+					}
+				case adapter.UpdatableInbound[option.AnyTLSUser]:
+					if opts, ok := inb.Options.(*option.AnyTLSInboundOptions); ok {
+						err = v.UpdateUsers(opts.Users)
+					}
+				case adapter.UpdatableInbound[auth.User]:
+					switch opts := inb.Options.(type) {
+					case *option.NaiveInboundOptions:
+						err = v.UpdateUsers(opts.Users)
+					case *option.SocksInboundOptions:
+						err = v.UpdateUsers(opts.Users)
+					case *option.HTTPMixedInboundOptions:
+						err = v.UpdateUsers(opts.Users)
+					}
 				}
-			case adapter.UpdatableInbound[option.VLESSUser]:
-				if opts, ok := inb.Options.(*option.VLESSInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
+				if err == nil {
+					continue
 				}
-			case adapter.UpdatableInbound[option.TrojanUser]:
-				if opts, ok := inb.Options.(*option.TrojanInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableInbound[option.Hysteria2User]:
-				if opts, ok := inb.Options.(*option.Hysteria2InboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableShadowsocksInbound:
-				if opts, ok := inb.Options.(*option.ShadowsocksInboundOptions); ok {
-					err = v.UpdateUsersByOptions(opts.Users)
-				}
-			case adapter.UpdatableInbound[option.TUICUser]:
-				if opts, ok := inb.Options.(*option.TUICInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableInbound[option.AnyTLSUser]:
-				if opts, ok := inb.Options.(*option.AnyTLSInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableInbound[auth.User]:
-				switch opts := inb.Options.(type) {
-				case *option.NaiveInboundOptions:
-					err = v.UpdateUsers(opts.Users)
-				case *option.SocksInboundOptions:
-					err = v.UpdateUsers(opts.Users)
-				case *option.HTTPMixedInboundOptions:
-					err = v.UpdateUsers(opts.Users)
-				}
+				slog.Warn("incremental update failed, falling back to recreate", "tag", tag, "error", err)
 			}
-			if err == nil {
-				continue
-			}
-			slog.Warn("incremental update failed, falling back to recreate", "tag", tag, "error", err)
 		}
 
+		// Config mismatch or incremental update failure: Reconstruct Inbound.
 		// Remove the existing inbound first so im.Create() can bind the same port.
 		// im.Create() cannot atomically swap a TCP listener — it tries to start the
 		// new socket before the old one is closed, causing "address already in use".

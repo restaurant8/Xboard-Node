@@ -90,7 +90,7 @@ func TestWSClient_ConnectAndReceiveDataEvents(t *testing.T) {
 		mu.Lock()
 		received = append(received, event)
 		mu.Unlock()
-	}, nil)
+	}, nil, func() map[string]interface{} { return nil })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -187,7 +187,7 @@ func TestWSClient_ReconnectOnDisconnect(t *testing.T) {
 	defer server.Close()
 
 	host := strings.TrimPrefix(server.URL, "http://")
-	ws := NewWSClient("ws://"+host, "reconnect-token", 1, func(WSEvent) {}, nil)
+	ws := NewWSClient("ws://"+host, "reconnect-token", 1, func(WSEvent) {}, nil, func() map[string]interface{} { return nil })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -218,7 +218,7 @@ func TestWSClient_ReconnectOnDisconnect(t *testing.T) {
 }
 
 func TestWSClient_FallbackWhenNoServer(t *testing.T) {
-	ws := NewWSClient("ws://127.0.0.1:19999", "fallback-token", 1, func(WSEvent) {}, nil)
+	ws := NewWSClient("ws://127.0.0.1:19999", "fallback-token", 1, func(WSEvent) {}, nil, func() map[string]interface{} { return nil })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -254,7 +254,7 @@ func TestWSClient_UserDeltaEvent(t *testing.T) {
 		mu.Lock()
 		received = append(received, event)
 		mu.Unlock()
-	}, nil)
+	}, nil, func() map[string]interface{} { return nil })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

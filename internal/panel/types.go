@@ -110,6 +110,32 @@ type NodeConfig struct {
 
 	// AnyTLS
 	PaddingScheme StringOrArray `json:"padding_scheme,omitempty"`
+
+	// Mieru
+	Transport      string `json:"transport,omitempty"`
+	TrafficPattern string `json:"traffic_pattern,omitempty"`
+
+	// Multiplex
+	Multiplex *MultiplexConfig `json:"multiplex,omitempty"`
+
+	// Proxy Protocol
+	AcceptProxyProtocol bool `json:"accept_proxy_protocol,omitempty"`
+}
+
+type MultiplexConfig struct {
+	Enabled        bool          `json:"enabled"`
+	Protocol       string        `json:"protocol"`
+	MaxConnections int           `json:"max_connections"`
+	MinStreams     int           `json:"min_streams"`
+	MaxStreams     int           `json:"max_streams"`
+	Padding        bool          `json:"padding"`
+	Brutal         *BrutalConfig `json:"brutal,omitempty"`
+}
+
+type BrutalConfig struct {
+	Enabled  bool `json:"enabled"`
+	UpMbps   int  `json:"up_mbps"`
+	DownMbps int  `json:"down_mbps"`
 }
 
 // CertConfig holds certificate automation settings from the panel
