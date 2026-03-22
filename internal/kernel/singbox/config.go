@@ -1,6 +1,7 @@
 package singbox
 
 import (
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"net"
@@ -152,27 +153,27 @@ func buildRoutes(panelRoutes []panel.RouteRule, custom []map[string]any) M {
 	}
 
 	// Standard blocks for private/loopback
-	rules = append(rules, M{
-		"outbound": "block",
-		"ip_cidr": []string{
-			"10.0.0.0/8",
-			"100.64.0.0/10",
-			"127.0.0.0/8",
-			"169.254.0.0/16",
-			"172.16.0.0/12",
-			"192.0.0.0/24",
-			"192.168.0.0/16",
-			"198.18.0.0/15",
-			"fc00::/7",
-			"fe80::/10",
-			"::1/128",
-		},
-	}, M{
-		"outbound": "block",
-		"domain": []string{
-			"geoip:private",
-		},
-	})
+	// rules = append(rules, M{
+	// 	"outbound": "block",
+	// 	"ip_cidr": []string{
+	// 		"10.0.0.0/8",
+	// 		"100.64.0.0/10",
+	// 		"127.0.0.0/8",
+	// 		"169.254.0.0/16",
+	// 		"172.16.0.0/12",
+	// 		"192.0.0.0/24",
+	// 		"192.168.0.0/16",
+	// 		"198.18.0.0/15",
+	// 		"fc00::/7",
+	// 		"fe80::/10",
+	// 		"::1/128",
+	// 	},
+	// }, M{
+	// 	"outbound": "block",
+	// 	"domain": []string{
+	// 		"geoip:private",
+	// 	},
+	// })
 
 	// Panel-defined routes (usually specific blocks/proxies)
 	for _, pr := range panelRoutes {
@@ -378,20 +379,48 @@ func buildMieru(base M, nc *panel.NodeConfig, users []panel.User) M {
 	return base
 }
 
+type ss2022Config struct {
+	method string
+	size   int
+}
+
+var ss2022Methods = map[string]ss2022Config{
+	"2022-blake3-aes-128-gcm":       {"2022-blake3-aes-128-gcm", 16},
+	"2022-blake3-aes-256-gcm":       {"2022-blake3-aes-256-gcm", 32},
+	"2022-blake3-chacha20-poly1305": {"2022-blake3-chacha20-poly1305", 32},
+}
+
 func buildShadowsocks(base M, nc *panel.NodeConfig, users []panel.User) M {
 	base["type"] = "shadowsocks"
 	base["method"] = nc.Cipher
 
-	if strings.HasPrefix(nc.Cipher, "2022-blake3-") {
+	ss2022, isSS2022 := ss2022Methods[nc.Cipher]
+	if isSS2022 {
 		base["password"] = nc.ServerKey
 	}
 
-	userList := make([]M, 0, len(users))
-	for _, u := range users {
-		userList = append(userList, M{
+	userList := make([]M, len(users))
+	var rawBuf []byte
+	if isSS2022 {
+		rawBuf = make([]byte, ss2022.size)
+	}
+
+	for i := range users {
+		u := &users[i]
+		user := M{
 			"name":     u.UUID,
 			"password": u.UUID,
-		})
+		}
+
+		if isSS2022 {
+			// Reuse buffer and clear it to maintain SS2022 key integrity
+			for j := range rawBuf {
+				rawBuf[j] = 0
+			}
+			copy(rawBuf, u.UUID)
+			user["password"] = base64.StdEncoding.EncodeToString(rawBuf)
+		}
+		userList[i] = user
 	}
 	base["users"] = userList
 

@@ -1,6 +1,7 @@
 package xray
 
 import (
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -285,9 +286,22 @@ func buildTrojan(base M, nc *panel.NodeConfig, users []panel.User, certFile, key
 	return base
 }
 
+type ss2022Config struct {
+	method string
+	size   int
+}
+
+var ss2022Methods = map[string]ss2022Config{
+	"2022-blake3-aes-128-gcm":       {"2022-blake3-aes-128-gcm", 16},
+	"2022-blake3-aes-256-gcm":       {"2022-blake3-aes-256-gcm", 32},
+	"2022-blake3-chacha20-poly1305": {"2022-blake3-chacha20-poly1305", 32},
+}
+
 func buildShadowsocks(base M, nc *panel.NodeConfig, users []panel.User) M {
+	ss2022, isSS2022 := ss2022Methods[nc.Cipher]
+
 	// Single-user mode for traditional ciphers
-	if !strings.HasPrefix(nc.Cipher, "2022-blake3-") {
+	if !isSS2022 {
 		if len(users) > 0 {
 			base["settings"] = M{
 				"method":   nc.Cipher,
@@ -300,13 +314,23 @@ func buildShadowsocks(base M, nc *panel.NodeConfig, users []panel.User) M {
 	}
 
 	// Multi-user mode for 2022-blake3 ciphers
-	clients := make([]M, 0, len(users))
-	for _, u := range users {
-		clients = append(clients, M{
-			"password": u.UUID,
+	clients := make([]M, len(users))
+	rawBuf := make([]byte, ss2022.size)
+
+	for i := range users {
+		u := &users[i]
+		// SS2022 User Key must be Base64 of fixed-length raw bytes
+		for j := range rawBuf {
+			rawBuf[j] = 0
+		}
+		copy(rawBuf, u.UUID)
+
+		clients[i] = M{
+			"password": base64.StdEncoding.EncodeToString(rawBuf),
 			"email":    userEmail(u.ID),
-		})
+		}
 	}
+
 	base["settings"] = M{
 		"method":   nc.Cipher,
 		"password": nc.ServerKey,
