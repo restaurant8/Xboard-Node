@@ -485,12 +485,13 @@ func buildVLESS(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyF
 func buildTrojan(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
 	base["type"] = "trojan"
 
-	userList := make([]M, 0, len(users))
-	for _, u := range users {
-		userList = append(userList, M{
+	userList := make([]M, len(users))
+	for i := range users {
+		u := &users[i]
+		userList[i] = M{
 			"name":     u.UUID,
 			"password": u.UUID,
-		})
+		}
 	}
 	base["users"] = userList
 
@@ -502,6 +503,14 @@ func buildTrojan(base M, nc *panel.NodeConfig, users []panel.User, certFile, key
 	} else if nc.TLS == 2 {
 		base["tls"] = buildRealityConfig(nc)
 	}
+
+	// Trojan requires TLS or Reality to be enabled.
+	// If the panel didn't explicitly set TLS=1 or TLS=2, but we have certs,
+	// we should enable a default TLS config to ensure the inbound can start.
+	if _, ok := base["tls"]; !ok {
+		base["tls"] = buildTLSConfig(nc, certFile, keyFile)
+	}
+
 	return base
 }
 
@@ -676,7 +685,7 @@ func applyTransport(base M, nc *panel.NodeConfig) {
 				transport["early_data_header_name"] = v
 			}
 		case "grpc":
-			if v, ok := nc.NetworkSettings["service_name"]; ok {
+			if v, ok := nc.NetworkSettings["serviceName"]; ok {
 				transport["service_name"] = v
 			}
 		case "httpupgrade":
