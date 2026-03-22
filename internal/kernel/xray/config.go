@@ -273,16 +273,27 @@ func buildVLESS(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyF
 }
 
 func buildTrojan(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
-	clients := make([]M, 0, len(users))
-	for _, u := range users {
-		clients = append(clients, M{
+	clients := make([]M, len(users))
+	for i := range users {
+		u := &users[i]
+		clients[i] = M{
 			"password": u.UUID,
 			"email":    userEmail(u.ID),
-		})
+		}
 	}
 	base["settings"] = M{"clients": clients}
 
 	applyStreamSettings(base, nc, certFile, keyFile)
+
+	// Trojan requires TLS or Reality to be enabled.
+	// If the panel didn't explicitly set TLS=1 or TLS=2, but we have certs,
+	// we should enable a default TLS config to ensure the inbound can start.
+	ss, _ := base["streamSettings"].(M)
+	if security, ok := ss["security"].(string); !ok || (security != "tls" && security != "reality") {
+		nc.TLS = 1 // Force internal state to trigger TLS build in applyStreamSettings
+		applyStreamSettings(base, nc, certFile, keyFile)
+	}
+
 	return base
 }
 
