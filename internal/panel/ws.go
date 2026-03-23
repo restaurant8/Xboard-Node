@@ -185,12 +185,10 @@ func (w *WSClient) connect(ctx context.Context) error {
 		// Process it and continue
 		w.connected.Store(true)
 		w.notifyStatus(true)
-		slog.Info("ws connected (implicit auth)")
 		w.handleMessage(firstMsg)
 	} else {
 		w.connected.Store(true)
 		w.notifyStatus(true)
-		slog.Info("ws connected and authenticated")
 	}
 
 	// Ping interval: send pong responses to server pings.
@@ -314,8 +312,12 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 	case WSEventSyncConfig:
 		slog.Debug("ws sync config event received")
 		var p syncConfigPayload
-		if err := decodeData(msg.Data, &p); err != nil && p.Config.Protocol != "" {
+		if err := decodeData(msg.Data, &p); err != nil {
 			slog.Warn("ws: cannot decode config payload", "error", err)
+			return
+		}
+		if p.Config.Protocol == "" {
+			slog.Warn("ws: config payload missing protocol")
 			return
 		}
 		event.Config = &p.Config
@@ -323,8 +325,12 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 	case WSEventSyncUsers:
 		slog.Debug("ws sync users event received")
 		var p syncUsersPayload
-		if err := decodeData(msg.Data, &p); err != nil && len(p.Users) > 0 {
+		if err := decodeData(msg.Data, &p); err != nil {
 			slog.Warn("ws: cannot decode users payload", "error", err)
+			return
+		}
+		if len(p.Users) == 0 {
+			slog.Warn("ws: users payload empty")
 			return
 		}
 		event.Users = p.Users
@@ -334,6 +340,14 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 		var p syncUserDeltaPayload
 		if err := decodeData(msg.Data, &p); err != nil {
 			slog.Warn("ws: cannot decode user delta payload", "error", err)
+			return
+		}
+		if p.Action == "" {
+			slog.Warn("ws: user delta payload missing action")
+			return
+		}
+		if len(p.Users) == 0 {
+			slog.Warn("ws: user delta payload has no users")
 			return
 		}
 		event.DeltaAction = p.Action

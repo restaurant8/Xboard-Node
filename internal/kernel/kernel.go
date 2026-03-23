@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"sync"
 
 	"github.com/cedar2025/xboard-node/internal/panel"
 	"golang.org/x/time/rate"
@@ -56,13 +55,24 @@ type Kernel interface {
 	UpdateUsers(users []panel.User) (added, removed int, err error)
 
 	// ─── Observability ──────────────────────────────────────────────────
-	// GetConnections returns a snapshot of all active proxy connections.
-	GetConnections(ctx context.Context) ([]Connection, error)
+	// GetUserTraffic returns per-user cumulative traffic counters and
+	// per-user alive IP sets. The kernel maintains these internally using
+	// per-user atomic counters — no per-connection iteration needed.
+	// aliveIPs maps userID → set of source IPs currently connected.
+	// traffic maps userID → [upload, download] cumulative bytes.
+	// connCount is the total number of active connections (for metrics).
+	GetUserTraffic(ctx context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error)
 	// CloseConnection terminates a specific connection by ID.
 	CloseConnection(ctx context.Context, connID string) error
+	// CloseUserConnections terminates all connections for the given user UUID.
+	CloseUserConnections(ctx context.Context, uuid string) error
 	// SetSpeedLimitFunc configures per-user bandwidth throttling.
 	// The function resolves a user UUID to a *rate.Limiter (nil = unlimited).
 	SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter)
+	// SetDeviceLimitFunc configures per-user device limit gate-keeping.
+	// The function resolves a user UUID to (limit, hasLimit).
+	// Kernels that already gate-keep internally (e.g. xray) may no-op.
+	SetDeviceLimitFunc(fn func(uuid string) (int, bool))
 }
 
 // ComputeHash returns a hash of config + user identities that would
@@ -78,26 +88,6 @@ func ComputeHash(nc *panel.NodeConfig, users []panel.User) string {
 		fmt.Fprintf(h, "%d:%s,", u.ID, u.UUID)
 	}
 	return fmt.Sprintf("%x", h.Sum(nil))
-}
-
-// Connection represents an active proxy connection reported by the kernel.
-type Connection struct {
-	ID       string
-	UserID   int    // extracted user ID (0 if unknown)
-	Upload   int64  // cumulative upload bytes
-	Download int64  // cumulative download bytes
-	SourceIP string // client source IP (cleaned, no port/brackets)
-}
-
-var ConnectionSlicePool = sync.Pool{
-	New: func() any { return make([]Connection, 0, 256) },
-}
-
-func ReleaseConnectionSlice(s []Connection) {
-	if s == nil {
-		return
-	}
-	ConnectionSlicePool.Put(s[:0])
 }
 
 // UserDiff computes which users to add and which to remove when transitioning

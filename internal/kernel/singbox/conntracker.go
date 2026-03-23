@@ -5,7 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"strconv"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,252 +15,372 @@ import (
 	singM "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"golang.org/x/time/rate"
-
-	"github.com/cedar2025/xboard-node/internal/kernel"
 )
 
 const rateLimitThreshold = 64 * 1024
 
-// connRecord holds the minimal per-connection state we need.
-// Each field is accessed by multiple goroutines; upload/download use atomics.
-type connRecord struct {
-	id       string
-	userID   int
-	sourceIP string
+// ─── Per-user statistics ────────────────────────────────────────────────────
+
+// userStats holds per-user traffic counters and alive IP tracking.
+// Traffic counters are lock-free atomics (read on every packet).
+// IP tracking uses a lightweight mutex (only touched at connect/disconnect).
+type userStats struct {
 	upload   atomic.Int64
 	download atomic.Int64
-	conn     net.Conn // kept for force-close via CloseByID
+
+	mu        sync.Mutex
+	ips       map[string]int // sourceIP → refcount (number of active conns from that IP)
+	connCount int            // total active connections
 }
 
-func (r *connRecord) toConnection() kernel.Connection {
-	return kernel.Connection{
-		ID:       r.id,
-		UserID:   r.userID,
-		SourceIP: r.sourceIP,
-		Upload:   r.upload.Load(),
-		Download: r.download.Load(),
+// addConn registers a new connection from sourceIP.
+func (u *userStats) addConn(sourceIP string) {
+	u.mu.Lock()
+	u.connCount++
+	u.ips[sourceIP]++
+	u.mu.Unlock()
+}
+
+// removeConn unregisters a connection from sourceIP.
+func (u *userStats) removeConn(sourceIP string) {
+	u.mu.Lock()
+	u.connCount--
+	u.ips[sourceIP]--
+	if u.ips[sourceIP] <= 0 {
+		delete(u.ips, sourceIP)
 	}
+	u.mu.Unlock()
 }
 
-// ConnTracker is a lightweight in-process connection tracker that replaces
-// the Clash API TrafficManager. It handles:
-//   - per-connection byte counting (upload / download)
-//   - optional per-user speed limiting (when SetSpeedLimitFunc is configured)
-//   - source IP tracking for device-limit enforcement
-//   - force-close a connection by ID
-//
-// Both byte counting and speed limiting are implemented via sing's CountFunc
-// callback mechanism (ReadCounter / WriteCounter interfaces). This allows
-// sing's copy pipeline to use splice / ReadWaiter zero-copy paths while
-// still counting bytes and enforcing bandwidth limits through post-transfer
-// callbacks.
-//
-// Memory model:
-//   - active: live connections, looked up by ID for snapshots and CloseByID
-//   - pending: closed connections accumulated since the last Snapshot call,
-//     drained atomically so the Tracker sees every connection's final bytes
-//
-// Thread safety: active is guarded by mu; pending by pendingMu.
-type ConnTracker struct {
-	mu     sync.RWMutex
-	active map[string]*connRecord
+// distinctIPs returns the number of distinct IPs currently connected.
+func (u *userStats) distinctIPs() int {
+	u.mu.Lock()
+	n := len(u.ips)
+	u.mu.Unlock()
+	return n
+}
 
-	// idCounter generates unique connection IDs without crypto/rand.
+// ipSnapshot returns a copy of the current IP set (for device gate-keeping).
+func (u *userStats) ipSnapshot() map[string]struct{} {
+	u.mu.Lock()
+	snapshot := make(map[string]struct{}, len(u.ips))
+	for ip := range u.ips {
+		snapshot[ip] = struct{}{}
+	}
+	u.mu.Unlock()
+	return snapshot
+}
+
+// aliveIPList returns the set of alive IPs as a boolean map (for reporting).
+func (u *userStats) aliveIPList() map[string]bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if len(u.ips) == 0 {
+		return nil
+	}
+	result := make(map[string]bool, len(u.ips))
+	for ip := range u.ips {
+		result[ip] = true
+	}
+	return result
+}
+
+// ─── ConnTracker ────────────────────────────────────────────────────────────
+
+// ConnTracker provides per-user traffic counting, alive IP tracking, device
+// limit gate-keeping, and per-user speed limiting for the sing-box kernel.
+//
+// Architecture: instead of maintaining a per-connection map (O(connections)),
+// it maintains per-user atomic counters and IP refcount sets (O(users)).
+// This means:
+//   - GetUserTraffic is O(users), not O(connections)
+//   - No Snapshot/pending buffer needed
+//   - No per-connection map lock contention
+//   - Bytes are counted directly into per-user atomics via CountFunc callbacks
+//
+// The per-connection wrapper (trackedConn) is still needed for:
+//   - Hooking into sing's ReadCounter/WriteCounter for zero-copy byte counting
+//   - Close callback to decrement IP refcounts
+//   - Per-connection rate limit token accumulation (amortized WaitN)
+type ConnTracker struct {
+	usersMu sync.RWMutex
+	users   map[int]*userStats  // userID → stats
+	uuidMap map[string]int      // UUID → userID (for lookup in RoutedConnection)
+	connMap map[string]net.Conn // connID → conn (only for force-close support)
+
 	idCounter atomic.Int64
 
-	pendingMu  sync.Mutex
-	pending    []*connRecord
-	maxPending int
+	// speedLimitFunc resolves a user UUID to a *rate.Limiter.
+	speedLimitFunc atomic.Pointer[func(uuid string) *rate.Limiter]
 
-	userMapMu sync.RWMutex
-	userMap   map[string]int // UUID → userID
-
-	// speedLimitFunc resolves a user UUID to a *rate.Limiter. When set,
-	// new connections for users with a speed limit are automatically
-	// rate-limited without needing a second ConnectionTracker wrapper.
-	// The function must be safe for concurrent calls.
-	speedLimitFunc func(uuid string) *rate.Limiter
+	// deviceLimitFunc resolves a user UUID to their device limit.
+	deviceLimitFunc atomic.Pointer[func(uuid string) (int, bool)]
 }
 
 // NewConnTracker creates a tracker.
-func NewConnTracker(maxPending int) *ConnTracker {
-	if maxPending <= 0 {
-		maxPending = 50000
-	}
+func NewConnTracker(_ int) *ConnTracker {
 	return &ConnTracker{
-		active:     make(map[string]*connRecord),
-		maxPending: maxPending,
-		userMap:    make(map[string]int),
+		users:   make(map[int]*userStats),
+		uuidMap: make(map[string]int),
+		connMap: make(map[string]net.Conn),
 	}
 }
 
 // SetSpeedLimitFunc configures the per-user speed limit lookup.
-// fn is called for every new connection; it must return nil for unlimited users.
-// Thread-safe: fn itself must be safe for concurrent calls.
 func (t *ConnTracker) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) {
-	t.speedLimitFunc = fn
+	t.speedLimitFunc.Store(&fn)
 }
 
-// SetUserMap replaces the UUID→userID mapping. Must be called whenever the
-// user list changes so that new connections are attributed to the correct user.
+// SetDeviceLimitFunc configures the per-user device limit lookup for gate-keeping.
+func (t *ConnTracker) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) {
+	t.deviceLimitFunc.Store(&fn)
+}
+
+// SetUserMap replaces the UUID→userID mapping and ensures per-user stats
+// structs exist for all users. Old users that are no longer present keep
+// their stats until their connections drain.
 func (t *ConnTracker) SetUserMap(m map[string]int) {
-	t.userMapMu.Lock()
-	t.userMap = m
-	t.userMapMu.Unlock()
+	t.usersMu.Lock()
+	t.uuidMap = m
+	for _, uid := range m {
+		if _, ok := t.users[uid]; !ok {
+			t.users[uid] = &userStats{ips: make(map[string]int)}
+		}
+	}
+	t.usersMu.Unlock()
 }
 
-// ─── adapter.ConnectionTracker ───────────────────────────────────────────────
+// ─── adapter.ConnectionTracker ──────────────────────────────────────────────
 
-// RoutedConnection wraps a TCP conn to count bytes, track lifecycle,
-// and optionally rate-limit per-user bandwidth.
+// RoutedConnection wraps a TCP conn to count bytes per-user, track IPs,
+// and optionally rate-limit. Gate-keeps device limits at connection time.
 func (t *ConnTracker) RoutedConnection(
 	ctx context.Context, conn net.Conn,
 	metadata adapter.InboundContext,
 	_ adapter.Rule, _ adapter.Outbound,
 ) net.Conn {
-	rec := t.allocRecord(metadata, conn)
-	var lim *rate.Limiter
-	if t.speedLimitFunc != nil {
-		lim = t.speedLimitFunc(metadata.User)
+	uuid := metadata.User
+	sourceIP := metadata.Source.Addr.String()
+
+	t.usersMu.RLock()
+	uid := t.uuidMap[uuid]
+	us := t.users[uid]
+	t.usersMu.RUnlock()
+
+	// Gate-keep device limit
+	if dlf := t.deviceLimitFunc.Load(); dlf != nil {
+		if limit, hasLimit := (*dlf)(uuid); hasLimit {
+			if t.checkDeviceGate(us, sourceIP, limit) {
+				slog.Info("singbox: device limit gate-keep, rejecting connection",
+					"user", uuid, "ip", sourceIP, "limit", limit)
+				conn.Close()
+				return conn
+			}
+		}
 	}
-	return &trackedConn{Conn: conn, rec: rec, tracker: t, limiter: lim, ctx: ctx}
+
+	// Register connection
+	if us != nil {
+		us.addConn(sourceIP)
+	}
+
+	connID := t.nextID()
+
+	// Store conn reference for force-close support
+	t.usersMu.Lock()
+	t.connMap[connID] = conn
+	t.usersMu.Unlock()
+
+	var lim *rate.Limiter
+	if slf := t.speedLimitFunc.Load(); slf != nil {
+		lim = (*slf)(uuid)
+	}
+
+	return &trackedConn{
+		Conn:    conn,
+		tracker: t,
+		us:      us,
+		connID:  connID,
+		sourceIP: sourceIP,
+		limiter: lim,
+		ctx:     ctx,
+	}
 }
 
-// RoutedPacketConnection wraps a UDP PacketConn to count bytes, track lifecycle,
-// and optionally rate-limit per-user bandwidth.
+// RoutedPacketConnection wraps a UDP PacketConn with per-user byte counting.
 func (t *ConnTracker) RoutedPacketConnection(
 	ctx context.Context, conn N.PacketConn,
 	metadata adapter.InboundContext,
 	_ adapter.Rule, _ adapter.Outbound,
 ) N.PacketConn {
-	rec := t.allocRecord(metadata, nil)
+	uuid := metadata.User
+	sourceIP := metadata.Source.Addr.String()
+
+	t.usersMu.RLock()
+	uid := t.uuidMap[uuid]
+	us := t.users[uid]
+	t.usersMu.RUnlock()
+
+	if us != nil {
+		us.addConn(sourceIP)
+	}
+
+	connID := t.nextID()
+
 	var lim *rate.Limiter
-	if t.speedLimitFunc != nil {
-		lim = t.speedLimitFunc(metadata.User)
+	if slf := t.speedLimitFunc.Load(); slf != nil {
+		lim = (*slf)(uuid)
 	}
-	return &trackedPacketConn{PacketConn: conn, rec: rec, tracker: t, limiter: lim, ctx: ctx}
+
+	return &trackedPacketConn{
+		PacketConn: conn,
+		tracker:    t,
+		us:         us,
+		connID:     connID,
+		sourceIP:   sourceIP,
+		limiter:    lim,
+		ctx:        ctx,
+	}
 }
 
-// ─── Internal helpers ────────────────────────────────────────────────────────
-
-func (t *ConnTracker) allocRecord(metadata adapter.InboundContext, conn net.Conn) *connRecord {
-	// Use a fast atomic counter instead of crypto/rand UUID generation.
-	// Under connection floods (thousands of concurrent handshakes), uuid.NewV4()
-	// becomes a syscall bottleneck; a counter is allocation-free and lock-free.
-	id := strconv.FormatInt(t.idCounter.Add(1), 36)
-	t.userMapMu.RLock()
-	uid := t.userMap[metadata.User]
-	t.userMapMu.RUnlock()
-	rec := &connRecord{
-		id:       id,
-		userID:   uid,
-		sourceIP: metadata.Source.Addr.String(),
-		conn:     conn,
-	}
-	t.mu.Lock()
-	t.active[rec.id] = rec
-	t.mu.Unlock()
-	return rec
-}
-
-// closeRecord is idempotent: if the record has already been moved to pending,
-// the second call is a no-op.
-func (t *ConnTracker) closeRecord(rec *connRecord) {
-	t.mu.Lock()
-	_, present := t.active[rec.id]
-	if present {
-		delete(t.active, rec.id)
-	}
-	t.mu.Unlock()
-
-	if !present {
-		return
-	}
-
-	t.pendingMu.Lock()
-	if len(t.pending) < t.maxPending {
-		t.pending = append(t.pending, rec)
-	} else {
-		slog.Warn("conntracker: pending buffer full, dropping closed connection",
-			"max_pending", t.maxPending, "user_id", rec.userID)
-	}
-	t.pendingMu.Unlock()
-}
-
-// ─── Public API ──────────────────────────────────────────────────────────────
-
-// Snapshot returns a point-in-time view of all active connections plus all
-// connections that closed since the previous Snapshot call. The pending
-// (closed) list is drained atomically so callers never miss a connection.
-func (t *ConnTracker) Snapshot() []kernel.Connection {
-	// Drain pending under its own lock (hot path for closed connections).
-	t.pendingMu.Lock()
-	pending := t.pending
-	t.pending = nil
-	t.pendingMu.Unlock()
-
-	// Two-phase read to minimise RLock hold time at high connection counts:
-	//   Phase 1 (under RLock): collect record *pointers* — a pointer copy is
-	//   ~8 bytes vs ~80 bytes for a full Connection struct, and no atomic loads.
-	//   Phase 2 (lock-free):   call toConnection() which atomically reads the
-	//   upload/download counters. Atomics are safe without any mutex.
-	t.mu.RLock()
-	n := len(t.active)
-	t.mu.RUnlock()
-
-	result := kernel.ConnectionSlicePool.Get().([]kernel.Connection)
-	result = result[:0]
-	if cap(result) < n+len(pending) {
-		result = make([]kernel.Connection, 0, n+len(pending))
-	}
-
-	t.mu.RLock()
-	for _, rec := range t.active {
-		result = append(result, rec.toConnection())
-	}
-	t.mu.RUnlock()
-
-	for _, rec := range pending {
-		result = append(result, rec.toConnection())
-	}
-	return result
-}
-
-// CloseByID force-closes a live connection by its ID.
-// Returns true if the connection was found and closed.
-func (t *ConnTracker) CloseByID(id string) bool {
-	t.mu.RLock()
-	rec, ok := t.active[id]
-	t.mu.RUnlock()
-	if !ok {
+// checkDeviceGate returns true if the connection should be rejected.
+// Uses the deterministic lowest-IP algorithm.
+func (t *ConnTracker) checkDeviceGate(us *userStats, sourceIP string, limit int) bool {
+	if us == nil {
 		return false
 	}
-	if rec.conn != nil {
-		rec.conn.Close()
+
+	knownIPs := us.ipSnapshot()
+
+	// Already known IP — always allow
+	if _, exists := knownIPs[sourceIP]; exists {
+		return false
+	}
+
+	// Under limit — allow
+	if len(knownIPs) < limit {
+		return false
+	}
+
+	// Over limit — deterministic: allow lowest IPs lexicographically
+	ipList := make([]string, 0, len(knownIPs)+1)
+	for ip := range knownIPs {
+		ipList = append(ipList, ip)
+	}
+	ipList = append(ipList, sourceIP)
+	sort.Strings(ipList)
+
+	for i := 0; i < limit && i < len(ipList); i++ {
+		if ipList[i] == sourceIP {
+			return false
+		}
 	}
 	return true
 }
 
-// ActiveCount returns the number of currently tracked live connections.
-func (t *ConnTracker) ActiveCount() int {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return len(t.active)
+func (t *ConnTracker) nextID() string {
+	return "sb-" + formatInt36(t.idCounter.Add(1))
 }
 
-// ─── trackedConn (TCP) ───────────────────────────────────────────────────────
+func formatInt36(n int64) string {
+	const digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+	if n == 0 {
+		return "0"
+	}
+	var buf [13]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = digits[n%36]
+		n /= 36
+	}
+	return string(buf[i:])
+}
+
+// ─── Public API ─────────────────────────────────────────────────────────────
+
+// GetUserTraffic returns per-user cumulative traffic and alive IPs.
+// This is O(users), not O(connections).
+func (t *ConnTracker) GetUserTraffic() (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int) {
+	t.usersMu.RLock()
+	traffic = make(map[int][2]int64, len(t.users))
+	aliveIPs = make(map[int]map[string]bool, len(t.users))
+	for uid, us := range t.users {
+		up := us.upload.Load()
+		down := us.download.Load()
+		if up > 0 || down > 0 {
+			traffic[uid] = [2]int64{up, down}
+		}
+
+		ips := us.aliveIPList()
+		if ips != nil {
+			aliveIPs[uid] = ips
+		}
+
+		us.mu.Lock()
+		connCount += us.connCount
+		us.mu.Unlock()
+	}
+	t.usersMu.RUnlock()
+	return
+}
+
+// CloseByID force-closes a connection by its ID.
+func (t *ConnTracker) CloseByID(id string) bool {
+	t.usersMu.RLock()
+	conn, ok := t.connMap[id]
+	t.usersMu.RUnlock()
+	if !ok {
+		return false
+	}
+	if conn != nil {
+		conn.Close()
+	}
+	return true
+}
+
+// CloseByUUID force-closes ALL connections for a given user UUID.
+func (t *ConnTracker) CloseByUUID(uuid string) int {
+	// This is a no-op for now — sing-box doesn't expose per-user connection
+	// kill easily. The kernel's RemoveUsers removes the inbound user which
+	// prevents new connections, and existing connections will fail on next I/O.
+	return 0
+}
+
+// ActiveCount returns the total number of active connections.
+func (t *ConnTracker) ActiveCount() int {
+	t.usersMu.RLock()
+	total := 0
+	for _, us := range t.users {
+		us.mu.Lock()
+		total += us.connCount
+		us.mu.Unlock()
+	}
+	t.usersMu.RUnlock()
+	return total
+}
+
+// removeConnRef removes the connection reference from connMap on close.
+func (t *ConnTracker) removeConnRef(connID string) {
+	t.usersMu.Lock()
+	delete(t.connMap, connID)
+	t.usersMu.Unlock()
+}
+
+// ─── trackedConn (TCP) ──────────────────────────────────────────────────────
 
 type trackedConn struct {
 	net.Conn
-	rec           *connRecord
 	tracker       *ConnTracker
-	limiter       *rate.Limiter   // nil = unlimited
-	ctx           context.Context // for rate limiter WaitN cancellation
-	pendingTokens atomic.Int64    // amortized token accumulator for CountFunc
+	us            *userStats      // per-user stats (upload/download atomics + IP tracking)
+	connID        string
+	sourceIP      string
+	limiter       *rate.Limiter
+	ctx           context.Context
+	pendingTokens atomic.Int64
+	closed        atomic.Bool
 }
 
-// Read is the fallback path used when the copy pipeline cannot unwrap this
-// wrapper (should not happen with current code, but kept for robustness).
 func (c *trackedConn) Read(b []byte) (int, error) {
 	if c.limiter != nil {
 		if burst := c.limiter.Burst(); len(b) > burst {
@@ -269,7 +389,9 @@ func (c *trackedConn) Read(b []byte) (int, error) {
 	}
 	n, err := c.Conn.Read(b)
 	if n > 0 {
-		c.rec.download.Add(int64(n))
+		if c.us != nil {
+			c.us.download.Add(int64(n))
+		}
 		if c.limiter != nil {
 			if pending := c.pendingTokens.Add(int64(n)); pending >= rateLimitThreshold {
 				tokens := int(c.pendingTokens.Swap(0))
@@ -286,11 +408,12 @@ func (c *trackedConn) Read(b []byte) (int, error) {
 	return n, err
 }
 
-// Write is the fallback path.
 func (c *trackedConn) Write(b []byte) (int, error) {
 	n, err := c.Conn.Write(b)
 	if n > 0 {
-		c.rec.upload.Add(int64(n))
+		if c.us != nil {
+			c.us.upload.Add(int64(n))
+		}
 		if c.limiter != nil {
 			if pending := c.pendingTokens.Add(int64(n)); pending >= rateLimitThreshold {
 				tokens := int(c.pendingTokens.Swap(0))
@@ -308,27 +431,24 @@ func (c *trackedConn) Write(b []byte) (int, error) {
 }
 
 func (c *trackedConn) Close() error {
-	c.tracker.closeRecord(c.rec)
+	if c.closed.CompareAndSwap(false, true) {
+		if c.us != nil {
+			c.us.removeConn(c.sourceIP)
+		}
+		c.tracker.removeConnRef(c.connID)
+	}
 	return c.Conn.Close()
 }
 
-// makeCountFunc builds a CountFunc that does byte accounting and optional
-// rate limiting in a single callback. The direction is selected by the
-// counter pointer (download or upload).
-//
-// For rate-limited connections, tokens are accumulated in pendingTokens and
-// only consumed (via WaitN) when the threshold is reached. This amortizes
-// goroutine blocking from hundreds-of-thousands per second to ~10 per second
-// per connection, eliminating scheduler thrashing under high concurrency.
+// makeCountFunc builds a CountFunc for zero-copy byte counting via sing's
+// ReadCounter/WriteCounter unwrap interfaces.
 func (c *trackedConn) makeCountFunc(counter *atomic.Int64) N.CountFunc {
 	if c.limiter == nil {
-		// Fast path: no rate limiting, just atomic add.
 		return func(n int64) { counter.Add(n) }
 	}
 	return func(n int64) {
 		counter.Add(n)
 		if pending := c.pendingTokens.Add(n); pending >= rateLimitThreshold {
-			// Drain all accumulated tokens in one blocking call.
 			tokens := int(c.pendingTokens.Swap(0))
 			if burst := c.limiter.Burst(); tokens > burst {
 				tokens = burst
@@ -347,38 +467,45 @@ func (c *trackedConn) makeCountFunc(counter *atomic.Int64) N.CountFunc {
 	}
 }
 
-// UnwrapReader implements N.ReadCounter — lets the copy pipeline strip this
-// wrapper, collect a counter callback, and reach the inner conn for
-// splice / ReadWaiter zero-copy transfer.
 func (c *trackedConn) UnwrapReader() (io.Reader, []N.CountFunc) {
-	return c.Conn, []N.CountFunc{c.makeCountFunc(&c.rec.download)}
+	if c.us == nil {
+		return c.Conn, nil
+	}
+	return c.Conn, []N.CountFunc{c.makeCountFunc(&c.us.download)}
 }
 
-// UnwrapWriter implements N.WriteCounter.
 func (c *trackedConn) UnwrapWriter() (io.Writer, []N.CountFunc) {
-	return c.Conn, []N.CountFunc{c.makeCountFunc(&c.rec.upload)}
+	if c.us == nil {
+		return c.Conn, nil
+	}
+	return c.Conn, []N.CountFunc{c.makeCountFunc(&c.us.upload)}
 }
 
 func (c *trackedConn) Upstream() any           { return c.Conn }
 func (c *trackedConn) ReaderReplaceable() bool { return true }
 func (c *trackedConn) WriterReplaceable() bool { return true }
 
-// ─── trackedPacketConn (UDP / QUIC) ──────────────────────────────────────────
+// ─── trackedPacketConn (UDP / QUIC) ─────────────────────────────────────────
 
 type trackedPacketConn struct {
 	N.PacketConn
-	rec           *connRecord
 	tracker       *ConnTracker
+	us            *userStats
+	connID        string
+	sourceIP      string
 	limiter       *rate.Limiter
 	ctx           context.Context
 	pendingTokens atomic.Int64
+	closed        atomic.Bool
 }
 
 func (c *trackedPacketConn) ReadPacket(buffer *buf.Buffer) (singM.Socksaddr, error) {
 	dest, err := c.PacketConn.ReadPacket(buffer)
 	if err == nil {
 		n := int64(buffer.Len())
-		c.rec.download.Add(n)
+		if c.us != nil {
+			c.us.download.Add(n)
+		}
 		if c.limiter != nil {
 			if pending := c.pendingTokens.Add(n); pending >= rateLimitThreshold {
 				tokens := int(c.pendingTokens.Swap(0))
@@ -399,7 +526,9 @@ func (c *trackedPacketConn) WritePacket(buffer *buf.Buffer, dest singM.Socksaddr
 	n := int64(buffer.Len())
 	err := c.PacketConn.WritePacket(buffer, dest)
 	if err == nil {
-		c.rec.upload.Add(n)
+		if c.us != nil {
+			c.us.upload.Add(n)
+		}
 		if c.limiter != nil {
 			if pending := c.pendingTokens.Add(n); pending >= rateLimitThreshold {
 				tokens := int(c.pendingTokens.Swap(0))
@@ -417,7 +546,12 @@ func (c *trackedPacketConn) WritePacket(buffer *buf.Buffer, dest singM.Socksaddr
 }
 
 func (c *trackedPacketConn) Close() error {
-	c.tracker.closeRecord(c.rec)
+	if c.closed.CompareAndSwap(false, true) {
+		if c.us != nil {
+			c.us.removeConn(c.sourceIP)
+		}
+		c.tracker.removeConnRef(c.connID)
+	}
 	return c.PacketConn.Close()
 }
 
@@ -447,11 +581,17 @@ func (c *trackedPacketConn) makeCountFunc(counter *atomic.Int64) N.CountFunc {
 }
 
 func (c *trackedPacketConn) UnwrapPacketReader() (N.PacketReader, []N.CountFunc) {
-	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.rec.download)}
+	if c.us == nil {
+		return c.PacketConn, nil
+	}
+	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.download)}
 }
 
 func (c *trackedPacketConn) UnwrapPacketWriter() (N.PacketWriter, []N.CountFunc) {
-	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.rec.upload)}
+	if c.us == nil {
+		return c.PacketConn, nil
+	}
+	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.upload)}
 }
 
 func (c *trackedPacketConn) Upstream() any           { return c.PacketConn }

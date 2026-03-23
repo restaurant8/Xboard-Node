@@ -118,8 +118,24 @@ type NodeConfig struct {
 	// Multiplex
 	Multiplex *MultiplexConfig `json:"multiplex,omitempty"`
 
-	// Proxy Protocol
+	// Proxy Protocol (supports both top-level and networkSettings for compatibility)
 	AcceptProxyProtocol bool `json:"accept_proxy_protocol,omitempty"`
+}
+
+// GetProxyProtocol returns true if AcceptProxyProtocol is set either at node level
+// or in networkSettings (for panel compatibility).
+func (nc *NodeConfig) GetProxyProtocol() bool {
+	if nc.AcceptProxyProtocol {
+		return true
+	}
+	if nc.NetworkSettings != nil {
+		if v, ok := nc.NetworkSettings["acceptProxyProtocol"]; ok {
+			if b, ok := v.(bool); ok {
+				return b
+			}
+		}
+	}
+	return false
 }
 
 type MultiplexConfig struct {

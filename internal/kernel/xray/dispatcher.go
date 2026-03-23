@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"reflect"
 	"sort"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	_ "unsafe"
@@ -19,8 +18,6 @@ import (
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
 	"golang.org/x/time/rate"
-
-	"github.com/cedar2025/xboard-node/internal/kernel"
 )
 
 // Access xray's internal config creator registry so we can replace the
@@ -52,10 +49,9 @@ func limitDispatcherFactory(ctx context.Context, config interface{}) (interface{
 		return orig, nil
 	}
 	ld := &LimitDispatcher{
-		inner:     orig,
-		innerDisp: inner,
-		conns:     make(map[string]*dispatchedConn),
-		userIPs:   make(map[string]map[string]int),
+		inner:      orig,
+		innerDisp:  inner,
+		limitedIPs: make(map[string]map[string]int),
 	}
 	globalLimitDispatcher.Store(ld)
 	slog.Debug("xray: limit dispatcher installed")
@@ -63,32 +59,56 @@ func limitDispatcherFactory(ctx context.Context, config interface{}) (interface{
 }
 
 // LimitDispatcher wraps xray's DefaultDispatcher to add per-user device
-// limit enforcement, speed limiting, and per-connection source IP tracking.
-// It hooks into Dispatch/DispatchLink which are called AFTER the protocol
-// handler has identified the user, so it works for ALL protocols.
+// limit enforcement, speed limiting, and per-user traffic counting.
+//
+// Architecture: traffic bytes are accumulated in per-user atomic counters
+// (not per-connection maps). IP tracking uses sync.Map for unlimited users
+// (lock-free) and RWMutex-protected map for limited users (deterministic).
+// This means GetUserTraffic() is O(users), not O(connections).
 type LimitDispatcher struct {
 	inner     interface{}        // original DefaultDispatcher (Feature + Dispatcher)
 	innerDisp routing.Dispatcher // same object, typed as Dispatcher
 
+	// limitedUsers: users with device limit > 0, protected by mu.
+	// Needs deterministic IP ordering for kick decisions.
 	mu           sync.RWMutex
-	conns        map[string]*dispatchedConn // connID → conn
-	userIPs      map[string]map[string]int  // email → sourceIP → count
-	deviceLimits map[string]int             // email → max devices
-	speedLimits  map[string]int             // email → Mbps
-	speedBuckets sync.Map                   // email → *rate.Limiter
-	emailToUID   map[string]int             // email → panel user ID
+	limitedIPs   map[string]map[string]int // email → sourceIP → refcount
+	deviceLimits map[string]int            // email → max devices
+	speedLimits  map[string]int            // email → Mbps
+	emailToUID   map[string]int            // email → panel user ID
 
-	connIDSeq atomic.Uint64
+	// unlimitedIPs: users without device limit — sync.Map for lock-free access.
+	// Each entry is *ipCounter{count atomic.Int64, ips sync.Map}.
+	unlimitedIPs sync.Map // email → *ipCounter
+
+	speedBuckets sync.Map // email → *rate.Limiter
+
+	// Per-user traffic counters — lock-free atomics for the data path.
+	userTraffic sync.Map // email → *userTrafficCounter
+
+	connCount atomic.Int64 // total active connections (for metrics)
 }
 
-type dispatchedConn struct {
-	id       string
-	email    string
-	sourceIP string
-	userID   int
+// ipCounter tracks IPs for unlimited users without any lock.
+type ipCounter struct {
+	count atomic.Int64 // total TCP connections (for connCount reporting)
+	ips   sync.Map     // sourceIP → *atomic.Int64 (refcount)
+}
+
+// aliveIPs returns a snapshot of distinct IPs.
+func (ic *ipCounter) aliveIPs() map[string]bool {
+	result := make(map[string]bool)
+	ic.ips.Range(func(key, _ interface{}) bool {
+		result[key.(string)] = true
+		return true
+	})
+	return result
+}
+
+// userTrafficCounter holds per-user cumulative traffic counters.
+type userTrafficCounter struct {
 	upload   atomic.Int64
 	download atomic.Int64
-	closed   atomic.Bool
 }
 
 // ─── routing.Dispatcher ──────────────────────────────────────────────────────
@@ -144,43 +164,33 @@ func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destina
 	return email, sourceIP, isTCP, nil
 }
 
-// wrapLink instruments a transport.Link with per-connection byte counting,
+// wrapLink instruments a transport.Link with per-user byte counting,
 // rate limiting, and lifecycle tracking. Must only be called when email != "".
 func (d *LimitDispatcher) wrapLink(ctx context.Context, link *transport.Link, email, sourceIP string, isTCP bool) {
-	connID := "xd-" + strconv.FormatUint(d.connIDSeq.Add(1), 36)
-	dc := &dispatchedConn{
-		id:       connID,
-		email:    email,
-		sourceIP: sourceIP,
-		userID:   d.getUID(email),
-	}
+	// Get or create per-user traffic counter
+	v, _ := d.userTraffic.LoadOrStore(email, &userTrafficCounter{})
+	utc := v.(*userTrafficCounter)
 
-	d.mu.Lock()
-	d.conns[connID] = dc
-	d.mu.Unlock()
+	d.connCount.Add(1)
 
 	onClose := func() {
-		if dc.closed.CompareAndSwap(false, true) {
-			if isTCP {
-				d.delConn(email, sourceIP)
-			}
-			d.mu.Lock()
-			delete(d.conns, connID)
-			d.mu.Unlock()
+		if isTCP {
+			d.delConn(email, sourceIP)
 		}
+		d.connCount.Add(-1)
 	}
 
 	limiter := d.getBucket(email)
 
 	link.Reader = &statsCloseReader{
 		Reader:  link.Reader,
-		counter: &dc.upload,
+		counter: &utc.upload,
 		limiter: limiter,
 		ctx:     ctx,
 	}
 	link.Writer = &statsCloseWriter{
 		Writer:  link.Writer,
-		counter: &dc.download,
+		counter: &utc.download,
 		limiter: limiter,
 		ctx:     ctx,
 		onClose: onClose,
@@ -224,9 +234,20 @@ func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits, 
 
 func (d *LimitDispatcher) ResetConns() {
 	d.mu.Lock()
-	d.conns = make(map[string]*dispatchedConn)
-	d.userIPs = make(map[string]map[string]int)
+	d.limitedIPs = make(map[string]map[string]int)
 	d.mu.Unlock()
+
+	// Clear unlimited IPs
+	d.unlimitedIPs.Range(func(key, _ interface{}) bool {
+		d.unlimitedIPs.Delete(key)
+		return true
+	})
+
+	d.userTraffic.Range(func(key, _ interface{}) bool {
+		d.userTraffic.Delete(key)
+		return true
+	})
+	d.connCount.Store(0)
 
 	d.speedBuckets.Range(func(key, _ interface{}) bool {
 		d.speedBuckets.Delete(key)
@@ -234,59 +255,132 @@ func (d *LimitDispatcher) ResetConns() {
 	})
 }
 
-func (d *LimitDispatcher) Snapshot() []kernel.Connection {
+// GetUserTraffic returns per-user cumulative traffic and alive IPs.
+// O(users), not O(connections).
+func (d *LimitDispatcher) GetUserTraffic() (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int) {
 	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	result := make([]kernel.Connection, 0, len(d.conns))
-	for _, c := range d.conns {
-		result = append(result, kernel.Connection{
-			ID:       c.id,
-			UserID:   c.userID,
-			SourceIP: c.sourceIP,
-			Upload:   c.upload.Load(),
-			Download: c.download.Load(),
-		})
-	}
-	return result
-}
-
-func (d *LimitDispatcher) CloseConn(id string) bool {
-	d.mu.RLock()
-	c, ok := d.conns[id]
+	emailToUID := d.emailToUID
+	limitedIPs := d.limitedIPs
 	d.mu.RUnlock()
-	if !ok {
-		return false
+
+	aliveIPs = make(map[int]map[string]bool)
+
+	// Collect IPs from limited users (under RLock snapshot).
+	for email, ipsMap := range limitedIPs {
+		uid := emailToUID[email]
+		if uid == 0 {
+			continue
+		}
+		ipSet := make(map[string]bool, len(ipsMap))
+		for ip := range ipsMap {
+			ipSet[ip] = true
+		}
+		if len(ipSet) > 0 {
+			aliveIPs[uid] = ipSet
+		}
 	}
-	c.closed.Store(true)
-	d.delConn(c.email, c.sourceIP)
-	d.mu.Lock()
-	delete(d.conns, id)
-	d.mu.Unlock()
-	return true
+
+	// Collect IPs from unlimited users (lock-free).
+	d.unlimitedIPs.Range(func(key, value interface{}) bool {
+		email := key.(string)
+		uid := emailToUID[email]
+		if uid == 0 {
+			return true
+		}
+		ic := value.(*ipCounter)
+		if ips := ic.aliveIPs(); len(ips) > 0 {
+			// Merge with limited IPs if any
+			if existing, ok := aliveIPs[uid]; ok {
+				for ip := range ips {
+					existing[ip] = true
+				}
+			} else {
+				aliveIPs[uid] = ips
+			}
+		}
+		return true
+	})
+
+	traffic = make(map[int][2]int64)
+	d.userTraffic.Range(func(key, value interface{}) bool {
+		email := key.(string)
+		utc := value.(*userTrafficCounter)
+		uid := emailToUID[email]
+		if uid == 0 {
+			return true
+		}
+		up := utc.upload.Load()
+		down := utc.download.Load()
+		if up > 0 || down > 0 {
+			traffic[uid] = [2]int64{up, down}
+		}
+		return true
+	})
+
+	connCount = int(d.connCount.Load())
+	return
 }
 
 // ─── Internal helpers ───────────────────────────────────────────────────────
 
+// checkDeviceLimit enforces per-user device limits.
+// Fast path: unlimited users use lock-free sync.Map.
+// Slow path: limited users use RWMutex with deterministic IP ordering.
 func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
+	d.mu.RLock()
 	limit, hasLimit := d.deviceLimits[email]
+	d.mu.RUnlock()
+
+	// Fast path: no device limit — use lock-free sync.Map.
 	if !hasLimit || limit <= 0 {
 		if isTCP {
-			if d.userIPs[email] == nil {
-				d.userIPs[email] = make(map[string]int)
-			}
-			d.userIPs[email][sourceIP]++
+			v, _ := d.unlimitedIPs.LoadOrStore(email, &ipCounter{})
+			ic := v.(*ipCounter)
+			ic.count.Add(1)
+
+			// Increment IP refcount atomically.
+			rv, _ := ic.ips.LoadOrStore(sourceIP, &atomic.Int64{})
+			rv.(*atomic.Int64).Add(1)
 		}
 		return false
 	}
 
-	ips := d.userIPs[email]
+	// Slow path: user has device limit — need deterministic ordering.
+	d.mu.RLock()
+	ips := d.limitedIPs[email]
+	if ips != nil && ips[sourceIP] > 0 {
+		d.mu.RUnlock()
+		if isTCP {
+			d.mu.Lock()
+			d.limitedIPs[email][sourceIP]++
+			d.mu.Unlock()
+		}
+		return false
+	}
+
+	if ips != nil && len(ips) < limit {
+		d.mu.RUnlock()
+		if isTCP {
+			d.mu.Lock()
+			if d.limitedIPs[email] == nil {
+				d.limitedIPs[email] = make(map[string]int)
+			}
+			d.limitedIPs[email][sourceIP]++
+			d.mu.Unlock()
+		}
+		return false
+	}
+	d.mu.RUnlock()
+
+	// Over limit — need write lock for deterministic check.
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Re-check under write lock.
+	ips = d.limitedIPs[email]
 	if ips == nil {
 		ips = make(map[string]int)
-		d.userIPs[email] = ips
+		d.limitedIPs[email] = ips
 	}
 
 	if ips[sourceIP] > 0 {
@@ -303,7 +397,7 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) b
 		return false
 	}
 
-	// Over limit — deterministic: allow lowest IPs lexicographically
+	// Over limit — deterministic: allow lowest IPs lexicographically.
 	ipList := make([]string, 0, len(ips)+1)
 	for ip := range ips {
 		ipList = append(ipList, ip)
@@ -322,24 +416,32 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) b
 	return true
 }
 
+// delConn decrements the IP refcount when a connection closes.
 func (d *LimitDispatcher) delConn(email, sourceIP string) {
+	// Check if this is an unlimited user first (lock-free).
+	if v, ok := d.unlimitedIPs.Load(email); ok {
+		ic := v.(*ipCounter)
+		if rv, ok := ic.ips.Load(sourceIP); ok {
+			counter := rv.(*atomic.Int64)
+			if counter.Add(-1) <= 0 {
+				ic.ips.Delete(sourceIP)
+			}
+		}
+		return
+	}
+
+	// Limited user — use write lock.
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if ips, ok := d.userIPs[email]; ok {
+	if ips, ok := d.limitedIPs[email]; ok {
 		ips[sourceIP]--
 		if ips[sourceIP] <= 0 {
 			delete(ips, sourceIP)
 		}
 		if len(ips) == 0 {
-			delete(d.userIPs, email)
+			delete(d.limitedIPs, email)
 		}
 	}
-}
-
-func (d *LimitDispatcher) getUID(email string) int {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	return d.emailToUID[email]
 }
 
 func (d *LimitDispatcher) getBucket(email string) *rate.Limiter {
@@ -366,11 +468,14 @@ func (d *LimitDispatcher) getBucket(email string) *rate.Limiter {
 
 // ─── I/O wrappers ───────────────────────────────────────────────────────────
 
+const xrayRateLimitThreshold = 64 * 1024
+
 type statsCloseReader struct {
 	buf.Reader
-	counter *atomic.Int64
-	limiter *rate.Limiter
-	ctx     context.Context
+	counter       *atomic.Int64
+	limiter       *rate.Limiter
+	ctx           context.Context
+	pendingTokens atomic.Int64
 }
 
 func (r *statsCloseReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
@@ -378,11 +483,13 @@ func (r *statsCloseReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	if n := int64(mb.Len()); n > 0 {
 		r.counter.Add(n)
 		if r.limiter != nil {
-			waitN := int(n)
-			if burst := r.limiter.Burst(); waitN > burst {
-				waitN = burst
+			if pending := r.pendingTokens.Add(n); pending >= xrayRateLimitThreshold {
+				tokens := int(r.pendingTokens.Swap(0))
+				if burst := r.limiter.Burst(); tokens > burst {
+					tokens = burst
+				}
+				_ = r.limiter.WaitN(r.ctx, tokens)
 			}
-			_ = r.limiter.WaitN(r.ctx, waitN)
 		}
 	}
 	return mb, err
@@ -393,21 +500,24 @@ func (r *statsCloseReader) Interrupt()   { common.Interrupt(r.Reader) }
 
 type statsCloseWriter struct {
 	buf.Writer
-	counter *atomic.Int64
-	limiter *rate.Limiter
-	ctx     context.Context
-	onClose func()
-	closed  atomic.Bool
+	counter       *atomic.Int64
+	limiter       *rate.Limiter
+	ctx           context.Context
+	onClose       func()
+	closed        atomic.Bool
+	pendingTokens atomic.Int64
 }
 
 func (w *statsCloseWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	n := int64(mb.Len())
 	if w.limiter != nil {
-		waitN := int(n)
-		if burst := w.limiter.Burst(); waitN > burst {
-			waitN = burst
+		if pending := w.pendingTokens.Add(n); pending >= xrayRateLimitThreshold {
+			tokens := int(w.pendingTokens.Swap(0))
+			if burst := w.limiter.Burst(); tokens > burst {
+				tokens = burst
+			}
+			_ = w.limiter.WaitN(w.ctx, tokens)
 		}
-		_ = w.limiter.WaitN(w.ctx, waitN)
 	}
 	w.counter.Add(n)
 	return w.Writer.WriteMultiBuffer(mb)

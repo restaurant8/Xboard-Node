@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/config"
+	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/service"
 )
 
@@ -46,11 +47,7 @@ func main() {
 	applyRuntimeConfig(cfg.Runtime)
 
 	nodes := cfg.ExpandNodes()
-	slog.Info("xboard-node starting",
-		"version", version,
-		"build_time", buildTime,
-		"nodes", len(nodes),
-	)
+	nlog.Core().Info(fmt.Sprintf("xboard-node %s starting, %d nodes", version, len(nodes)))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -60,7 +57,7 @@ func main() {
 
 	go func() {
 		sig := <-sigCh
-		slog.Info("received signal, shutting down gracefully", "signal", sig)
+		nlog.Core().Info(fmt.Sprintf("received %v, shutting down...", sig))
 		cancel()
 
 		// Force-exit on second signal or after timeout.
@@ -89,7 +86,7 @@ func main() {
 		})
 		srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 		go func() {
-			slog.Info("health check listening", "addr", ln.Addr())
+			nlog.Core().Debug(fmt.Sprintf("health check listening on :%d", cfg.HealthPort))
 			if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 				slog.Warn("health check server stopped", "error", err)
 			}
@@ -114,8 +111,6 @@ func main() {
 					"node_id", nodeCfg.Panel.NodeID, "error", err)
 				errCh <- err
 				cancel() // bring down all other nodes
-			} else {
-				slog.Info("node service stopped", "node_id", nodeCfg.Panel.NodeID)
 			}
 		}()
 	}
@@ -126,7 +121,7 @@ func main() {
 	if err := <-errCh; err != nil {
 		os.Exit(1)
 	}
-	slog.Info("xboard-node stopped")
+	nlog.Core().Info("stopped")
 }
 
 // applyRuntimeConfig wires up Go runtime memory limits from the config file.

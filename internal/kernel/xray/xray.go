@@ -92,14 +92,16 @@ func (x *Xray) Protocols() []string {
 // ─── Lifecycle ──────────────────────────────────────────────────────────────
 
 // Start builds a new xray-core instance and atomically replaces the old
-// one. The method is organised in four non-overlapping phases so that the
+// one. The method is organised in five non-overlapping phases so that the
 // kernel mutex is never held during slow operations (Start / Close).
+// Crucially, the old instance stays alive until the new one is confirmed
+// running — if StartNew fails, the old instance is untouched.
 //
-//	Phase 1 – Build:   generate protobuf config  (no lock, pure computation)
-//	Phase 2 – Create:  xrayCore.New + capture LD (brief global lock)
-//	Phase 3 – Swap:    stop old instance          (brief kernel lock)
-//	Phase 4 – Start:   instance.Start             (no lock, potentially slow)
-//	Phase 5 – Commit:  store new state            (brief kernel lock)
+//	Phase 1 – Build:      generate protobuf config  (no lock, pure computation)
+//	Phase 2 – Create:     xrayCore.New + capture LD (brief global lock)
+//	Phase 3 – StartNew:   instance.Start            (no lock, potentially slow)
+//	Phase 4 – Swap:       store new, extract old     (brief kernel lock)
+//	Phase 5 – RecycleOld: close old in background    (non-blocking)
 func (x *Xray) Start(nodeConfig *panel.NodeConfig, users []panel.User, certFile, keyFile string) error {
 	// ── Phase 1: Build config (no shared state) ─────────────────────────
 	x.ensureGeoData(nodeConfig)
@@ -123,25 +125,16 @@ func (x *Xray) Start(nodeConfig *panel.NodeConfig, users []panel.User, certFile,
 		return fmt.Errorf("create xray: %w", err)
 	}
 
-	// ── Phase 3: Stop old (brief kernel lock, no drain) ─────────────────
-	x.mu.Lock()
-	x.running.Store(false)
-	old := x.instance
-	x.instance = nil
-	oldLD := x.limitDispatcher
-	x.limitDispatcher = nil
-	x.mu.Unlock()
-
-	closeOld(old, oldLD)
-
-	// ── Phase 4: Start new (no lock, potentially slow) ──────────────────
+	// ── Phase 3: Start new (no lock, potentially slow) ──────────────────
 	if err := startWithTimeout(inst, startTimeout); err != nil {
 		inst.Close()
 		return err
 	}
 
-	// ── Phase 5: Commit (brief kernel lock) ─────────────────────────────
+	// ── Phase 4: Swap old → new (brief kernel lock) ─────────────────────
 	x.mu.Lock()
+	old := x.instance
+	oldLD := x.limitDispatcher
 	x.instance = inst
 	x.limitDispatcher = ld
 	x.users = users
@@ -154,6 +147,9 @@ func (x *Xray) Start(nodeConfig *panel.NodeConfig, users []panel.User, certFile,
 	x.lastKernelHash = kernel.ComputeHash(nodeConfig, users)
 	x.running.Store(true)
 	x.mu.Unlock()
+
+	// ── Phase 5: Recycle old (background, non-blocking) ─────────────────
+	closeOld(old, oldLD)
 
 	x.updateDispatcherLimits(users)
 
@@ -206,42 +202,45 @@ func (x *Xray) Stop() {
 
 func (x *Xray) IsRunning() bool { return x.running.Load() }
 
-// ─── Connection queries ─────────────────────────────────────────────────────
+// ─── Observability ──────────────────────────────────────────────────────────
 
-// GetConnections returns a snapshot of active proxy connections.
-// The lock is safe to take here because mu is never held during slow I/O.
-func (x *Xray) GetConnections(ctx context.Context) ([]kernel.Connection, error) {
+// GetUserTraffic returns per-user cumulative traffic and alive IPs.
+// Reads from LimitDispatcher's per-user atomic counters — O(users).
+func (x *Xray) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error) {
 	if !x.running.Load() {
-		return nil, nil
+		return nil, nil, 0, nil
 	}
 
-	x.mu.Lock()
-	defer x.mu.Unlock()
-
-	if x.instance == nil {
-		return nil, nil
-	}
-
-	if x.limitDispatcher != nil {
-		if conns := x.limitDispatcher.Snapshot(); len(conns) > 0 {
-			return conns, nil
-		}
-	}
-
-	return x.aggregateStats()
-}
-
-func (x *Xray) CloseConnection(_ context.Context, connID string) error {
 	x.mu.Lock()
 	ld := x.limitDispatcher
 	x.mu.Unlock()
+
 	if ld != nil {
-		ld.CloseConn(connID)
+		traffic, aliveIPs, connCount = ld.GetUserTraffic()
+		return traffic, aliveIPs, connCount, nil
 	}
+
+	// Fallback: read xray's native stats counters
+	traffic, err = x.aggregateStats()
+	return traffic, nil, 0, err
+}
+
+func (x *Xray) CloseConnection(_ context.Context, _ string) error {
+	// No-op: xray doesn't support force-closing individual connections.
+	// User removal goes through RemoveUsers which removes the inbound user.
+	return nil
+}
+
+func (x *Xray) CloseUserConnections(_ context.Context, _ string) error {
+	// No-op: handled by RemoveUsers at the xray core level.
 	return nil
 }
 
 func (x *Xray) SetSpeedLimitFunc(_ func(string) *rate.Limiter) {}
+
+// SetDeviceLimitFunc is a no-op for xray — device limits are already
+// gate-kept by LimitDispatcher.checkDeviceLimit at Dispatch time.
+func (x *Xray) SetDeviceLimitFunc(_ func(string) (int, bool)) {}
 
 // ─── User management (non-disruptive where possible) ────────────────────────
 
@@ -658,10 +657,7 @@ func closeOld(inst *xrayCore.Instance, ld *LimitDispatcher) {
 func drainConns(ld *LimitDispatcher, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		ld.mu.RLock()
-		n := len(ld.conns)
-		ld.mu.RUnlock()
-		if n == 0 {
+		if ld.connCount.Load() == 0 {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -669,9 +665,9 @@ func drainConns(ld *LimitDispatcher, timeout time.Duration) {
 }
 
 // aggregateStats is a fallback path that reads xray's built-in stats counters
-// when LimitDispatcher has no active connections (e.g. short-lived UDP flows).
+// when LimitDispatcher is not available. Returns per-user cumulative traffic.
 // Must be called with x.mu held.
-func (x *Xray) aggregateStats() ([]kernel.Connection, error) {
+func (x *Xray) aggregateStats() (map[int][2]int64, error) {
 	sm := x.instance.GetFeature(stats.ManagerType())
 	if sm == nil {
 		return nil, nil
@@ -681,7 +677,7 @@ func (x *Xray) aggregateStats() ([]kernel.Connection, error) {
 		return nil, nil
 	}
 
-	var conns []kernel.Connection
+	traffic := make(map[int][2]int64)
 	for _, u := range x.users {
 		email := userEmail(u.ID)
 
@@ -701,15 +697,10 @@ func (x *Xray) aggregateStats() ([]kernel.Connection, error) {
 		}
 
 		if cum := x.cumTraffic[u.ID]; cum[0] > 0 || cum[1] > 0 {
-			conns = append(conns, kernel.Connection{
-				ID:       fmt.Sprintf("xray-%d", u.ID),
-				UserID:   u.ID,
-				Upload:   cum[0],
-				Download: cum[1],
-			})
+			traffic[u.ID] = cum
 		}
 	}
-	return conns, nil
+	return traffic, nil
 }
 
 // updateDispatcherLimits configures the LimitDispatcher with per-user

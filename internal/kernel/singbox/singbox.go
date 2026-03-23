@@ -54,6 +54,10 @@ type SingBox struct {
 	// Set once by SetSpeedLimitFunc and forwarded to every new ConnTracker.
 	speedLimitFunc func(string) *rate.Limiter
 
+	// deviceLimitFunc resolves a user UUID to (limit, hasLimit) for gate-keeping.
+	// Set once by SetDeviceLimitFunc and forwarded to every new ConnTracker.
+	deviceLimitFunc func(string) (int, bool)
+
 	// trackerRegistered prevents duplicate AppendTracker calls on the same
 	// Router instance during Reload. Reset to false on full restart.
 	trackerRegistered bool
@@ -95,7 +99,11 @@ func (s *SingBox) Start(nodeConfig *panel.NodeConfig, users []panel.User, certFi
 		return fmt.Errorf("parse sing-box options: %w", err)
 	}
 
-	s.stop()
+	// Save old state before creating the new instance.
+	oldBox := s.box
+	oldCancel := s.cancel
+	oldCtx := s.ctx
+	oldTracker := s.connTracker
 
 	instance, err := box.New(box.Options{
 		Context: ctx,
@@ -112,6 +120,7 @@ func (s *SingBox) Start(nodeConfig *panel.NodeConfig, users []panel.User, certFi
 		return fmt.Errorf("start sing-box: %w", err)
 	}
 
+	// New instance started successfully — swap state.
 	s.box = instance
 	s.ctx = ctx
 	s.cancel = cancel
@@ -120,18 +129,54 @@ func (s *SingBox) Start(nodeConfig *panel.NodeConfig, users []panel.User, certFi
 	s.certFile = certFile
 	s.keyFile = keyFile
 
-	// Fresh tracker on full restart (all connections were terminated by s.stop).
+	// Fresh tracker on full restart.
 	s.connTracker = NewConnTracker(0)
 	s.connTracker.SetUserMap(buildUserMap(users))
 	if s.speedLimitFunc != nil {
 		s.connTracker.SetSpeedLimitFunc(s.speedLimitFunc)
 	}
+	if s.deviceLimitFunc != nil {
+		s.connTracker.SetDeviceLimitFunc(s.deviceLimitFunc)
+	}
 
 	s.trackerRegistered = false
 	s.registerTracker(ctx)
 
-	slog.Info("sing-box started", "users", len(users))
+	// Recycle old instance in background — drain then close.
+	if oldBox != nil {
+		go recycleOldBox(oldBox, oldCancel, oldCtx, oldTracker)
+	}
+
+	slog.Debug("sing-box started", "users", len(users))
 	return nil
+}
+
+// recycleOldBox gracefully shuts down a previous sing-box instance in the
+// background. It closes listen sockets first, waits for connections to drain,
+// then hard-closes. This avoids blocking the new instance's startup.
+func recycleOldBox(oldBox *box.Box, oldCancel context.CancelFunc, oldCtx context.Context, oldTracker *ConnTracker) {
+	// Step 1: close listen sockets so no new connections arrive on old ports.
+	if im := service.FromContext[adapter.InboundManager](oldCtx); im != nil {
+		_ = im.Close()
+	}
+
+	// Step 2: drain in-flight connections (best-effort).
+	if oldTracker != nil {
+		deadline := time.Now().Add(drainTimeout)
+		for time.Now().Before(deadline) {
+			if oldTracker.ActiveCount() == 0 {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	// Step 3: hard-close everything.
+	oldBox.Close()
+	if oldCancel != nil {
+		oldCancel()
+	}
+	slog.Debug("sing-box: old instance recycled")
 }
 
 // Reload hot-swaps the inbound users and routing rules without restarting the box.
@@ -168,9 +213,9 @@ func (s *SingBox) Reload(nodeConfig *panel.NodeConfig, users []panel.User, certF
 
 	// Update routing rules
 	if err := router.UpdateRules(opts.Route.Rules, opts.Route.RuleSet); err != nil {
-		slog.Warn("routing reload failed", "error", err)
+		slog.Debug("routing reload failed", "error", err)
 	} else {
-		slog.Info("sing-box routing reloaded")
+		slog.Debug("sing-box routing reloaded")
 	}
 
 	nopFactory := singLog.NewNOPFactory()
@@ -247,7 +292,7 @@ func (s *SingBox) Reload(nodeConfig *panel.NodeConfig, users []panel.User, certF
 		s.connTracker.SetUserMap(buildUserMap(users))
 	}
 
-	slog.Info("sing-box reloaded (users and routes hot-swapped)", "users", len(users))
+	slog.Debug("sing-box reloaded", "users", len(users))
 	s.users = users
 	s.nodeConfig = nodeConfig
 	s.certFile = certFile
@@ -327,15 +372,23 @@ func (s *SingBox) connTrackerSafe() *ConnTracker {
 }
 
 // SetSpeedLimitFunc configures per-user bandwidth throttling.
-// The function is forwarded to the ConnTracker, which embeds the rate limiter
-// in each tracked connection wrapper. This merges byte counting and rate limiting
-// into a single CountFunc callback, allowing splice/zero-copy paths.
 func (s *SingBox) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.speedLimitFunc = fn
 	if s.connTracker != nil {
 		s.connTracker.SetSpeedLimitFunc(fn)
+	}
+}
+
+// SetDeviceLimitFunc configures per-user device limit gate-keeping.
+// Connections exceeding the limit are rejected at connect time.
+func (s *SingBox) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deviceLimitFunc = fn
+	if s.connTracker != nil {
+		s.connTracker.SetDeviceLimitFunc(fn)
 	}
 }
 
@@ -520,19 +573,18 @@ func (s *SingBox) reloadInboundsLocked(users []panel.User) error {
 		s.connTracker.SetUserMap(buildUserMap(users))
 	}
 
-	slog.Info("sing-box users hot-swapped", "users", len(users))
+	slog.Debug("sing-box users hot-swapped", "users", len(users))
 	return nil
 }
 
 // ─── Observability ──────────────────────────────────────────────────────────
-func (s *SingBox) GetConnections(_ context.Context) ([]kernel.Connection, error) {
+func (s *SingBox) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error) {
 	ct := s.connTrackerSafe()
 	if ct == nil {
-		return nil, nil
+		return nil, nil, 0, nil
 	}
-	conns := ct.Snapshot()
-	slog.Debug("GetConnections snapshot", "count", len(conns))
-	return conns, nil
+	traffic, aliveIPs, connCount = ct.GetUserTraffic()
+	return traffic, aliveIPs, connCount, nil
 }
 
 // CloseConnection force-closes a specific connection by its ID.
@@ -544,6 +596,16 @@ func (s *SingBox) CloseConnection(_ context.Context, connID string) error {
 	if !ct.CloseByID(connID) {
 		slog.Debug("CloseConnection: connection not found (already closed?)", "id", connID)
 	}
+	return nil
+}
+
+// CloseUserConnections terminates all connections for a user UUID.
+func (s *SingBox) CloseUserConnections(_ context.Context, uuid string) error {
+	ct := s.connTrackerSafe()
+	if ct == nil {
+		return nil
+	}
+	ct.CloseByUUID(uuid)
 	return nil
 }
 

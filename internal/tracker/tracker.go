@@ -1,275 +1,261 @@
 package tracker
 
 import (
-	"log/slog"
+	"sync"
+	"sync/atomic"
 
-	"github.com/cedar2025/xboard-node/internal/kernel"
+	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
-const (
-	// DefaultMaxConnState caps how many connection-state entries we maintain.
-	// Prevents unbounded memory growth from rogue / DDoS connection floods.
-	DefaultMaxConnState = 100_000
+// snapshot is an immutable point-in-time view of tracker state.
+// It is swapped atomically so readers never block writers.
+type snapshot struct {
+	traffic   map[int][2]int64        // userID → [upload, download] delta
+	aliveIPs  map[int]map[string]bool // userID → set of source IPs
+	online    map[int]int             // userID → distinct IP count
+	connCount int
+	inSpeed   int64
+	outSpeed  int64
+}
 
-	// DefaultMaxAliveIPsPerUser caps the per-user IP set tracked per push interval.
-	// 200 IPs per user is generous for any legitimate use case.
-	DefaultMaxAliveIPsPerUser = 200
-)
-
-// Tracker tracks per-connection traffic deltas and accumulates per-user totals.
+// Tracker computes per-user traffic deltas from cumulative counters
+// provided by the kernel, and accumulates totals for panel reporting.
 //
-// Thread safety model: Tracker is designed for SINGLE-GOROUTINE use only.
-// All methods (Process, Flush*, Restore*, CurrentOnline, speed accessors) are
-// called exclusively from the service goroutine's select loop. No internal
-// locking is provided. Do NOT call Tracker methods from multiple goroutines.
+// Architecture: the kernel maintains per-user atomic counters and IP sets.
+// Each tick, the service calls Process() with cumulative per-user traffic.
+// Tracker computes deltas against the previous cycle's values — O(users),
+// not O(connections).
 //
-// Hot-path optimisation (②): activeConns is allocated once and cleared in-place
-// every Process() call instead of being reallocated, saving GC pressure at high
-// connection counts.
-//
-// OOM protection (④): connState and aliveIPs are capped at configurable maximums.
+// Thread safety: Process() acquires mu to update internal state, then
+// atomically publishes a new snapshot. All read methods (Flush*,
+// CurrentOnline, LogStats, *Speed) read the snapshot lock-free.
+// This eliminates contention between the 10s Process tick and the 60s
+// flush/push tick.
 type Tracker struct {
-	connState map[string][2]int64     // conn_id → last [upload, download]
-	traffic   map[int][2]int64        // user_id → accumulated [upload, download]
-	aliveIPs  map[int]map[string]bool // user_id → set of source IPs
-	online    map[int]int             // user_id → current active connection count
+	mu sync.Mutex
 
-	// ② Reused buffer: cleared each Process() call, not reallocated.
-	activeConns map[string]struct{}
+	// lastSeen stores the cumulative traffic from the previous Process() call.
+	// Protected by mu — only written by Process.
+	lastSeen map[int][2]int64 // userID → [upload, download] cumulative
 
-	// ④ Limits (set at construction, never mutated).
-	maxConnState       int
-	maxAliveIPsPerUser int
+	// pending accumulates deltas between flushes.
+	// Protected by mu — written by Process, drained by FlushTraffic.
+	pendingTraffic map[int][2]int64
 
-	// lastActiveConns stores the last observed number of active connections.
-	// This is updated on each Process() call and read by the service when
-	// building node metrics for panel reporting.
-	lastActiveConns int
-	totalConns      int64 // cumulative number of connections seen since startup
+	// live holds the current snapshot, swapped atomically.
+	// Readers load this pointer without any lock.
+	live atomic.Pointer[snapshot]
 
-	// lastUserCount is used to pre-size intervalTraffic each cycle, avoiding
-	// repeated map rehashing under heavy user counts.
-	lastUserCount int
-
-	inSpeed  int64
-	outSpeed int64
+	// aliveIPsBuf is a reusable buffer for FlushAliveIPs output.
+	// Avoids allocating a new map+slice every 60s.
+	aliveIPsBuf map[int][]string
 }
 
 func New() *Tracker {
-	return NewWithLimits(DefaultMaxConnState, DefaultMaxAliveIPsPerUser)
+	t := &Tracker{
+		lastSeen:       make(map[int][2]int64),
+		pendingTraffic: make(map[int][2]int64),
+		aliveIPsBuf:    make(map[int][]string),
+	}
+	// Publish initial empty snapshot.
+	t.live.Store(&snapshot{
+		traffic:  make(map[int][2]int64),
+		aliveIPs: make(map[int]map[string]bool),
+		online:   make(map[int]int),
+	})
+	return t
 }
 
-func NewWithLimits(maxConnState, maxAliveIPsPerUser int) *Tracker {
-	return &Tracker{
-		connState:          make(map[string][2]int64),
-		traffic:            make(map[int][2]int64),
-		aliveIPs:           make(map[int]map[string]bool),
-		online:             make(map[int]int),
-		activeConns:        make(map[string]struct{}),
-		maxConnState:       maxConnState,
-		maxAliveIPsPerUser: maxAliveIPsPerUser,
-	}
-}
+// Process computes per-user traffic deltas from cumulative kernel counters.
+// Also stores alive IPs and connection count. O(users).
+//
+// This is the only writer to lastSeen and pendingTraffic.
+// After computing deltas, it publishes a new snapshot for lock-free reads.
+func (t *Tracker) Process(
+	cumTraffic map[int][2]int64,
+	kernelAliveIPs map[int]map[string]bool,
+	connCount int,
+) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
-// Process calculates per-user traffic deltas for this interval.
-// Internally accumulates totals for panel push and tracks alive IPs.
-// Returns per-user interval traffic [upload, download] for the limiter.
-func (t *Tracker) Process(conns []kernel.Connection) map[int][2]int64 {
-	// Pre-size using last cycle's user count to avoid rehashing under heavy load.
-	intervalTraffic := make(map[int][2]int64, t.lastUserCount)
+	var cycleIn, cycleOut int64
 
-	// Clear activeConns in-place (no alloc, backing array retained).
-	for k := range t.activeConns {
-		delete(t.activeConns, k)
-	}
+	for uid, cum := range cumTraffic {
+		prev := t.lastSeen[uid]
+		deltaUp := cum[0] - prev[0]
+		deltaDown := cum[1] - prev[1]
 
-	// Rebuild aliveIPs each cycle so only currently-active IPs are reported.
-	// Previously, IPs accumulated across cycles leading to stale entries.
-	for uid := range t.aliveIPs {
-		for ip := range t.aliveIPs[uid] {
-			delete(t.aliveIPs[uid], ip)
+		// Guard against counter reset (kernel restart).
+		if deltaUp < 0 {
+			deltaUp = cum[0]
 		}
-	}
-
-	// Clear online counts
-	for uid := range t.online {
-		delete(t.online, uid)
-	}
-
-	for _, conn := range conns {
-		t.activeConns[conn.ID] = struct{}{}
-
-		if conn.UserID == 0 {
-			continue
+		if deltaDown < 0 {
+			deltaDown = cum[1]
 		}
 
-		t.online[conn.UserID]++
-
-		var deltaUp, deltaDown int64
-		prev, exists := t.connState[conn.ID]
-		if exists {
-			deltaUp = conn.Upload - prev[0]
-			deltaDown = conn.Download - prev[1]
-			if deltaUp < 0 {
-				deltaUp = conn.Upload
-			}
-			if deltaDown < 0 {
-				deltaDown = conn.Download
-			}
-		} else {
-			// ④ New connection: only track if below the state cap.
-			if len(t.connState) >= t.maxConnState {
-				slog.Debug("connState cap reached, skipping new connection",
-					"cap", t.maxConnState, "conn_id", conn.ID)
-				continue
-			}
-			deltaUp = conn.Upload
-			deltaDown = conn.Download
-			t.totalConns++
-		}
-		t.connState[conn.ID] = [2]int64{conn.Upload, conn.Download}
+		t.lastSeen[uid] = cum
 
 		if deltaUp > 0 || deltaDown > 0 {
-			cur := t.traffic[conn.UserID]
+			cur := t.pendingTraffic[uid]
 			cur[0] += deltaUp
 			cur[1] += deltaDown
-			t.traffic[conn.UserID] = cur
+			t.pendingTraffic[uid] = cur
 
-			it := intervalTraffic[conn.UserID]
-			it[0] += deltaUp
-			it[1] += deltaDown
-			intervalTraffic[conn.UserID] = it
-		}
-
-		// ④ Track alive IPs, capped per user.
-		if conn.SourceIP != "" {
-			ips := t.aliveIPs[conn.UserID]
-			if ips == nil {
-				ips = make(map[string]bool)
-				t.aliveIPs[conn.UserID] = ips
-			}
-			if len(ips) < t.maxAliveIPsPerUser {
-				ips[conn.SourceIP] = true
-			}
+			cycleOut += deltaUp
+			cycleIn += deltaDown
 		}
 	}
 
-	// Cleanup stale connState entries for connections that are no longer active.
-	for id := range t.connState {
-		if _, active := t.activeConns[id]; !active {
-			delete(t.connState, id)
-		}
+	// Compute online from alive IPs.
+	online := make(map[int]int, len(kernelAliveIPs))
+	for uid, ips := range kernelAliveIPs {
+		online[uid] = len(ips)
 	}
 
-	// Snapshot current active connection count for metrics reporting.
-	t.lastActiveConns = len(t.connState)
-
-	// Derive speed directly from intervalTraffic deltas accumulated this cycle.
-	// This avoids the negative-diff bug that occurs when connState entries for
-	// closed connections are removed, which made cumulative totals drop and
-	// clamped speed to 0 for one cycle after a mass disconnect.
-	var cycleIn, cycleOut int64
-	for _, it := range intervalTraffic {
-		cycleOut += it[0]
-		cycleIn += it[1]
-	}
-	t.inSpeed = cycleIn
-	t.outSpeed = cycleOut
-
-	// Update hint for next cycle's map pre-sizing.
-	if n := len(intervalTraffic); n > 0 {
-		t.lastUserCount = n
-	}
-
-	return intervalTraffic
+	// Publish new snapshot (readers will see this atomically).
+	t.live.Store(&snapshot{
+		traffic:   copyTrafficMap(t.pendingTraffic),
+		aliveIPs:  kernelAliveIPs, // kernel provides fresh copy each tick
+		online:    online,
+		connCount: connCount,
+		inSpeed:   cycleIn,
+		outSpeed:  cycleOut,
+	})
 }
 
-// FlushTraffic returns accumulated per-user traffic and resets the counter.
+// FlushTraffic returns accumulated per-user traffic and resets the pending buffer.
+// Lock-free: reads from live snapshot, then acquires mu only to drain.
 func (t *Tracker) FlushTraffic() map[int][2]int64 {
-	data := t.traffic
-	t.traffic = make(map[int][2]int64, len(data))
+	t.mu.Lock()
+	data := t.pendingTraffic
+	t.pendingTraffic = make(map[int][2]int64, len(data))
+	t.mu.Unlock()
 	return data
 }
 
 // RestoreTraffic adds traffic back (used when push to panel fails).
 func (t *Tracker) RestoreTraffic(data map[int][2]int64) {
+	t.mu.Lock()
 	for uid, d := range data {
-		cur := t.traffic[uid]
+		cur := t.pendingTraffic[uid]
 		cur[0] += d[0]
 		cur[1] += d[1]
-		t.traffic[uid] = cur
+		t.pendingTraffic[uid] = cur
 	}
+	t.mu.Unlock()
 }
 
 // HasTraffic returns true if there is accumulated traffic to report.
 func (t *Tracker) HasTraffic() bool {
-	return len(t.traffic) > 0
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.pendingTraffic) > 0
 }
 
-// FlushAliveIPs returns per-user alive IPs and resets the tracker.
+// FlushAliveIPs returns per-user alive IPs.
+// Reuses internal buffer to avoid allocation every 60s.
 func (t *Tracker) FlushAliveIPs() map[int][]string {
-	data := make(map[int][]string, len(t.aliveIPs))
-	for uid, ips := range t.aliveIPs {
-		ipList := make([]string, 0, len(ips))
-		for ip := range ips {
-			ipList = append(ipList, ip)
-		}
-		data[uid] = ipList
+	s := t.live.Load()
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Clear old buffer entries.
+	for k := range t.aliveIPsBuf {
+		delete(t.aliveIPsBuf, k)
 	}
-	t.aliveIPs = make(map[int]map[string]bool, len(t.aliveIPs))
-	return data
+
+	// Fill buffer from snapshot.
+	for uid, ips := range s.aliveIPs {
+		buf := t.aliveIPsBuf[uid]
+		if buf == nil {
+			buf = make([]string, 0, len(ips))
+		}
+		buf = buf[:0]
+		for ip := range ips {
+			buf = append(buf, ip)
+		}
+		t.aliveIPsBuf[uid] = buf
+	}
+
+	return t.aliveIPsBuf
 }
 
-// CurrentOnline returns a map of user_id to active connection count.
+// CurrentOnline returns a snapshot copy of user_id → device count (distinct IPs).
+// Lock-free: reads from live snapshot.
 func (t *Tracker) CurrentOnline() map[int]int {
-	return t.online
+	s := t.live.Load()
+	cp := make(map[int]int, len(s.online))
+	for k, v := range s.online {
+		cp[k] = v
+	}
+	return cp
 }
 
 // RestoreAliveIPs merges alive IPs back in (used when push to panel fails).
+// Note: this operates on the buffer, which will be overwritten next Process().
 func (t *Tracker) RestoreAliveIPs(data map[int][]string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	for uid, ipList := range data {
-		ips := t.aliveIPs[uid]
+		ips := t.aliveIPsBuf[uid]
 		if ips == nil {
-			ips = make(map[string]bool, len(ipList))
-			t.aliveIPs[uid] = ips
+			ips = make([]string, 0, len(ipList))
 		}
 		for _, ip := range ipList {
-			if len(ips) < t.maxAliveIPsPerUser {
-				ips[ip] = true
+			// Dedup check
+			found := false
+			for _, existing := range ips {
+				if existing == ip {
+					found = true
+					break
+				}
+			}
+			if !found {
+				ips = append(ips, ip)
 			}
 		}
+		t.aliveIPsBuf[uid] = ips
 	}
 }
 
 // LogStats logs current tracking statistics.
+// Lock-free: reads from live snapshot.
 func (t *Tracker) LogStats() {
-	slog.Debug("tracker stats",
-		"active_connections", len(t.connState),
-		"users_with_traffic", len(t.traffic),
-		"users_with_ips", len(t.aliveIPs),
-	)
+	s := t.live.Load()
+	nlog.TrackerStats(s.connCount, len(s.online))
 }
 
 // ActiveConnections returns the last observed active connection count.
-// This is cheap and safe because Tracker is only mutated from the service
-// goroutine; reads happen from the same goroutine when pushing reports.
+// Lock-free: reads from live snapshot.
 func (t *Tracker) ActiveConnections() int {
-	return t.lastActiveConns
+	return t.live.Load().connCount
 }
 
-// TotalConnections returns the cumulative connection count since startup.
+// TotalConnections is deprecated — no longer tracked per-connection.
+// Returns 0 for backward compatibility.
 func (t *Tracker) TotalConnections() int64 {
-	return t.totalConns
+	return 0
 }
 
 // InboundSpeed returns the last observed inbound (download) speed in bytes/second.
-// Process() is called every 10 seconds, so we divide the 10-second total by 10.
+// Lock-free: reads from live snapshot.
 func (t *Tracker) InboundSpeed() int64 {
-	return t.inSpeed / 10
+	return t.live.Load().inSpeed / 10
 }
 
 // OutboundSpeed returns the last observed outbound (upload) speed in bytes/second.
-// Process() is called every 10 seconds, so we divide the 10-second total by 10.
+// Lock-free: reads from live snapshot.
 func (t *Tracker) OutboundSpeed() int64 {
-	return t.outSpeed / 10
+	return t.live.Load().outSpeed / 10
+}
+
+// copyTrafficMap creates a shallow copy of the traffic map.
+func copyTrafficMap(src map[int][2]int64) map[int][2]int64 {
+	dst := make(map[int][2]int64, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }

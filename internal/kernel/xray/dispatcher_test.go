@@ -1,16 +1,20 @@
 package xray
 
 import (
+	"sync/atomic"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/panel"
 )
 
-func TestLimitDispatcher_DeviceLimitCheck(t *testing.T) {
-	ld := &LimitDispatcher{
-		conns:   make(map[string]*dispatchedConn),
-		userIPs: make(map[string]map[string]int),
+func newTestDispatcher() *LimitDispatcher {
+	return &LimitDispatcher{
+		limitedIPs: make(map[string]map[string]int),
 	}
+}
+
+func TestLimitDispatcher_DeviceLimitCheck(t *testing.T) {
+	ld := newTestDispatcher()
 
 	users := []panel.User{
 		{ID: 1, UUID: "uuid-1", DeviceLimit: 2, SpeedLimit: 0},
@@ -65,10 +69,7 @@ func TestLimitDispatcher_DeviceLimitCheck(t *testing.T) {
 }
 
 func TestLimitDispatcher_DelConn(t *testing.T) {
-	ld := &LimitDispatcher{
-		conns:   make(map[string]*dispatchedConn),
-		userIPs: make(map[string]map[string]int),
-	}
+	ld := newTestDispatcher()
 
 	email := userEmail(1)
 	deviceLimits := map[string]int{email: 2}
@@ -93,10 +94,7 @@ func TestLimitDispatcher_DelConn(t *testing.T) {
 }
 
 func TestLimitDispatcher_SpeedBucket(t *testing.T) {
-	ld := &LimitDispatcher{
-		conns:   make(map[string]*dispatchedConn),
-		userIPs: make(map[string]map[string]int),
-	}
+	ld := newTestDispatcher()
 
 	email1 := userEmail(1)
 	email2 := userEmail(2)
@@ -123,82 +121,112 @@ func TestLimitDispatcher_SpeedBucket(t *testing.T) {
 	}
 }
 
-func TestLimitDispatcher_Snapshot(t *testing.T) {
-	ld := &LimitDispatcher{
-		conns:   make(map[string]*dispatchedConn),
-		userIPs: make(map[string]map[string]int),
-	}
+func TestLimitDispatcher_GetUserTraffic(t *testing.T) {
+	ld := newTestDispatcher()
 
-	// Add some connections
-	ld.conns["conn-1"] = &dispatchedConn{
-		id: "conn-1", email: "user@1", sourceIP: "1.1.1.1", userID: 1,
-	}
-	ld.conns["conn-2"] = &dispatchedConn{
-		id: "conn-2", email: "user@2", sourceIP: "2.2.2.2", userID: 2,
-	}
-	ld.conns["conn-1"].upload.Store(1000)
-	ld.conns["conn-1"].download.Store(2000)
+	email1 := userEmail(1)
+	email2 := userEmail(2)
+	ld.UpdateLimits(map[string]int{email1: 1, email2: 2}, nil, nil)
 
-	snapshot := ld.Snapshot()
-	if len(snapshot) != 2 {
-		t.Fatalf("expected 2 connections, got %d", len(snapshot))
-	}
+	// Simulate traffic by storing counters directly
+	tc1 := &userTrafficCounter{}
+	tc1.upload.Store(1000)
+	tc1.download.Store(2000)
+	ld.userTraffic.Store(email1, tc1)
 
-	found := false
-	for _, c := range snapshot {
-		if c.ID == "conn-1" {
-			found = true
-			if c.UserID != 1 || c.SourceIP != "1.1.1.1" || c.Upload != 1000 || c.Download != 2000 {
-				t.Errorf("unexpected connection data: %+v", c)
-			}
-		}
-	}
-	if !found {
-		t.Error("conn-1 not found in snapshot")
-	}
-}
+	tc2 := &userTrafficCounter{}
+	tc2.upload.Store(500)
+	tc2.download.Store(800)
+	ld.userTraffic.Store(email2, tc2)
 
-func TestLimitDispatcher_CloseConn(t *testing.T) {
-	ld := &LimitDispatcher{
-		conns:   make(map[string]*dispatchedConn),
-		userIPs: make(map[string]map[string]int),
-	}
+	// Simulate IPs (use unlimitedIPs for users without device limit)
+	ic1 := &ipCounter{}
+	ic1.ips.Store("1.1.1.1", &atomic.Int64{})
+	ic1.ips.Store("2.2.2.2", &atomic.Int64{})
+	ld.unlimitedIPs.Store(email1, ic1)
 
-	email := userEmail(1)
-	ld.userIPs[email] = map[string]int{"1.1.1.1": 1}
-	ld.conns["conn-1"] = &dispatchedConn{
-		id: "conn-1", email: email, sourceIP: "1.1.1.1", userID: 1,
-	}
+	ic2 := &ipCounter{}
+	ic2.ips.Store("3.3.3.3", &atomic.Int64{})
+	ld.unlimitedIPs.Store(email2, ic2)
 
-	ok := ld.CloseConn("conn-1")
-	if !ok {
-		t.Error("CloseConn should return true for existing connection")
-	}
+	ld.connCount.Store(5)
 
-	if len(ld.conns) != 0 {
-		t.Error("connection should be removed after close")
-	}
+	traffic, aliveIPs, connCount := ld.GetUserTraffic()
 
-	ok = ld.CloseConn("nonexistent")
-	if ok {
-		t.Error("CloseConn should return false for nonexistent connection")
+	if connCount != 5 {
+		t.Errorf("expected connCount=5, got %d", connCount)
+	}
+	if traffic[1] != [2]int64{1000, 2000} {
+		t.Errorf("user 1 traffic: got %v", traffic[1])
+	}
+	if traffic[2] != [2]int64{500, 800} {
+		t.Errorf("user 2 traffic: got %v", traffic[2])
+	}
+	if len(aliveIPs[1]) != 2 {
+		t.Errorf("user 1 IPs: got %d, want 2", len(aliveIPs[1]))
+	}
+	if len(aliveIPs[2]) != 1 {
+		t.Errorf("user 2 IPs: got %d, want 1", len(aliveIPs[2]))
 	}
 }
 
 func TestLimitDispatcher_ResetConns(t *testing.T) {
-	ld := &LimitDispatcher{
-		conns:   make(map[string]*dispatchedConn),
-		userIPs: make(map[string]map[string]int),
-	}
-	ld.conns["c1"] = &dispatchedConn{id: "c1"}
-	ld.userIPs["user@1"] = map[string]int{"1.1.1.1": 1}
+	ld := newTestDispatcher()
+
+	// Add some state
+	ld.mu.Lock()
+	ld.limitedIPs["user@1"] = map[string]int{"1.1.1.1": 1}
+	ld.mu.Unlock()
+	ld.userTraffic.Store("user@1", &userTrafficCounter{})
+	ld.connCount.Store(3)
 
 	ld.ResetConns()
 
-	if len(ld.conns) != 0 {
-		t.Error("conns should be empty after reset")
+	ld.mu.RLock()
+	ipCount := len(ld.limitedIPs)
+	ld.mu.RUnlock()
+	if ipCount != 0 {
+		t.Error("limitedIPs should be empty after reset")
 	}
-	if len(ld.userIPs) != 0 {
-		t.Error("userIPs should be empty after reset")
+
+	// Verify userTraffic is cleared
+	count := 0
+	ld.userTraffic.Range(func(_, _ interface{}) bool {
+		count++
+		return true
+	})
+	if count != 0 {
+		t.Error("userTraffic should be empty after reset")
+	}
+
+	if ld.connCount.Load() != 0 {
+		t.Error("connCount should be 0 after reset")
+	}
+}
+
+func TestLimitDispatcher_UnlimitedUserFastPath(t *testing.T) {
+	ld := newTestDispatcher()
+
+	email := userEmail(1)
+	// No device limit set for this user
+	ld.UpdateLimits(map[string]int{email: 1}, nil, nil)
+
+	// Should use fast path (sync.Map), no lock needed
+	for i := 0; i < 100; i++ {
+		ip := "10.0.0." + string(rune('0'+i%10))
+		if ld.checkDeviceLimit(email, ip, true) {
+			t.Errorf("unlimited user should always be allowed (ip=%s)", ip)
+		}
+	}
+
+	// Verify IPs are tracked in unlimitedIPs
+	v, ok := ld.unlimitedIPs.Load(email)
+	if !ok {
+		t.Error("unlimited user should have entry in unlimitedIPs")
+	}
+	ic := v.(*ipCounter)
+	ips := ic.aliveIPs()
+	if len(ips) == 0 {
+		t.Error("should have tracked some IPs")
 	}
 }

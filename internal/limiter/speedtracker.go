@@ -1,13 +1,15 @@
 package limiter
 
 import (
-	"log/slog"
 	"sync"
 	"sync/atomic"
 
 	"github.com/cedar2025/xboard-node/internal/panel"
 	"golang.org/x/time/rate"
 )
+
+// SpeedTrackerLogCallback is called when bucket updates occur.
+type SpeedTrackerLogCallback func(msg string)
 
 // SpeedTracker manages per-user token-bucket rate limiters.
 // It does NOT wrap connections itself — instead, ConnTracker consults it
@@ -22,6 +24,9 @@ type SpeedTracker struct {
 	// Fast-path: when no users have a speed limit, GetLimiter returns nil
 	// immediately without any map lookup.
 	hasLimits atomic.Bool
+
+	// Optional callback for logging
+	logFunc SpeedTrackerLogCallback
 }
 
 // NewSpeedTracker creates a bucket manager for per-user bandwidth throttling.
@@ -33,19 +38,23 @@ func NewSpeedTracker(l *Limiter) *SpeedTracker {
 	}
 }
 
+// SetLogCallback sets the logging callback.
+func (t *SpeedTracker) SetLogCallback(f SpeedTrackerLogCallback) {
+	t.logFunc = f
+}
+
 // UpdateBuckets performs an incremental update of rate limiter buckets.
 // It reuses existing rate.Limiter instances to avoid burst resets and
 // minimizes memory allocations.
 func (t *SpeedTracker) UpdateBuckets() {
+	currentUsers := make([]panel.User, 0, 32)
 	t.limiter.mu.RLock()
-	currentUsers := make([]panel.User, 0, len(t.limiter.users))
 	for _, u := range t.limiter.users {
 		currentUsers = append(currentUsers, u)
 	}
 	t.limiter.mu.RUnlock()
 
 	t.mu.Lock()
-	defer t.mu.Unlock()
 
 	newUUIDMap := make(map[string]int, len(currentUsers))
 	activeIDs := make(map[int]struct{}, len(currentUsers))
@@ -71,8 +80,6 @@ func (t *SpeedTracker) UpdateBuckets() {
 		}
 
 		if existing, ok := t.buckets[user.ID]; ok {
-			// Thread-safe in-place update. Existing connections continue
-			// using this limiter with the new rate immediately.
 			existing.SetLimit(rate.Limit(bytesPerSec))
 			existing.SetBurst(burst)
 		} else {
@@ -89,7 +96,16 @@ func (t *SpeedTracker) UpdateBuckets() {
 
 	t.uuidMap = newUUIDMap
 	t.hasLimits.Store(len(t.buckets) > 0)
-	slog.Info("speedtracker: buckets updated", "active_limiters", len(t.buckets))
+
+	// IMPORTANT: logFunc must run after Unlock. The callback installed in
+	// service.startKernel calls LimitedUserCount(), which needs RLock on t.mu.
+	// Calling it while this goroutine holds Lock causes a self-deadlock on
+	// sync.RWMutex (writer blocked forever waiting for itself to release).
+	t.mu.Unlock()
+
+	if t.logFunc != nil {
+		t.logFunc("buckets updated")
+	}
 }
 
 // GetLimiter returns the rate limiter for the given user UUID, or nil if

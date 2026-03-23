@@ -447,6 +447,7 @@ func buildVMess(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyF
 	base["users"] = userList
 
 	applyTransport(base, nc)
+	applyProxyProtocol(base, nc)
 	applyMultiplex(base, nc)
 
 	if nc.TLS == 1 {
@@ -473,6 +474,7 @@ func buildVLESS(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyF
 	base["users"] = userList
 
 	applyTransport(base, nc)
+	applyProxyProtocol(base, nc)
 	applyMultiplex(base, nc)
 
 	if nc.TLS == 1 {
@@ -498,6 +500,7 @@ func buildTrojan(base M, nc *panel.NodeConfig, users []panel.User, certFile, key
 	base["users"] = userList
 
 	applyTransport(base, nc)
+	applyProxyProtocol(base, nc)
 	applyMultiplex(base, nc)
 
 	if nc.TLS == 1 {
@@ -653,6 +656,7 @@ func buildHTTP(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFi
 	}
 	base["users"] = userList
 
+	applyProxyProtocol(base, nc)
 	if nc.TLS == 1 {
 		base["tls"] = buildTLSConfig(nc, certFile, keyFile)
 	}
@@ -836,4 +840,11 @@ func applyMultiplex(base M, nc *panel.NodeConfig) {
 	}
 
 	base["multiplex"] = mux
+}
+
+func applyProxyProtocol(base M, nc *panel.NodeConfig) {
+	// if !nc.GetProxyProtocol() {
+	// 	return
+	// }
+	// base["proxy_protocol"] = true
 }

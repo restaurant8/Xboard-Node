@@ -499,7 +499,7 @@ func applyStreamSettings(base M, nc *panel.NodeConfig, certFile, keyFile string)
 	}
 
 	// Proxy Protocol
-	if nc.AcceptProxyProtocol {
+	if nc.GetProxyProtocol() {
 		sockopt, ok := base["streamSettings"].(M)["sockopt"].(M)
 		if !ok {
 			sockopt = M{}

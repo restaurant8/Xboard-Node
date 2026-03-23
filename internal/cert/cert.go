@@ -135,7 +135,6 @@ func (m *Manager) CertRenewed() bool { return m.renewed.Swap(false) }
 // Start initializes the cert manager based on the resolved mode.
 func (m *Manager) Start(ctx context.Context) error {
 	mode := m.resolveMode()
-	slog.Info("cert manager starting", "mode", mode, "domain", m.cfg.Domain)
 
 	switch mode {
 	case "none", "":
@@ -172,7 +171,7 @@ func (m *Manager) startFile() error {
 	if _, err := os.Stat(m.cfg.KeyFile); err != nil {
 		return fmt.Errorf("key file: %w", err)
 	}
-	slog.Info("using manual TLS certificates", "cert", m.certFile, "key", m.keyFile)
+	slog.Debug("using manual TLS certificates", "cert", m.certFile, "key", m.keyFile)
 	return nil
 }
 
@@ -181,7 +180,7 @@ func (m *Manager) startFile() error {
 func (m *Manager) startSelfSigned() error {
 	// If files already exist and are valid, skip regeneration.
 	if fileExists(m.certFile) && fileExists(m.keyFile) {
-		slog.Info("self-signed cert already exists, reusing", "cert", m.certFile)
+		slog.Debug("self-signed cert exists, reusing", "cert", m.certFile)
 		return nil
 	}
 
