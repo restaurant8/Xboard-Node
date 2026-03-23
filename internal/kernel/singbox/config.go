@@ -152,28 +152,30 @@ func buildRoutes(panelRoutes []panel.RouteRule, custom []map[string]any) M {
 		rules = append(rules, M(cr))
 	}
 
-	// Standard blocks for private/loopback
-	// rules = append(rules, M{
-	// 	"outbound": "block",
-	// 	"ip_cidr": []string{
-	// 		"10.0.0.0/8",
-	// 		"100.64.0.0/10",
-	// 		"127.0.0.0/8",
-	// 		"169.254.0.0/16",
-	// 		"172.16.0.0/12",
-	// 		"192.0.0.0/24",
-	// 		"192.168.0.0/16",
-	// 		"198.18.0.0/15",
-	// 		"fc00::/7",
-	// 		"fe80::/10",
-	// 		"::1/128",
-	// 	},
-	// }, M{
-	// 	"outbound": "block",
-	// 	"domain": []string{
-	// 		"geoip:private",
-	// 	},
-	// })
+	// Standard blocks for private IPv4 and IPv6 ranges to prevent SSRF.
+	rules = append(rules,
+		M{
+			"outbound": "block",
+			"ip_cidr": []string{
+				"10.0.0.0/8",
+				"100.64.0.0/10",
+				"127.0.0.0/8",
+				"169.254.0.0/16",
+				"172.16.0.0/12",
+				"192.0.0.0/24",
+				"192.168.0.0/16",
+				"198.18.0.0/15",
+			},
+		},
+		M{
+			"outbound": "block",
+			"ip_cidr": []string{
+				"fc00::/7",
+				"fe80::/10",
+				"::1/128",
+			},
+		},
+	)
 
 	// Panel-defined routes (usually specific blocks/proxies)
 	for _, pr := range panelRoutes {

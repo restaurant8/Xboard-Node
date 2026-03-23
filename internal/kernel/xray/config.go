@@ -311,42 +311,45 @@ var ss2022Methods = map[string]ss2022Config{
 func buildShadowsocks(base M, nc *panel.NodeConfig, users []panel.User) M {
 	ss2022, isSS2022 := ss2022Methods[nc.Cipher]
 
-	// Single-user mode for traditional ciphers
-	if !isSS2022 {
-		if len(users) > 0 {
-			base["settings"] = M{
-				"method":   nc.Cipher,
-				"password": users[0].UUID,
-				"email":    userEmail(users[0].ID),
-				"network":  "tcp,udp",
+	clients := make([]M, 0, len(users))
+
+	if isSS2022 {
+		// SS2022: server key at top level, per-user key must be Base64 of fixed-length raw bytes.
+		// Only blake3-aes-* supports multi-user in Xray; chacha20 variant is single-user only.
+		rawBuf := make([]byte, ss2022.size)
+		for i := range users {
+			u := &users[i]
+			for j := range rawBuf {
+				rawBuf[j] = 0
 			}
+			copy(rawBuf, u.UUID)
+			clients = append(clients, M{
+				"password": base64.StdEncoding.EncodeToString(rawBuf),
+				"email":    userEmail(u.ID),
+			})
 		}
-		return base
-	}
-
-	// Multi-user mode for 2022-blake3 ciphers
-	clients := make([]M, len(users))
-	rawBuf := make([]byte, ss2022.size)
-
-	for i := range users {
-		u := &users[i]
-		// SS2022 User Key must be Base64 of fixed-length raw bytes
-		for j := range rawBuf {
-			rawBuf[j] = 0
+		base["settings"] = M{
+			"method":   nc.Cipher,
+			"password": nc.ServerKey,
+			"clients":  clients,
+			"network":  "tcp,udp",
 		}
-		copy(rawBuf, u.UUID)
-
-		clients[i] = M{
-			"password": base64.StdEncoding.EncodeToString(rawBuf),
-			"email":    userEmail(u.ID),
+	} else {
+		// Traditional ciphers: multi-user via clients array.
+		// Each entry must carry its own "method" field for Xray to parse correctly.
+		for i := range users {
+			u := &users[i]
+			clients = append(clients, M{
+				"method":   nc.Cipher,
+				"password": u.UUID,
+				"email":    userEmail(u.ID),
+			})
 		}
-	}
-
-	base["settings"] = M{
-		"method":   nc.Cipher,
-		"password": nc.ServerKey,
-		"clients":  clients,
-		"network":  "tcp,udp",
+		base["settings"] = M{
+			"method":  nc.Cipher,
+			"clients": clients,
+			"network": "tcp,udp",
+		}
 	}
 	return base
 }
@@ -426,7 +429,7 @@ func applyStreamSettings(base M, nc *panel.NodeConfig, certFile, keyFile string)
 	case "grpc":
 		grpcSettings := M{}
 		if nc.NetworkSettings != nil {
-			if v, ok := nc.NetworkSettings["service_name"]; ok {
+			if v, ok := nc.NetworkSettings["serviceName"]; ok {
 				grpcSettings["serviceName"] = v
 			}
 		}

@@ -361,7 +361,7 @@ func TestBuildConfig_StatsEnabled(t *testing.T) {
 	}
 }
 
-func TestBuildConfig_Shadowsocks_SingleUser(t *testing.T) {
+func TestBuildConfig_Shadowsocks_MultiUserTraditional(t *testing.T) {
 	nc := panel.NodeConfig{
 		Protocol:   "shadowsocks",
 		ServerPort: 8388,
@@ -377,12 +377,19 @@ func TestBuildConfig_Shadowsocks_SingleUser(t *testing.T) {
 	ib := inbounds[0].(map[string]interface{})
 	settings := ib["settings"].(map[string]interface{})
 
-	// Single-user mode: password directly, no clients array
 	if settings["method"] != "aes-128-gcm" {
 		t.Errorf("expected method aes-128-gcm, got %v", settings["method"])
 	}
-	if settings["password"] != testUsers[0].UUID {
-		t.Errorf("expected password %s, got %v", testUsers[0].UUID, settings["password"])
+	clients := settings["clients"].([]interface{})
+	if len(clients) != len(testUsers) {
+		t.Fatalf("expected %d clients, got %d", len(testUsers), len(clients))
+	}
+	c0 := clients[0].(map[string]interface{})
+	if c0["method"] != "aes-128-gcm" {
+		t.Errorf("expected per-user method aes-128-gcm, got %v", c0["method"])
+	}
+	if c0["password"] != testUsers[0].UUID {
+		t.Errorf("expected password %s, got %v", testUsers[0].UUID, c0["password"])
 	}
 }
 
@@ -427,7 +434,7 @@ func TestBuildConfig_SocksStats(t *testing.T) {
 	ib := inbounds[0].(map[string]interface{})
 	settings := ib["settings"].(map[string]interface{})
 	accounts := settings["accounts"].([]interface{})
-	
+
 	if len(accounts) == 0 {
 		t.Fatal("no accounts in socks config")
 	}

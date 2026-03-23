@@ -113,7 +113,7 @@ func TestBuildInbound_VMess_WithGRPC(t *testing.T) {
 		ServerPort: 443,
 		Network:    "grpc",
 		NetworkSettings: map[string]interface{}{
-			"service_name": "mygrpc",
+			"serviceName": "mygrpc",
 		},
 	}
 	inbound := buildInbound(nc, testUsers, "", "")
@@ -245,9 +245,13 @@ func TestBuildInbound_Trojan_NoTLS(t *testing.T) {
 		TLS:        0,
 	}
 	inbound := buildInbound(nc, testUsers, "", "")
-	if _, exists := inbound["tls"]; exists {
-		t.Error("trojan with tls=0 should not have TLS config")
+	// Trojan requires TLS; buildTrojan should force-enable self-signed TLS
+	// even when the panel sends tls=0.
+	tls, exists := inbound["tls"].(M)
+	if !exists {
+		t.Fatal("trojan with tls=0 should still get TLS (force-enabled)")
 	}
+	assertMapValue(t, tls, "enabled", true)
 }
 
 func TestBuildInbound_Trojan_WithTLS(t *testing.T) {
