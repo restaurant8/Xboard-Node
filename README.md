@@ -15,6 +15,29 @@ docker run -d --restart=always --network=host \
   ghcr.io/cedar2025/xboard-node:latest
 ```
 
+### Docker Compose
+
+**1. Get the `compose/` directory**
+
+```bash
+git clone -b compose --depth 1 https://github.com/cedar2025/xboard-node.git
+cd xboard-node
+```
+
+
+**2. Edit local config**
+
+```bash
+vim config/config.yml
+# edit config/config.yml — set panel.url, panel.token, panel.node_id
+```
+
+**3. Start**
+
+```bash
+docker compose up -d
+```
+
 ## Features
 
 - **Kernels**: sing-box (default) / Xray-core.
