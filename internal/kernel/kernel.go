@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"sync"
 
 	"github.com/cedar2025/xboard-node/internal/panel"
 	"golang.org/x/time/rate"
@@ -86,6 +87,17 @@ type Connection struct {
 	Upload   int64  // cumulative upload bytes
 	Download int64  // cumulative download bytes
 	SourceIP string // client source IP (cleaned, no port/brackets)
+}
+
+var ConnectionSlicePool = sync.Pool{
+	New: func() any { return make([]Connection, 0, 256) },
+}
+
+func ReleaseConnectionSlice(s []Connection) {
+	if s == nil {
+		return
+	}
+	ConnectionSlicePool.Put(s[:0])
 }
 
 // UserDiff computes which users to add and which to remove when transitioning

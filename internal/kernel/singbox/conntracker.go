@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing/common/buf"
@@ -17,6 +18,8 @@ import (
 
 	"github.com/cedar2025/xboard-node/internal/kernel"
 )
+
+const rateLimitThreshold = 64 * 1024
 
 // connRecord holds the minimal per-connection state we need.
 // Each field is accessed by multiple goroutines; upload/download use atomics.
@@ -201,19 +204,22 @@ func (t *ConnTracker) Snapshot() []kernel.Connection {
 	//   ~8 bytes vs ~80 bytes for a full Connection struct, and no atomic loads.
 	//   Phase 2 (lock-free):   call toConnection() which atomically reads the
 	//   upload/download counters. Atomics are safe without any mutex.
-	// This shrinks the RLock window proportionally as connection count grows,
-	// reducing serialisation against concurrent allocRecord/closeRecord calls.
 	t.mu.RLock()
-	ptrs := make([]*connRecord, 0, len(t.active))
+	n := len(t.active)
+	t.mu.RUnlock()
+
+	result := kernel.ConnectionSlicePool.Get().([]kernel.Connection)
+	result = result[:0]
+	if cap(result) < n+len(pending) {
+		result = make([]kernel.Connection, 0, n+len(pending))
+	}
+
+	t.mu.RLock()
 	for _, rec := range t.active {
-		ptrs = append(ptrs, rec)
+		result = append(result, rec.toConnection())
 	}
 	t.mu.RUnlock()
 
-	result := make([]kernel.Connection, 0, len(ptrs)+len(pending))
-	for _, rec := range ptrs {
-		result = append(result, rec.toConnection())
-	}
 	for _, rec := range pending {
 		result = append(result, rec.toConnection())
 	}
@@ -246,10 +252,11 @@ func (t *ConnTracker) ActiveCount() int {
 
 type trackedConn struct {
 	net.Conn
-	rec     *connRecord
-	tracker *ConnTracker
-	limiter *rate.Limiter   // nil = unlimited
-	ctx     context.Context // for rate limiter WaitN cancellation
+	rec           *connRecord
+	tracker       *ConnTracker
+	limiter       *rate.Limiter   // nil = unlimited
+	ctx           context.Context // for rate limiter WaitN cancellation
+	pendingTokens atomic.Int64    // amortized token accumulator for CountFunc
 }
 
 // Read is the fallback path used when the copy pipeline cannot unwrap this
@@ -264,8 +271,16 @@ func (c *trackedConn) Read(b []byte) (int, error) {
 	if n > 0 {
 		c.rec.download.Add(int64(n))
 		if c.limiter != nil {
-			waitN := min(n, c.limiter.Burst())
-			_ = c.limiter.WaitN(c.ctx, waitN)
+			if pending := c.pendingTokens.Add(int64(n)); pending >= rateLimitThreshold {
+				tokens := int(c.pendingTokens.Swap(0))
+				if burst := c.limiter.Burst(); tokens > burst {
+					tokens = burst
+				}
+				resv := c.limiter.ReserveN(time.Now(), tokens)
+				if delay := resv.Delay(); delay > 0 {
+					time.Sleep(delay)
+				}
+			}
 		}
 	}
 	return n, err
@@ -273,24 +288,21 @@ func (c *trackedConn) Read(b []byte) (int, error) {
 
 // Write is the fallback path.
 func (c *trackedConn) Write(b []byte) (int, error) {
-	if c.limiter != nil {
-		burst := c.limiter.Burst()
-		var n int
-		for n < len(b) {
-			chunk := min(len(b)-n, burst)
-			_ = c.limiter.WaitN(c.ctx, chunk)
-			written, writeErr := c.Conn.Write(b[n : n+chunk])
-			n += written
-			c.rec.upload.Add(int64(written))
-			if writeErr != nil {
-				return n, writeErr
-			}
-		}
-		return n, nil
-	}
 	n, err := c.Conn.Write(b)
 	if n > 0 {
 		c.rec.upload.Add(int64(n))
+		if c.limiter != nil {
+			if pending := c.pendingTokens.Add(int64(n)); pending >= rateLimitThreshold {
+				tokens := int(c.pendingTokens.Swap(0))
+				if burst := c.limiter.Burst(); tokens > burst {
+					tokens = burst
+				}
+				resv := c.limiter.ReserveN(time.Now(), tokens)
+				if delay := resv.Delay(); delay > 0 {
+					time.Sleep(delay)
+				}
+			}
+		}
 	}
 	return n, err
 }
@@ -303,6 +315,11 @@ func (c *trackedConn) Close() error {
 // makeCountFunc builds a CountFunc that does byte accounting and optional
 // rate limiting in a single callback. The direction is selected by the
 // counter pointer (download or upload).
+//
+// For rate-limited connections, tokens are accumulated in pendingTokens and
+// only consumed (via WaitN) when the threshold is reached. This amortizes
+// goroutine blocking from hundreds-of-thousands per second to ~10 per second
+// per connection, eliminating scheduler thrashing under high concurrency.
 func (c *trackedConn) makeCountFunc(counter *atomic.Int64) N.CountFunc {
 	if c.limiter == nil {
 		// Fast path: no rate limiting, just atomic add.
@@ -310,11 +327,23 @@ func (c *trackedConn) makeCountFunc(counter *atomic.Int64) N.CountFunc {
 	}
 	return func(n int64) {
 		counter.Add(n)
-		waitN := int(n)
-		if burst := c.limiter.Burst(); waitN > burst {
-			waitN = burst
+		if pending := c.pendingTokens.Add(n); pending >= rateLimitThreshold {
+			// Drain all accumulated tokens in one blocking call.
+			tokens := int(c.pendingTokens.Swap(0))
+			if burst := c.limiter.Burst(); tokens > burst {
+				tokens = burst
+			}
+			resv := c.limiter.ReserveN(time.Now(), tokens)
+			if delay := resv.Delay(); delay > 0 {
+				t := time.NewTimer(delay)
+				select {
+				case <-t.C:
+				case <-c.ctx.Done():
+					t.Stop()
+					resv.Cancel()
+				}
+			}
 		}
-		_ = c.limiter.WaitN(c.ctx, waitN)
 	}
 }
 
@@ -338,10 +367,11 @@ func (c *trackedConn) WriterReplaceable() bool { return true }
 
 type trackedPacketConn struct {
 	N.PacketConn
-	rec     *connRecord
-	tracker *ConnTracker
-	limiter *rate.Limiter
-	ctx     context.Context
+	rec           *connRecord
+	tracker       *ConnTracker
+	limiter       *rate.Limiter
+	ctx           context.Context
+	pendingTokens atomic.Int64
 }
 
 func (c *trackedPacketConn) ReadPacket(buffer *buf.Buffer) (singM.Socksaddr, error) {
@@ -350,8 +380,16 @@ func (c *trackedPacketConn) ReadPacket(buffer *buf.Buffer) (singM.Socksaddr, err
 		n := int64(buffer.Len())
 		c.rec.download.Add(n)
 		if c.limiter != nil {
-			waitN := int(min(n, int64(c.limiter.Burst())))
-			_ = c.limiter.WaitN(c.ctx, waitN)
+			if pending := c.pendingTokens.Add(n); pending >= rateLimitThreshold {
+				tokens := int(c.pendingTokens.Swap(0))
+				if burst := c.limiter.Burst(); tokens > burst {
+					tokens = burst
+				}
+				resv := c.limiter.ReserveN(time.Now(), tokens)
+				if delay := resv.Delay(); delay > 0 {
+					time.Sleep(delay)
+				}
+			}
 		}
 	}
 	return dest, err
@@ -363,8 +401,16 @@ func (c *trackedPacketConn) WritePacket(buffer *buf.Buffer, dest singM.Socksaddr
 	if err == nil {
 		c.rec.upload.Add(n)
 		if c.limiter != nil {
-			waitN := int(min(n, int64(c.limiter.Burst())))
-			_ = c.limiter.WaitN(c.ctx, waitN)
+			if pending := c.pendingTokens.Add(n); pending >= rateLimitThreshold {
+				tokens := int(c.pendingTokens.Swap(0))
+				if burst := c.limiter.Burst(); tokens > burst {
+					tokens = burst
+				}
+				resv := c.limiter.ReserveN(time.Now(), tokens)
+				if delay := resv.Delay(); delay > 0 {
+					time.Sleep(delay)
+				}
+			}
 		}
 	}
 	return err
@@ -381,11 +427,22 @@ func (c *trackedPacketConn) makeCountFunc(counter *atomic.Int64) N.CountFunc {
 	}
 	return func(n int64) {
 		counter.Add(n)
-		waitN := int(n)
-		if burst := c.limiter.Burst(); waitN > burst {
-			waitN = burst
+		if pending := c.pendingTokens.Add(n); pending >= rateLimitThreshold {
+			tokens := int(c.pendingTokens.Swap(0))
+			if burst := c.limiter.Burst(); tokens > burst {
+				tokens = burst
+			}
+			resv := c.limiter.ReserveN(time.Now(), tokens)
+			if delay := resv.Delay(); delay > 0 {
+				t := time.NewTimer(delay)
+				select {
+				case <-t.C:
+				case <-c.ctx.Done():
+					t.Stop()
+					resv.Cancel()
+				}
+			}
 		}
-		_ = c.limiter.WaitN(c.ctx, waitN)
 	}
 }
 

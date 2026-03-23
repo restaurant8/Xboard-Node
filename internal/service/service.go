@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/cert"
@@ -44,6 +45,8 @@ type Service struct {
 
 	pushInterval int // seconds
 	pullInterval int // seconds
+
+	trackRunning atomic.Bool // prevents concurrent trackAndEnforce goroutines
 
 	lastUserHash   string     // hash of user list for change detection
 	lastConfigHash string     // hash of full config for change detection
@@ -166,7 +169,12 @@ func (s *Service) Run(ctx context.Context) error {
 			return nil
 
 		case <-trackTicker.C:
-			s.trackAndEnforce(ctx)
+			if s.trackRunning.CompareAndSwap(false, true) {
+				go func() {
+					defer s.trackRunning.Store(false)
+					s.trackAndEnforce(ctx)
+				}()
+			}
 
 		case <-reportTicker.C:
 			s.pushReport()
@@ -762,6 +770,7 @@ func (s *Service) trackAndEnforce(ctx context.Context) {
 		slog.Debug("get connections failed", "error", err)
 		return
 	}
+	defer kernel.ReleaseConnectionSlice(conns)
 
 	s.tracker.Process(conns)
 	s.tracker.LogStats()

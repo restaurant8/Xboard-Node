@@ -62,6 +62,17 @@ func (l *Limiter) Check(conns []kernel.Connection) []KickAction {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
+	hasDeviceLimit := false
+	for _, u := range l.users {
+		if u.DeviceLimit > 0 {
+			hasDeviceLimit = true
+			break
+		}
+	}
+	if !hasDeviceLimit {
+		return nil
+	}
+
 	var kicks []KickAction
 
 	// Device limit check
