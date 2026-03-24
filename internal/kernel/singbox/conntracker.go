@@ -3,7 +3,6 @@ package singbox
 import (
 	"context"
 	"io"
-	"log/slog"
 	"net"
 	"sort"
 	"sync"
@@ -15,6 +14,8 @@ import (
 	singM "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"golang.org/x/time/rate"
+
+	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
 const rateLimitThreshold = 64 * 1024
@@ -171,7 +172,7 @@ func (t *ConnTracker) RoutedConnection(
 	if dlf := t.deviceLimitFunc.Load(); dlf != nil {
 		if limit, hasLimit := (*dlf)(uuid); hasLimit {
 			if t.checkDeviceGate(us, sourceIP, limit) {
-				slog.Info("singbox: device limit gate-keep, rejecting connection",
+				nlog.Core().Info("singbox: device limit gate-keep, rejecting connection",
 					"user", uuid, "ip", sourceIP, "limit", limit)
 				conn.Close()
 				return conn
@@ -197,17 +198,17 @@ func (t *ConnTracker) RoutedConnection(
 	}
 
 	return &trackedConn{
-		Conn:    conn,
-		tracker: t,
-		us:      us,
-		connID:  connID,
+		Conn:     conn,
+		tracker:  t,
+		us:       us,
+		connID:   connID,
 		sourceIP: sourceIP,
-		limiter: lim,
-		ctx:     ctx,
+		limiter:  lim,
+		ctx:      ctx,
 	}
 }
 
-// RoutedPacketConnection wraps a UDP PacketConn with per-user byte counting.
+// RoutedPacketConnection wraps UDP with per-user counting (UDP not in connMap).
 func (t *ConnTracker) RoutedPacketConnection(
 	ctx context.Context, conn N.PacketConn,
 	metadata adapter.InboundContext,
@@ -220,6 +221,17 @@ func (t *ConnTracker) RoutedPacketConnection(
 	uid := t.uuidMap[uuid]
 	us := t.users[uid]
 	t.usersMu.RUnlock()
+
+	if dlf := t.deviceLimitFunc.Load(); dlf != nil {
+		if limit, hasLimit := (*dlf)(uuid); hasLimit {
+			if t.checkDeviceGate(us, sourceIP, limit) {
+				nlog.Core().Info("singbox: device limit gate-keep, rejecting UDP connection",
+					"user", uuid, "ip", sourceIP, "limit", limit)
+				conn.Close()
+				return conn
+			}
+		}
+	}
 
 	if us != nil {
 		us.addConn(sourceIP)
@@ -372,7 +384,7 @@ func (t *ConnTracker) removeConnRef(connID string) {
 type trackedConn struct {
 	net.Conn
 	tracker       *ConnTracker
-	us            *userStats      // per-user stats (upload/download atomics + IP tracking)
+	us            *userStats // per-user stats (upload/download atomics + IP tracking)
 	connID        string
 	sourceIP      string
 	limiter       *rate.Limiter

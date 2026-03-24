@@ -3,7 +3,6 @@ package singbox
 import (
 	"encoding/base64"
 	"fmt"
-	"log/slog"
 	"net"
 	"path/filepath"
 	"strconv"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
+	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/panel"
 	"github.com/go-viper/mapstructure/v2"
 )
@@ -251,7 +251,7 @@ func buildRoutes(panelRoutes []panel.RouteRule, custom []map[string]any) M {
 func mergeCustomSingbox(cfg M, kcfg config.KernelConfig) {
 	custom, err := kernel.LoadCustomConfig(kcfg.CustomConfig)
 	if err != nil {
-		slog.Error("failed to load custom sing-box config", "error", err)
+		nlog.Core().Error("failed to load custom sing-box config", "error", err)
 		return
 	}
 	if custom == nil {
@@ -427,7 +427,7 @@ func buildShadowsocks(base M, nc *panel.NodeConfig, users []panel.User) M {
 	base["users"] = userList
 
 	if nc.Plugin != "" {
-		slog.Warn("sing-box shadowsocks inbound does not support plugin, ignoring", "plugin", nc.Plugin)
+		nlog.Core().Warn("sing-box shadowsocks inbound does not support plugin, ignoring", "plugin", nc.Plugin)
 	}
 
 	return base

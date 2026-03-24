@@ -3,7 +3,6 @@ package xray
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"reflect"
 	"sort"
 	"sync"
@@ -18,6 +17,8 @@ import (
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
 	"golang.org/x/time/rate"
+
+	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
 // Access xray's internal config creator registry so we can replace the
@@ -54,7 +55,7 @@ func limitDispatcherFactory(ctx context.Context, config interface{}) (interface{
 		limitedIPs: make(map[string]map[string]int),
 	}
 	globalLimitDispatcher.Store(ld)
-	slog.Debug("xray: limit dispatcher installed")
+	nlog.Core().Debug("xray: limit dispatcher installed")
 	return ld, nil
 }
 
@@ -158,7 +159,7 @@ func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destina
 	isTCP = dest.Network == net.Network_TCP
 
 	if d.checkDeviceLimit(email, sourceIP, isTCP) {
-		slog.Info("xray: device limit exceeded", "email", email, "ip", sourceIP)
+		nlog.Core().Info("xray: device limit exceeded", "email", email, "ip", sourceIP)
 		return "", "", false, errors.New("device limit exceeded for " + email)
 	}
 	return email, sourceIP, isTCP, nil

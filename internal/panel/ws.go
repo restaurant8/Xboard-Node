@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"math/rand"
 	"net/url"
 	"strconv"
 	"sync/atomic"
 	"time"
 
+	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/gorilla/websocket"
 )
 
@@ -108,7 +108,7 @@ func (w *WSClient) Run(ctx context.Context) {
 		}
 
 		if err != nil {
-			slog.Warn("ws disconnected", "error", err)
+			nlog.Core().Warn("ws disconnected", "error", err)
 			if !wasConnected {
 				w.notifyStatus(false)
 			}
@@ -153,7 +153,7 @@ func (w *WSClient) connect(ctx context.Context) error {
 	q.Set("node_id", strconv.Itoa(w.nodeID))
 	u.RawQuery = q.Encode()
 
-	slog.Debug("ws connecting", "url", u.Redacted())
+	nlog.Core().Debug("ws connecting", "url", u.Host)
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 15 * time.Second,
@@ -176,7 +176,9 @@ func (w *WSClient) connect(ctx context.Context) error {
 		var errData struct {
 			Message string `json:"message"`
 		}
-		json.Unmarshal(firstMsg.Data, &errData)
+		if err := json.Unmarshal(firstMsg.Data, &errData); err != nil {
+			return fmt.Errorf("auth failed (unable to parse error: %v)", err)
+		}
 		return fmt.Errorf("auth failed: %s", errData.Message)
 	}
 
@@ -213,6 +215,8 @@ func (w *WSClient) connect(ctx context.Context) error {
 			case msgCh <- msg:
 			case <-ctx.Done():
 				return
+			default:
+				nlog.Core().Warn("ws: message channel full, dropping message", "event", msg.Event)
 			}
 		}
 	}()
@@ -242,7 +246,7 @@ func (w *WSClient) connect(ctx context.Context) error {
 				select {
 				case writeCh <- wsMessage{Event: "pong"}:
 				default:
-					slog.Warn("ws write channel full, skipping pong")
+					nlog.Core().Warn("ws write channel full, skipping pong")
 				}
 			}
 
@@ -258,7 +262,7 @@ func (w *WSClient) connect(ctx context.Context) error {
 				select {
 				case writeCh <- msg:
 				default:
-					slog.Warn("ws write channel full, skipping status push (network slow?)")
+					nlog.Core().Warn("ws write channel full, skipping status push (network slow?)")
 				}
 			}
 
@@ -276,10 +280,10 @@ func (w *WSClient) handleMessage(msg wsMessage) {
 	switch msg.Event {
 	case "ping":
 		// Server ping — handled by the pong timer reset above
-		slog.Debug("ws received ping")
+		nlog.Core().Debug("ws received ping")
 
 	case "auth.success":
-		slog.Debug("ws auth confirmed")
+		nlog.Core().Debug("ws auth confirmed")
 
 	case WSEventSyncConfig:
 		w.handleDataEvent(msg)
@@ -291,7 +295,7 @@ func (w *WSClient) handleMessage(msg wsMessage) {
 		w.handleDataEvent(msg)
 
 	default:
-		slog.Debug("ws unknown event", "event", msg.Event)
+		nlog.Core().Debug("ws unknown event", "event", msg.Event)
 	}
 }
 
@@ -310,44 +314,44 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 
 	switch msg.Event {
 	case WSEventSyncConfig:
-		slog.Debug("ws sync config event received")
+		nlog.Core().Debug("ws sync config event received")
 		var p syncConfigPayload
 		if err := decodeData(msg.Data, &p); err != nil {
-			slog.Warn("ws: cannot decode config payload", "error", err)
+			nlog.Core().Warn("ws: cannot decode config payload", "error", err)
 			return
 		}
 		if p.Config.Protocol == "" {
-			slog.Warn("ws: config payload missing protocol")
+			nlog.Core().Warn("ws: config payload missing protocol")
 			return
 		}
 		event.Config = &p.Config
 
 	case WSEventSyncUsers:
-		slog.Debug("ws sync users event received")
+		nlog.Core().Debug("ws sync users event received")
 		var p syncUsersPayload
 		if err := decodeData(msg.Data, &p); err != nil {
-			slog.Warn("ws: cannot decode users payload", "error", err)
+			nlog.Core().Warn("ws: cannot decode users payload", "error", err)
 			return
 		}
 		if len(p.Users) == 0 {
-			slog.Warn("ws: users payload empty")
+			nlog.Core().Warn("ws: users payload empty")
 			return
 		}
 		event.Users = p.Users
 
 	case WSEventSyncUserDelta:
-		slog.Debug("ws sync user delta event received")
+		nlog.Core().Debug("ws sync user delta event received")
 		var p syncUserDeltaPayload
 		if err := decodeData(msg.Data, &p); err != nil {
-			slog.Warn("ws: cannot decode user delta payload", "error", err)
+			nlog.Core().Warn("ws: cannot decode user delta payload", "error", err)
 			return
 		}
 		if p.Action == "" {
-			slog.Warn("ws: user delta payload missing action")
+			nlog.Core().Warn("ws: user delta payload missing action")
 			return
 		}
 		if len(p.Users) == 0 {
-			slog.Warn("ws: user delta payload has no users")
+			nlog.Core().Warn("ws: user delta payload has no users")
 			return
 		}
 		event.DeltaAction = p.Action

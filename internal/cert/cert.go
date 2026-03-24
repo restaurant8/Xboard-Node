@@ -9,7 +9,6 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
-	"log/slog"
 	"math/big"
 	"net"
 	"os"
@@ -23,6 +22,7 @@ import (
 	"github.com/libdns/cloudflare"
 
 	"github.com/cedar2025/xboard-node/internal/config"
+	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
 // Manager handles TLS certificate lifecycle.
@@ -171,7 +171,7 @@ func (m *Manager) startFile() error {
 	if _, err := os.Stat(m.cfg.KeyFile); err != nil {
 		return fmt.Errorf("key file: %w", err)
 	}
-	slog.Debug("using manual TLS certificates", "cert", m.certFile, "key", m.keyFile)
+	nlog.Core().Debug("using manual TLS certificates", "cert", m.certFile, "key", m.keyFile)
 	return nil
 }
 
@@ -180,7 +180,7 @@ func (m *Manager) startFile() error {
 func (m *Manager) startSelfSigned() error {
 	// If files already exist and are valid, skip regeneration.
 	if fileExists(m.certFile) && fileExists(m.keyFile) {
-		slog.Debug("self-signed cert exists, reusing", "cert", m.certFile)
+		nlog.Core().Debug("self-signed cert exists, reusing", "cert", m.certFile)
 		return nil
 	}
 
@@ -238,7 +238,7 @@ func (m *Manager) startSelfSigned() error {
 		return fmt.Errorf("write key: %w", err)
 	}
 
-	slog.Info("self-signed certificate generated",
+	nlog.Core().Info("self-signed certificate generated",
 		"domain", domain, "cert", m.certFile, "valid_years", 10)
 	return nil
 }
@@ -260,7 +260,7 @@ func (m *Manager) startContent() error {
 	if err := atomicWriteFile(m.keyFile, []byte(m.cfg.KeyContent), 0o600); err != nil {
 		return fmt.Errorf("write key content: %w", err)
 	}
-	slog.Info("TLS certificate written from panel content", "cert", m.certFile)
+	nlog.Core().Info("TLS certificate written from panel content", "cert", m.certFile)
 	return nil
 }
 
@@ -270,7 +270,7 @@ func (m *Manager) startACME(ctx context.Context, dnsSolver *certmagic.DNS01Solve
 	// Guard: certmagic's background goroutines must only be started once.
 	// A process restart is required to change ACME settings at runtime.
 	if m.acmeStarted {
-		slog.Info("cert: ACME already active, skipping re-init (restart to change ACME settings)")
+		nlog.Core().Info("cert: ACME already active, skipping re-init (restart to change ACME settings)")
 		return nil
 	}
 
@@ -389,32 +389,32 @@ func (m *Manager) syncCertFiles(ctx context.Context, storage certmagic.Storage, 
 	certKey, _ := data["certificate_path"].(string)
 	keyKey, _ := data["private_key_path"].(string)
 	if certKey == "" || keyKey == "" {
-		slog.Warn("cert_obtained event missing storage paths", "data", data)
+		nlog.Core().Warn("cert_obtained event missing storage paths", "data", data)
 		return
 	}
 
 	certPEM, err := storage.Load(ctx, certKey)
 	if err != nil {
-		slog.Error("failed to load cert from storage", "error", err)
+		nlog.Core().Error("failed to load cert from storage", "error", err)
 		return
 	}
 	keyPEM, err := storage.Load(ctx, keyKey)
 	if err != nil {
-		slog.Error("failed to load key from storage", "error", err)
+		nlog.Core().Error("failed to load key from storage", "error", err)
 		return
 	}
 
 	if err := atomicWriteFile(m.certFile, certPEM, 0o644); err != nil {
-		slog.Error("failed to write cert file", "path", m.certFile, "error", err)
+		nlog.Core().Error("failed to write cert file", "path", m.certFile, "error", err)
 		return
 	}
 	if err := atomicWriteFile(m.keyFile, keyPEM, 0o600); err != nil {
-		slog.Error("failed to write key file", "path", m.keyFile, "error", err)
+		nlog.Core().Error("failed to write key file", "path", m.keyFile, "error", err)
 		return
 	}
 
 	renewal, _ := data["renewal"].(bool)
-	slog.Info("TLS certificate synced", "domain", m.cfg.Domain, "renewal", renewal,
+	nlog.Core().Info("TLS certificate synced", "domain", m.cfg.Domain, "renewal", renewal,
 		"cert", m.certFile)
 	m.renewed.Store(true)
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"sync"
 	"time"
 
@@ -20,6 +19,7 @@ import (
 
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
+	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/panel"
 )
 
@@ -88,7 +88,7 @@ func (s *SingBox) Start(nodeConfig *panel.NodeConfig, users []panel.User, certFi
 		return fmt.Errorf("marshal config: %w", err)
 	}
 
-	slog.Debug("sing-box config generated", "len", len(data))
+	nlog.Core().Debug("sing-box config generated", "len", len(data))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx = include.Context(ctx)
@@ -147,7 +147,7 @@ func (s *SingBox) Start(nodeConfig *panel.NodeConfig, users []panel.User, certFi
 		go recycleOldBox(oldBox, oldCancel, oldCtx, oldTracker)
 	}
 
-	slog.Debug("sing-box started", "users", len(users))
+	nlog.Core().Debug("sing-box started", "users", len(users))
 	return nil
 }
 
@@ -176,7 +176,7 @@ func recycleOldBox(oldBox *box.Box, oldCancel context.CancelFunc, oldCtx context
 	if oldCancel != nil {
 		oldCancel()
 	}
-	slog.Debug("sing-box: old instance recycled")
+	nlog.Core().Debug("sing-box: old instance recycled")
 }
 
 // Reload hot-swaps the inbound users and routing rules without restarting the box.
@@ -213,9 +213,9 @@ func (s *SingBox) Reload(nodeConfig *panel.NodeConfig, users []panel.User, certF
 
 	// Update routing rules
 	if err := router.UpdateRules(opts.Route.Rules, opts.Route.RuleSet); err != nil {
-		slog.Debug("routing reload failed", "error", err)
+		nlog.Core().Debug("routing reload failed", "error", err)
 	} else {
-		slog.Debug("sing-box routing reloaded")
+		nlog.Core().Debug("sing-box routing reloaded")
 	}
 
 	nopFactory := singLog.NewNOPFactory()
@@ -270,7 +270,7 @@ func (s *SingBox) Reload(nodeConfig *panel.NodeConfig, users []panel.User, certF
 				if err == nil {
 					continue
 				}
-				slog.Warn("incremental update failed, falling back to recreate", "tag", tag, "error", err)
+				nlog.Core().Warn("incremental update failed, falling back to recreate", "tag", tag, "error", err)
 			}
 		}
 
@@ -292,7 +292,7 @@ func (s *SingBox) Reload(nodeConfig *panel.NodeConfig, users []panel.User, certF
 		s.connTracker.SetUserMap(buildUserMap(users))
 	}
 
-	slog.Debug("sing-box reloaded", "users", len(users))
+	nlog.Core().Debug("sing-box reloaded", "users", len(users))
 	s.users = users
 	s.nodeConfig = nodeConfig
 	s.certFile = certFile
@@ -559,7 +559,7 @@ func (s *SingBox) reloadInboundsLocked(users []panel.User) error {
 			if err == nil {
 				continue
 			}
-			slog.Warn("incremental update failed, recreating inbound", "tag", tag, "error", err)
+			nlog.Core().Warn("incremental update failed, recreating inbound", "tag", tag, "error", err)
 		}
 
 		_ = im.Remove(tag)
@@ -573,7 +573,7 @@ func (s *SingBox) reloadInboundsLocked(users []panel.User) error {
 		s.connTracker.SetUserMap(buildUserMap(users))
 	}
 
-	slog.Debug("sing-box users hot-swapped", "users", len(users))
+	nlog.Core().Debug("sing-box users hot-swapped", "users", len(users))
 	return nil
 }
 
@@ -594,7 +594,7 @@ func (s *SingBox) CloseConnection(_ context.Context, connID string) error {
 		return fmt.Errorf("not running")
 	}
 	if !ct.CloseByID(connID) {
-		slog.Debug("CloseConnection: connection not found (already closed?)", "id", connID)
+		nlog.Core().Debug("CloseConnection: connection not found (already closed?)", "id", connID)
 	}
 	return nil
 }

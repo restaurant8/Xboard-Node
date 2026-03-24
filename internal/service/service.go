@@ -7,9 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"math"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -66,6 +66,9 @@ type Service struct {
 	wsStatusCh     chan panel.WSStatusChange // receives WS connect/disconnect notifications
 	wsCancel       context.CancelFunc        // cancels the WS client goroutine
 	wsDisconnectAt time.Time                 // when WS last disconnected (zero if connected)
+
+	// metricsMu: lastUsers, lastConfig, wsClient, wsDisconnectAt (buildMetrics vs main loop).
+	metricsMu sync.RWMutex
 }
 
 // pullResult carries the outcome of an async pullViaAPI back to the main goroutine.
@@ -79,10 +82,13 @@ type pullResult struct {
 
 // apiBackoff implements simple exponential backoff for API failures.
 type apiBackoff struct {
+	mu            sync.Mutex
 	skipRemaining int
 }
 
 func (b *apiBackoff) shouldSkip() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.skipRemaining > 0 {
 		b.skipRemaining--
 		return true
@@ -90,8 +96,15 @@ func (b *apiBackoff) shouldSkip() bool {
 	return false
 }
 
-func (b *apiBackoff) onSuccess() { b.skipRemaining = 0 }
+func (b *apiBackoff) onSuccess() {
+	b.mu.Lock()
+	b.skipRemaining = 0
+	b.mu.Unlock()
+}
+
 func (b *apiBackoff) onFailure() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.skipRemaining <= 0 {
 		b.skipRemaining = 1
 	} else if b.skipRemaining < 8 {
@@ -110,7 +123,7 @@ func New(cfg *config.Config) *Service {
 	case "xray":
 		k = xray.New(cfg.Kernel)
 	default:
-		slog.Error("unsupported kernel type, defaulting to sing-box", "type", cfg.Kernel.Type)
+		nlog.Core().Error("unsupported kernel type, defaulting to sing-box", "type", cfg.Kernel.Type)
 		k = singbox.New(cfg.Kernel)
 	}
 
@@ -276,14 +289,14 @@ func (s *Service) initialSetup(ctx context.Context) error {
 	s.limiter.UpdateUsers(users)
 	s.speedTracker.UpdateBuckets()
 
-	slog.Info("handshake complete (V1 fallback)",
+	nlog.Core().Info("handshake complete (V1 fallback)",
 		"protocol", nodeConfig.Protocol,
 		"port", nodeConfig.ServerPort,
 		"users", len(users),
 	)
 
 	if len(users) == 0 {
-		slog.Warn("no users, kernel will not start until users are available")
+		nlog.Core().Warn("no users, kernel will not start until users are available")
 		return nil
 	}
 
@@ -310,7 +323,7 @@ func (s *Service) applyRemoteOverrides(ctx context.Context, nc *panel.NodeConfig
 
 	// Dynamic Log Level (Kernel)
 	if nc.KernelLogLevel != "" && nc.KernelLogLevel != s.cfg.Kernel.LogLevel {
-		slog.Info("cert: kernel log level override", "old", s.cfg.Kernel.LogLevel, "new", nc.KernelLogLevel)
+		nlog.Core().Info("cert: kernel log level override", "old", s.cfg.Kernel.LogLevel, "new", nc.KernelLogLevel)
 		s.cfg.Kernel.LogLevel = nc.KernelLogLevel
 	}
 
@@ -321,7 +334,7 @@ func (s *Service) applyRemoteOverrides(ctx context.Context, nc *panel.NodeConfig
 
 	// Legacy fields (deprecated: prefer cert_config)
 	if nc.AutoTLS != s.cfg.Cert.AutoTLS {
-		slog.Info("cert: auto_tls policy changed (deprecated field)", "new", nc.AutoTLS)
+		nlog.Core().Info("cert: auto_tls policy changed (deprecated field)", "new", nc.AutoTLS)
 		s.cfg.Cert.AutoTLS = nc.AutoTLS
 	}
 	if nc.Domain != "" && nc.Domain != s.cfg.Cert.Domain {
@@ -351,7 +364,7 @@ func (s *Service) applyPanelCert(ctx context.Context, pc *panel.CertConfig) bool
 
 	changed, err := s.cert.Reconfigure(ctx, newCfg)
 	if err != nil {
-		slog.Error("failed to apply panel cert config", "mode", pc.CertMode, "error", err)
+		nlog.Core().Error("failed to apply panel cert config", "mode", pc.CertMode, "error", err)
 		return false
 	}
 	s.cfg.Cert = newCfg
@@ -386,7 +399,7 @@ func (s *Service) newWSClient(wsURL string) *panel.WSClient {
 			select {
 			case s.wsEvents <- event:
 			default:
-				slog.Warn("ws event channel full, dropping event", "type", event.Type)
+				nlog.Core().Warn("ws event channel full, dropping event", "type", event.Type)
 			}
 		},
 		func(status panel.WSStatusChange) {
@@ -410,7 +423,9 @@ func (s *Service) newWSClient(wsURL string) *panel.WSClient {
 // - On reconnect: clear disconnect timestamp, REST poll to catch missed events.
 func (s *Service) handleWSStatus(ctx context.Context, status panel.WSStatusChange) {
 	if status.Connected {
+		s.metricsMu.Lock()
 		s.wsDisconnectAt = time.Time{}
+		s.metricsMu.Unlock()
 		// Use nodeLog if available, otherwise core
 		if s.nodeLog != nil {
 			s.nodeLog.Info("ws connected")
@@ -421,9 +436,11 @@ func (s *Service) handleWSStatus(ctx context.Context, status panel.WSStatusChang
 		// any updates during the disconnection window.
 		s.pullViaAPIAsync(ctx)
 	} else {
+		s.metricsMu.Lock()
 		if s.wsDisconnectAt.IsZero() {
 			s.wsDisconnectAt = time.Now()
 		}
+		s.metricsMu.Unlock()
 		if s.nodeLog != nil {
 			s.nodeLog.Info("ws disconnected")
 		} else {
@@ -447,10 +464,10 @@ func (s *Service) wsDiscovery(ctx context.Context) {
 
 	if s.wsClient == nil {
 		needsCheck = true
-		slog.Debug("ws discovery: no WS client, checking if panel enabled WS")
+		nlog.Core().Debug("ws discovery: no WS client, checking if panel enabled WS")
 	} else if !s.wsDisconnectAt.IsZero() && time.Since(s.wsDisconnectAt) > 10*time.Minute {
 		needsCheck = true
-		slog.Debug("ws discovery: WS disconnected for >10min, re-checking WS config")
+		nlog.Core().Debug("ws discovery: WS disconnected for >10min, re-checking WS config")
 	}
 
 	if !needsCheck {
@@ -459,7 +476,7 @@ func (s *Service) wsDiscovery(ctx context.Context) {
 
 	hs, err := s.panel.Handshake()
 	if err != nil {
-		slog.Debug("ws discovery: handshake failed", "error", err)
+		nlog.Core().Debug("ws discovery: handshake failed", "error", err)
 		return
 	}
 
@@ -468,19 +485,24 @@ func (s *Service) wsDiscovery(ctx context.Context) {
 
 	if hs.WebSocket.Enabled && hs.WebSocket.WSURL != "" {
 		if s.wsClient == nil {
-			slog.Info("ws discovery: panel has WS enabled, creating WS client")
-			s.wsClient = s.newWSClient(hs.WebSocket.WSURL)
+			nlog.Core().Info("ws discovery: panel has WS enabled, creating WS client")
+			wsc := s.newWSClient(hs.WebSocket.WSURL)
+			s.metricsMu.Lock()
+			s.wsClient = wsc
 			s.wsDisconnectAt = time.Time{}
+			s.metricsMu.Unlock()
 			s.startWSClient(ctx)
 		}
 	} else if s.wsClient != nil {
-		slog.Info("ws discovery: panel disabled WS, switching to REST-only")
+		nlog.Core().Info("ws discovery: panel disabled WS, switching to REST-only")
 		if s.wsCancel != nil {
 			s.wsCancel()
 		}
+		s.metricsMu.Lock()
 		s.wsClient = nil
-		s.wsCancel = nil
 		s.wsDisconnectAt = time.Time{}
+		s.metricsMu.Unlock()
+		s.wsCancel = nil
 	}
 }
 
@@ -500,7 +522,9 @@ func (s *Service) handleWSEvent(ctx context.Context, event panel.WSEvent) {
 			s.nodeLog = nlog.ForNode(event.Config.Protocol, event.Config.ServerPort)
 		}
 		s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(event.Users)))
+		s.metricsMu.Lock()
 		s.lastConfig = event.Config
+		s.metricsMu.Unlock()
 		s.lastConfigHash = newConfigHash
 		s.applyRemoteOverrides(ctx, event.Config)
 		s.applyChanges(ctx, true, false)
@@ -536,12 +560,12 @@ func (s *Service) handleWSEvent(ctx context.Context, event panel.WSEvent) {
 // goroutine and sends the result to pullResults for the main goroutine to apply.
 func (s *Service) pullViaAPIAsync(ctx context.Context) {
 	if !s.pullActive.CompareAndSwap(false, true) {
-		slog.Debug("pull already in progress, skipping")
+		nlog.Core().Debug("pull already in progress, skipping")
 		return
 	}
 
 	if s.pullBackoff.shouldSkip() {
-		slog.Debug("skipping pull due to backoff")
+		nlog.Core().Debug("skipping pull due to backoff")
 		s.pullActive.Store(false)
 		return
 	}
@@ -555,14 +579,14 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 
 		config, err := s.panel.GetConfig()
 		if err != nil {
-			slog.Error("poll config failed", "error", err)
+			nlog.Core().Error("poll config failed", "error", err)
 			s.pullBackoff.onFailure()
 			return
 		}
 
 		users, err := s.panel.GetUsers()
 		if err != nil {
-			slog.Error("poll users failed", "error", err)
+			nlog.Core().Error("poll users failed", "error", err)
 			s.pullBackoff.onFailure()
 			return
 		}
@@ -609,7 +633,9 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 			s.nodeLog = nlog.ForNode(result.config.Protocol, result.config.ServerPort)
 		}
 		s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(s.lastUsers)))
+		s.metricsMu.Lock()
 		s.lastConfig = result.config
+		s.metricsMu.Unlock()
 		s.lastConfigHash = result.configHash
 		if s.applyRemoteOverrides(ctx, result.config) {
 			configChanged = true
@@ -641,7 +667,11 @@ func (s *Service) updateUserState(users []panel.User) {
 
 	s.limiter.UpdateUsers(users)
 	s.speedTracker.UpdateBuckets()
+
+	s.metricsMu.Lock()
 	s.lastUsers = users
+	s.metricsMu.Unlock()
+
 	s.lastUserHash = computeUserHash(users)
 }
 
@@ -649,7 +679,7 @@ func (s *Service) updateUserState(users []panel.User) {
 // records the successfully applied state. Returns false on error.
 func (s *Service) startKernel(nc *panel.NodeConfig, users []panel.User) bool {
 	if err := s.kernel.Start(nc, users, s.cert.CertFile(), s.cert.KeyFile()); err != nil {
-		slog.Error("failed to start kernel", "error", err)
+		nlog.Core().Error("failed to start kernel", "error", err)
 		return false
 	}
 
@@ -685,10 +715,6 @@ func (s *Service) ensureRunning() bool {
 // applyUserUpdate replaces the full user set and hot-swaps the kernel.
 // Called from WS sync.users and REST polling.
 func (s *Service) applyUserUpdate(ctx context.Context, users []panel.User, newHash string) {
-	// Update limiter/speed state first so even if kernel ops fail,
-	// the in-memory limits are already correct.
-	s.updateUserState(users)
-
 	if !s.ensureRunning() {
 		return
 	}
@@ -699,23 +725,22 @@ func (s *Service) applyUserUpdate(ctx context.Context, users []panel.User, newHa
 		s.startKernel(s.lastConfig, users)
 		return
 	}
+	s.updateUserState(users)
 	if s.nodeLog != nil && (added > 0 || removed > 0) {
 		s.nodeLog.Info(fmt.Sprintf("users updated: +%d -%d", added, removed))
 	}
 }
 
 // applyUserDelta applies an incremental user change (add or remove) directly
-// via the kernel's atomic user API.
+// via the kernel's atomic user API. Kernel updates run before updateUserState.
 func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers []panel.User) {
 	switch action {
 	case "add":
 		// Defensive check for empty or nil deltaUsers
 		if deltaUsers == nil || len(deltaUsers) == 0 {
-			nlog.Core().Warn("add delta with empty users, skipping")
 			return
 		}
 		merged := mergeUsers(s.lastUsers, deltaUsers)
-		s.updateUserState(merged)
 
 		if !s.ensureRunning() {
 			return
@@ -723,22 +748,23 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 
 		added, err := s.kernel.AddUsers(deltaUsers)
 		if err != nil {
-			nlog.Core().Warn(fmt.Sprintf("AddUsers failed: %v", err))
+			nlog.Core().Warn(fmt.Sprintf("AddUsers failed: %v, falling back to UpdateUsers", err))
 			if _, _, err := s.kernel.UpdateUsers(merged); err != nil {
 				nlog.Core().Error(fmt.Sprintf("UpdateUsers fallback failed: %v", err))
+				return
 			}
-		} else if s.nodeLog != nil && added > 0 {
+		}
+		s.updateUserState(merged)
+		if s.nodeLog != nil && added > 0 {
 			s.nodeLog.Info(fmt.Sprintf("users added: +%d", added))
 		}
 
 	case "remove":
 		// Defensive check for empty or nil deltaUsers
 		if deltaUsers == nil || len(deltaUsers) == 0 {
-			nlog.Core().Warn("remove delta with empty users, skipping")
 			return
 		}
 		filtered := subtractUsers(s.lastUsers, deltaUsers)
-		s.updateUserState(filtered)
 
 		if !s.kernel.IsRunning() {
 			return
@@ -746,11 +772,14 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 
 		removed, err := s.kernel.RemoveUsers(deltaUsers)
 		if err != nil {
-			nlog.Core().Warn(fmt.Sprintf("RemoveUsers failed: %v", err))
+			nlog.Core().Warn(fmt.Sprintf("RemoveUsers failed: %v, falling back to UpdateUsers", err))
 			if _, _, err := s.kernel.UpdateUsers(filtered); err != nil {
 				nlog.Core().Error(fmt.Sprintf("UpdateUsers fallback failed: %v", err))
+				return
 			}
-		} else if s.nodeLog != nil && removed > 0 {
+		}
+		s.updateUserState(filtered)
+		if s.nodeLog != nil && removed > 0 {
 			s.nodeLog.Info(fmt.Sprintf("users removed: -%d", removed))
 		}
 
@@ -786,6 +815,12 @@ func mergeUsers(base, delta []panel.User) []panel.User {
 
 // subtractUsers returns base with all users in delta removed.
 func subtractUsers(base, delta []panel.User) []panel.User {
+	if base == nil {
+		return nil
+	}
+	if delta == nil || len(delta) == 0 {
+		return base
+	}
 	removeSet := make(map[int]struct{}, len(delta))
 	for _, u := range delta {
 		removeSet[u.ID] = struct{}{}
@@ -839,7 +874,7 @@ func (s *Service) trackAndEnforce(ctx context.Context) {
 
 	traffic, aliveIPs, connCount, err := s.kernel.GetUserTraffic(ctx)
 	if err != nil {
-		slog.Debug("get user traffic failed", "error", err)
+		nlog.Core().Debug("get user traffic failed", "error", err)
 		return
 	}
 
@@ -859,12 +894,12 @@ func (s *Service) trackAndEnforce(ctx context.Context) {
 // loop is never blocked by slow HTTP. Only one push runs at a time.
 func (s *Service) pushReportAsync() {
 	if !s.pushActive.CompareAndSwap(false, true) {
-		slog.Debug("push already in progress, skipping")
+		nlog.Core().Debug("push already in progress, skipping")
 		return
 	}
 
 	if s.pushBackoff.shouldSkip() {
-		slog.Debug("skipping report due to backoff")
+		nlog.Core().Debug("skipping report due to backoff")
 		s.pushActive.Store(false)
 		return
 	}
@@ -888,7 +923,7 @@ func (s *Service) pushReportAsync() {
 			[2]uint64{status.DiskTotal, status.DiskUsed},
 			metrics,
 		); err != nil {
-			slog.Error("failed to push report", "error", err)
+			nlog.Core().Error("failed to push report", "error", err)
 			if len(traffic) > 0 {
 				s.tracker.RestoreTraffic(traffic)
 			}
@@ -921,7 +956,7 @@ func (s *Service) pushReportSync() {
 		[2]uint64{status.DiskTotal, status.DiskUsed},
 		metrics,
 	); err != nil {
-		slog.Error("failed to push final report", "error", err)
+		nlog.Core().Error("failed to push final report", "error", err)
 	}
 }
 
@@ -929,6 +964,11 @@ func (s *Service) pushReportSync() {
 // This includes active connections, per-core CPU, GC stats, API call stats,
 // WebSocket status, and limiter hit counts.
 func (s *Service) buildMetrics(status monitor.Status) map[string]interface{} {
+	s.metricsMu.RLock()
+	lastUsers := s.lastUsers
+	wsClient := s.wsClient
+	s.metricsMu.RUnlock()
+
 	m := make(map[string]interface{})
 	online := s.tracker.CurrentOnline()
 
@@ -939,7 +979,7 @@ func (s *Service) buildMetrics(status monitor.Status) map[string]interface{} {
 	m["active_connections"] = s.tracker.ActiveConnections()
 	m["total_connections"] = s.tracker.TotalConnections()
 	m["active_users"] = len(online)
-	m["total_users"] = len(s.lastUsers)
+	m["total_users"] = len(lastUsers)
 
 	// Speed
 	m["inbound_speed"] = s.tracker.InboundSpeed()
@@ -976,8 +1016,8 @@ func (s *Service) buildMetrics(status monitor.Status) map[string]interface{} {
 	}
 
 	// WebSocket status.
-	wsEnabled := s.wsClient != nil
-	wsConnected := wsEnabled && s.wsClient.IsConnected()
+	wsEnabled := wsClient != nil
+	wsConnected := wsEnabled && wsClient.IsConnected()
 	m["ws"] = map[string]interface{}{
 		"enabled":   wsEnabled,
 		"connected": wsConnected,

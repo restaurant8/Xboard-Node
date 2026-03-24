@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strconv"
 
+	"github.com/cedar2025/xboard-node/internal/nlog"
+	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
 )
 
@@ -331,40 +333,47 @@ func (c *Config) ExpandNodes() []*Config {
 }
 
 func InitLogger(cfg LogConfig) {
-	var level slog.Level
+	var minLevel slog.Level
 	switch cfg.Level {
 	case "debug":
-		level = slog.LevelDebug
+		minLevel = slog.LevelDebug
 	case "warn":
-		level = slog.LevelWarn
+		minLevel = slog.LevelWarn
 	case "error":
-		level = slog.LevelError
+		minLevel = slog.LevelError
 	default:
-		level = slog.LevelInfo
+		minLevel = slog.LevelInfo
 	}
 
 	var w io.Writer
+	useColor := false
 	switch cfg.Output {
 	case "stdout", "":
 		w = os.Stdout
+		useColor = term.IsTerminal(int(os.Stdout.Fd()))
 	case "stderr":
 		w = os.Stderr
+		useColor = term.IsTerminal(int(os.Stderr.Fd()))
 	default:
 		dir := filepath.Dir(cfg.Output)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			slog.Error("failed to create log dir, falling back to stdout", "error", err)
+			fmt.Fprintf(os.Stderr, "failed to create log dir, falling back to stdout: %v\n", err)
 			w = os.Stdout
+			useColor = term.IsTerminal(int(os.Stdout.Fd()))
 		} else {
 			f, err := os.OpenFile(cfg.Output, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 			if err != nil {
-				slog.Error("failed to open log file, falling back to stdout", "error", err)
+				fmt.Fprintf(os.Stderr, "failed to open log file, falling back to stdout: %v\n", err)
 				w = os.Stdout
+				useColor = term.IsTerminal(int(os.Stdout.Fd()))
 			} else {
 				w = f
+				useColor = false
 			}
 		}
 	}
 
-	handler := slog.NewTextHandler(w, &slog.HandlerOptions{Level: level})
-	slog.SetDefault(slog.New(handler))
+	nlog.Init(w, minLevel, useColor)
+	// Application logging goes through nlog; silence slog.Default for stray library use.
+	slog.SetDefault(slog.New(slog.DiscardHandler))
 }

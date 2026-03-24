@@ -3,11 +3,12 @@ package geodata
 import (
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
 const (
@@ -49,7 +50,7 @@ func Ensure(dir string, needGeoIP, needGeoSite bool, kernelType string) error {
 	var firstErr error
 	for _, f := range files {
 		if err := ensureFile(dir, f.name, f.url); err != nil {
-			slog.Warn("geo database auto-download failed", "file", f.name, "error", err)
+			nlog.Core().Warn("geo database auto-download failed", "file", f.name, "error", err)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -63,12 +64,12 @@ func ensureFile(dir, name, url string) error {
 	if _, err := os.Stat(dst); err == nil {
 		return nil
 	}
-	slog.Info("geo database missing, downloading automatically", "file", name, "url", url)
+	nlog.Core().Info("geo database missing, downloading automatically", "file", name, "url", url)
 	if err := atomicDownload(dst, url); err != nil {
 		return err
 	}
 	if fi, err := os.Stat(dst); err == nil {
-		slog.Info("geo database ready", "file", name, "size_kb", fi.Size()/1024)
+		nlog.Core().Info("geo database ready", "file", name, "size_kb", fi.Size()/1024)
 	}
 	return nil
 }

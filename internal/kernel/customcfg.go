@@ -3,10 +3,10 @@ package kernel
 import (
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"os"
 	"strings"
 
+	"github.com/cedar2025/xboard-node/internal/nlog"
 	"gopkg.in/yaml.v3"
 )
 
@@ -20,7 +20,7 @@ func LoadCustomConfig(path string) (map[string]any, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			slog.Warn("custom config file not found, skipping", "path", path)
+			nlog.Core().Warn("custom config file not found, skipping", "path", path)
 			return nil, nil
 		}
 		return nil, fmt.Errorf("read custom config %s: %w", path, err)
@@ -43,7 +43,7 @@ func LoadCustomConfig(path string) (map[string]any, error) {
 		}
 	}
 
-	slog.Info("loaded custom config", "path", path, "keys", mapKeys(result))
+	nlog.Core().Info("loaded custom config", "path", path, "keys", mapKeys(result))
 	return result, nil
 }
 

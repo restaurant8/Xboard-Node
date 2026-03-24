@@ -3,11 +3,11 @@ package xray
 import (
 	"encoding/base64"
 	"fmt"
-	"log/slog"
 	"strings"
 
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
+	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/panel"
 )
 
@@ -70,7 +70,7 @@ func buildConfig(kcfg config.KernelConfig, nc *panel.NodeConfig, users []panel.U
 	if inbound != nil {
 		cfg["inbounds"] = []M{inbound}
 	} else {
-		slog.Warn("xray: unsupported protocol, no inbound configured — node will not accept connections",
+		nlog.Core().Warn("xray: unsupported protocol, no inbound configured — node will not accept connections",
 			"protocol", nc.Protocol,
 			"supported", "vmess, vless, trojan, shadowsocks, socks, http")
 	}
@@ -116,7 +116,7 @@ func mergeRouteList(a, b []map[string]any) []map[string]any {
 func mergeCustomXray(cfg M, kcfg config.KernelConfig) {
 	custom, err := kernel.LoadCustomConfig(kcfg.CustomConfig)
 	if err != nil {
-		slog.Error("failed to load custom xray config", "error", err)
+		nlog.Core().Error("failed to load custom xray config", "error", err)
 		return
 	}
 	if custom == nil {

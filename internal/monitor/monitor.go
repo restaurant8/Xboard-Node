@@ -1,10 +1,10 @@
 package monitor
 
 import (
-	"log/slog"
 	"runtime"
 	"time"
 
+	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/disk"
 	"github.com/shirou/gopsutil/v4/load"
@@ -50,7 +50,7 @@ func Collect() Status {
 	if cpuPercent, err := cpu.Percent(0, false); err == nil && len(cpuPercent) > 0 {
 		s.CPU = cpuPercent[0]
 	} else if err != nil {
-		slog.Debug("failed to get CPU usage", "error", err)
+		nlog.Core().Debug("failed to get CPU usage", "error", err)
 	}
 
 	// Per-core CPU usage (best-effort; safe if it fails).

@@ -203,17 +203,15 @@ func (t *Tracker) RestoreAliveIPs(data map[int][]string) {
 		if ips == nil {
 			ips = make([]string, 0, len(ipList))
 		}
+		// Use map for O(n) dedup instead of O(n²) linear search
+		existMap := make(map[string]struct{}, len(ips)+len(ipList))
+		for _, existing := range ips {
+			existMap[existing] = struct{}{}
+		}
 		for _, ip := range ipList {
-			// Dedup check
-			found := false
-			for _, existing := range ips {
-				if existing == ip {
-					found = true
-					break
-				}
-			}
-			if !found {
+			if _, exists := existMap[ip]; !exists {
 				ips = append(ips, ip)
+				existMap[ip] = struct{}{}
 			}
 		}
 		t.aliveIPsBuf[uid] = ips

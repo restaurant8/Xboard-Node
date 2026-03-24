@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -46,36 +45,20 @@ func main() {
 	// Apply runtime memory tuning before anything else allocates.
 	applyRuntimeConfig(cfg.Runtime)
 
-	nodes := cfg.ExpandNodes()
-	nlog.Core().Info(fmt.Sprintf("xboard-node %s starting, %d nodes", version, len(nodes)))
+	runWithReload(cfg, *configPath)
+}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		sig := <-sigCh
-		nlog.Core().Info(fmt.Sprintf("received %v, shutting down...", sig))
-		cancel()
-
-		// Force-exit on second signal or after timeout.
-		select {
-		case sig = <-sigCh:
-			slog.Warn("received second signal, forcing exit", "signal", sig)
-			os.Exit(1)
-		case <-time.After(15 * time.Second):
-			slog.Error("shutdown timed out after 15s, forcing exit")
-			os.Exit(2)
+// runWithReload restarts all node services when the config file changes.
+func runWithReload(initialCfg *config.Config, configPath string) {
+	var healthSrv *http.Server
+	var healthPort int
+	startHealth := func(port int) {
+		if port <= 0 {
+			return
 		}
-	}()
-
-	// Optional health-check endpoint for container orchestrators.
-	if cfg.HealthPort > 0 {
-		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.HealthPort))
+		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 		if err != nil {
-			slog.Error("failed to start health check listener", "port", cfg.HealthPort, "error", err)
+			nlog.Core().Error("failed to start health check listener", "port", port, "error", err)
 			os.Exit(1)
 		}
 		mux := http.NewServeMux()
@@ -84,44 +67,118 @@ func main() {
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`{"status":"ok"}`))
 		})
-		srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+		healthSrv = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+		healthPort = port
 		go func() {
-			nlog.Core().Debug(fmt.Sprintf("health check listening on :%d", cfg.HealthPort))
-			if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-				slog.Warn("health check server stopped", "error", err)
-			}
-		}()
-		go func() {
-			<-ctx.Done()
-			srv.Close()
-		}()
-	}
-
-	// Run one service per node. If any node fails, cancel all others.
-	errCh := make(chan error, len(nodes))
-	var wg sync.WaitGroup
-	for _, nodeCfg := range nodes {
-		nodeCfg := nodeCfg // capture
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			svc := service.New(nodeCfg)
-			if err := svc.Run(ctx); err != nil {
-				slog.Error("node service exited with error",
-					"node_id", nodeCfg.Panel.NodeID, "error", err)
-				errCh <- err
-				cancel() // bring down all other nodes
+			nlog.Core().Debug(fmt.Sprintf("health check listening on :%d", port))
+			if err := healthSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
+				nlog.Core().Warn("health check server stopped", "error", err)
 			}
 		}()
 	}
 
-	wg.Wait()
-	close(errCh)
+	startHealth(initialCfg.HealthPort)
+	defer func() {
+		if healthSrv != nil {
+			healthSrv.Close()
+		}
+	}()
 
-	if err := <-errCh; err != nil {
-		os.Exit(1)
+	for cfg := initialCfg; ; {
+		ctx, cancel := context.WithCancel(context.Background())
+
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+		reloadCh := make(chan *config.Config, 1)
+
+		watcher, err := config.WatchConfig(ctx, configPath, func(newCfg *config.Config) {
+			select {
+			case reloadCh <- newCfg:
+			default:
+			}
+		})
+		if err != nil {
+			nlog.Core().Warn("config watcher unavailable, hot-reload disabled", "error", err)
+		}
+
+		go func() {
+			select {
+			case sig := <-sigCh:
+				nlog.Core().Info(fmt.Sprintf("received %v, shutting down...", sig))
+				cancel()
+
+				select {
+				case sig = <-sigCh:
+					nlog.Core().Warn("received second signal, forcing exit", "signal", sig)
+					os.Exit(1)
+				case <-time.After(15 * time.Second):
+					nlog.Core().Error("shutdown timed out after 15s, forcing exit")
+					os.Exit(2)
+				}
+			case <-ctx.Done():
+			}
+		}()
+
+		if cfg.HealthPort != healthPort {
+			if healthSrv != nil {
+				healthSrv.Close()
+				healthSrv = nil
+			}
+			startHealth(cfg.HealthPort)
+		}
+
+		nodes := cfg.ExpandNodes()
+		nlog.Core().Info(fmt.Sprintf("xboard-node %s starting, %d nodes", version, len(nodes)))
+
+		errCh := make(chan error, len(nodes))
+		var wg sync.WaitGroup
+		for _, nodeCfg := range nodes {
+			nodeCfg := nodeCfg
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				svc := service.New(nodeCfg)
+				if err := svc.Run(ctx); err != nil {
+					nlog.Core().Error("node service exited with error",
+						"node_id", nodeCfg.Panel.NodeID, "error", err)
+					errCh <- err
+					cancel()
+				}
+			}()
+		}
+
+		doneCh := make(chan struct{})
+		go func() { wg.Wait(); close(doneCh) }()
+
+		var newCfg *config.Config
+		select {
+		case newCfg = <-reloadCh:
+			nlog.Core().Info("config changed, restarting all services...")
+			cancel()
+			<-doneCh
+		case <-doneCh:
+		}
+
+		signal.Stop(sigCh)
+		if watcher != nil {
+			watcher.Stop()
+		}
+
+		if newCfg == nil {
+			close(errCh)
+			if err := <-errCh; err != nil {
+				os.Exit(1)
+			}
+			nlog.Core().Info("stopped")
+			return
+		}
+
+		config.InitLogger(newCfg.Log)
+		applyRuntimeConfig(newCfg.Runtime)
+		cfg = newCfg
+		nlog.Core().Info("reload complete, services restarting with new config")
 	}
-	nlog.Core().Info("stopped")
 }
 
 // applyRuntimeConfig wires up Go runtime memory limits from the config file.
@@ -133,17 +190,17 @@ func applyRuntimeConfig(rt config.RuntimeConfig) {
 	// GOGC
 	if rt.GoGCPercent > 0 {
 		prev := debug.SetGCPercent(rt.GoGCPercent)
-		slog.Info("runtime: GOGC set", "gogc", rt.GoGCPercent, "prev", prev)
+		nlog.Core().Info("runtime: GOGC set", "gogc", rt.GoGCPercent, "prev", prev)
 	}
 
 	// GOMEMLIMIT — parse human-readable size string (e.g. "30MiB")
 	if rt.GoMemLimit != "" {
 		limit, err := parseMemLimit(rt.GoMemLimit)
 		if err != nil {
-			slog.Warn("runtime: invalid gomemlimit, ignoring", "value", rt.GoMemLimit, "error", err)
+			nlog.Core().Warn("runtime: invalid gomemlimit, ignoring", "value", rt.GoMemLimit, "error", err)
 		} else {
 			prev := debug.SetMemoryLimit(limit)
-			slog.Info("runtime: GOMEMLIMIT set",
+			nlog.Core().Info("runtime: GOMEMLIMIT set",
 				"limit", rt.GoMemLimit,
 				"bytes", limit,
 				"prev_bytes", prev,

@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -32,6 +31,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/kernel/geodata"
+	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/panel"
 )
 
@@ -153,7 +153,7 @@ func (x *Xray) Start(nodeConfig *panel.NodeConfig, users []panel.User, certFile,
 
 	x.updateDispatcherLimits(users)
 
-	slog.Info("xray started",
+	nlog.Core().Info("xray started",
 		"users", len(users),
 		"protocol", nodeConfig.Protocol,
 	)
@@ -174,12 +174,12 @@ func (x *Xray) Reload(nodeConfig *panel.NodeConfig, users []panel.User, certFile
 	if same {
 		x.users = users
 		x.mu.Unlock()
-		slog.Debug("xray: limits updated, kernel configuration unchanged")
+		nlog.Core().Debug("xray: limits updated, kernel configuration unchanged")
 		return nil
 	}
 	x.mu.Unlock()
 
-	slog.Info("xray: configuration changed, performing full restart")
+	nlog.Core().Info("xray: configuration changed, performing full restart")
 	return x.Start(nodeConfig, users, certFile, keyFile)
 }
 
@@ -220,8 +220,10 @@ func (x *Xray) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliv
 		return traffic, aliveIPs, connCount, nil
 	}
 
-	// Fallback: read xray's native stats counters
+	// Fallback path: aggregateStats needs x.mu.
+	x.mu.Lock()
 	traffic, err = x.aggregateStats()
+	x.mu.Unlock()
 	return traffic, nil, 0, err
 }
 
@@ -289,7 +291,7 @@ func (x *Xray) AddUsers(users []panel.User) (int, error) {
 		// Protocol doesn't support UserManager → full restart
 		nc, cf, kf := x.nodeConfig, x.certFile, x.keyFile
 		x.mu.Unlock()
-		slog.Debug("xray: AddUsers fallback to restart", "reason", err)
+		nlog.Core().Debug("xray: AddUsers fallback to restart", "reason", err)
 		if err := x.Start(nc, merged, cf, kf); err != nil {
 			return 0, err
 		}
@@ -305,11 +307,11 @@ func (x *Xray) AddUsers(users []panel.User) (int, error) {
 	for _, u := range toAdd {
 		mu, err := toMemoryUser(proto, nc, u)
 		if err != nil {
-			slog.Warn("xray: skip user, cannot build account", "user", u.ID, "error", err)
+			nlog.Core().Warn("xray: skip user, cannot build account", "user", u.ID, "error", err)
 			continue
 		}
 		if err := um.AddUser(ctx, mu); err != nil {
-			slog.Warn("xray: AddUser failed", "user", u.ID, "error", err)
+			nlog.Core().Warn("xray: AddUser failed", "user", u.ID, "error", err)
 			continue
 		}
 		added++
@@ -321,7 +323,7 @@ func (x *Xray) AddUsers(users []panel.User) (int, error) {
 	x.mu.Unlock()
 	x.updateDispatcherLimits(merged)
 
-	slog.Info("xray: users added via UserManager", "added", added, "total", len(merged))
+	nlog.Core().Info("xray: users added via UserManager", "added", added, "total", len(merged))
 	return added, nil
 }
 
@@ -361,7 +363,7 @@ func (x *Xray) RemoveUsers(users []panel.User) (int, error) {
 	if err != nil {
 		nc, cf, kf := x.nodeConfig, x.certFile, x.keyFile
 		x.mu.Unlock()
-		slog.Debug("xray: RemoveUsers fallback to restart", "reason", err)
+		nlog.Core().Debug("xray: RemoveUsers fallback to restart", "reason", err)
 		if err := x.Start(nc, kept, cf, kf); err != nil {
 			return 0, err
 		}
@@ -374,7 +376,7 @@ func (x *Xray) RemoveUsers(users []panel.User) (int, error) {
 	for _, u := range users {
 		email := userEmail(u.ID)
 		if err := um.RemoveUser(ctx, email); err != nil {
-			slog.Debug("xray: RemoveUser skipped", "user", u.ID, "error", err)
+			nlog.Core().Debug("xray: RemoveUser skipped", "user", u.ID, "error", err)
 			continue
 		}
 		actualRemoved++
@@ -385,7 +387,7 @@ func (x *Xray) RemoveUsers(users []panel.User) (int, error) {
 	x.mu.Unlock()
 	x.updateDispatcherLimits(kept)
 
-	slog.Info("xray: users removed via UserManager", "removed", actualRemoved, "total", len(kept))
+	nlog.Core().Info("xray: users removed via UserManager", "removed", actualRemoved, "total", len(kept))
 	return actualRemoved, nil
 }
 
@@ -406,7 +408,7 @@ func (x *Xray) UpdateUsers(users []panel.User) (added, removed int, err error) {
 		x.users = users
 		x.mu.Unlock()
 		x.updateDispatcherLimits(users)
-		slog.Info("xray: limits updated, kernel unchanged")
+		nlog.Core().Info("xray: limits updated, kernel unchanged")
 		return 0, 0, nil
 	}
 
@@ -415,7 +417,7 @@ func (x *Xray) UpdateUsers(users []panel.User) (added, removed int, err error) {
 		// Protocol doesn't support UserManager → full restart
 		nc, cf, kf := x.nodeConfig, x.certFile, x.keyFile
 		x.mu.Unlock()
-		slog.Debug("xray: UpdateUsers fallback to restart", "reason", umErr)
+		nlog.Core().Debug("xray: UpdateUsers fallback to restart", "reason", umErr)
 		if err = x.Start(nc, users, cf, kf); err != nil {
 			return 0, 0, err
 		}
@@ -432,17 +434,17 @@ func (x *Xray) UpdateUsers(users []panel.User) (added, removed int, err error) {
 	for _, u := range toRemove {
 		email := userEmail(u.ID)
 		if err := um.RemoveUser(ctx, email); err != nil {
-			slog.Debug("xray: RemoveUser skipped in UpdateUsers", "user", u.ID, "error", err)
+			nlog.Core().Debug("xray: RemoveUser skipped in UpdateUsers", "user", u.ID, "error", err)
 		}
 	}
 	for _, u := range toAdd {
 		mu, err := toMemoryUser(proto, nc, u)
 		if err != nil {
-			slog.Warn("xray: skip user in UpdateUsers", "user", u.ID, "error", err)
+			nlog.Core().Warn("xray: skip user in UpdateUsers", "user", u.ID, "error", err)
 			continue
 		}
 		if err := um.AddUser(ctx, mu); err != nil {
-			slog.Warn("xray: AddUser failed in UpdateUsers", "user", u.ID, "error", err)
+			nlog.Core().Warn("xray: AddUser failed in UpdateUsers", "user", u.ID, "error", err)
 		}
 	}
 
@@ -451,7 +453,7 @@ func (x *Xray) UpdateUsers(users []panel.User) (added, removed int, err error) {
 	x.mu.Unlock()
 	x.updateDispatcherLimits(users)
 
-	slog.Info("xray: users updated via UserManager", "added", added, "removed", removed, "total", len(users))
+	nlog.Core().Info("xray: users updated via UserManager", "added", added, "removed", removed, "total", len(users))
 	return
 }
 
@@ -597,7 +599,7 @@ func (x *Xray) ensureGeoData(nc *panel.NodeConfig) {
 	}
 	dir := x.cfg.GeoDataDir
 	if err := geodata.Ensure(dir, needIP, needSite, "xray"); err != nil {
-		slog.Warn("geo database unavailable", "error", err)
+		nlog.Core().Warn("geo database unavailable", "error", err)
 	}
 	os.Setenv("XRAY_LOCATION_ASSET", dir)
 }
@@ -609,7 +611,7 @@ func marshalConfig(cfg config.KernelConfig, nc *panel.NodeConfig, users []panel.
 	if err != nil {
 		return nil, fmt.Errorf("marshal config: %w", err)
 	}
-	slog.Debug("xray config generated", "len", len(data))
+	nlog.Core().Debug("xray config generated", "len", len(data))
 	return data, nil
 }
 
@@ -625,6 +627,7 @@ func startWithTimeout(inst *xrayCore.Instance, timeout time.Duration) error {
 		}
 		return nil
 	case <-time.After(timeout):
+		go inst.Close()
 		return fmt.Errorf("start xray: timeout after %v", timeout)
 	}
 }
@@ -648,7 +651,7 @@ func closeOld(inst *xrayCore.Instance, ld *LimitDispatcher) {
 		if ld != nil {
 			ld.ResetConns()
 		}
-		slog.Debug("xray: old instance recycled")
+		nlog.Core().Debug("xray: old instance recycled")
 	}()
 }
 

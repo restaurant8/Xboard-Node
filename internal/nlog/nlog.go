@@ -3,6 +3,7 @@ package nlog
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -33,7 +34,43 @@ var (
 	mu          sync.RWMutex
 	defaultNode string
 	nodeLoggers = make(map[string]*NodeLog)
+
+	logMu      sync.RWMutex
+	logWriter  io.Writer = os.Stdout
+	logMin     = slog.LevelInfo
+	logColor   = true
 )
+
+// Init configures process-wide log output (called from config.InitLogger).
+// w must be non-nil. minLevel drops messages below that severity.
+// color enables ANSI coloring when true (typically TTY + stdout/stderr).
+func Init(w io.Writer, minLevel slog.Level, color bool) {
+	if w == nil {
+		w = os.Stdout
+	}
+	logMu.Lock()
+	defer logMu.Unlock()
+	logWriter = w
+	logMin = minLevel
+	logColor = color
+}
+
+// formatMsg appends alternating key-value pairs like slog: ("k", v, "k2", v2).
+func formatMsg(msg string, args []any) string {
+	if len(args) == 0 {
+		return msg
+	}
+	var b strings.Builder
+	b.WriteString(msg)
+	for i := 0; i < len(args); i += 2 {
+		if i+1 < len(args) {
+			fmt.Fprintf(&b, " %v=%v", args[i], args[i+1])
+		} else {
+			fmt.Fprintf(&b, " %v", args[i])
+		}
+	}
+	return b.String()
+}
 
 // SetDefault sets the default node prefix for core-level logs.
 func SetDefault(prefix string) {
@@ -128,48 +165,61 @@ func (nl *NodeLog) Error(msg string, args ...any) {
 	logWithColor(slog.LevelError, nl.prefix, msg, args...)
 }
 
-// logWithColor outputs a colored log line directly to stdout.
-// Format: HH:MM:SS.mmm LEVEL [prefix] message
+// logWithColor writes one line to the configured writer (see Init).
+// Format: HH:MM:SS.mmm LEVEL [prefix] message [key=value ...]
 func logWithColor(level slog.Level, prefix, msg string, args ...any) {
-	// Time
-	now := time.Now().Format("15:04:05.000")
+	logMu.RLock()
+	out := logWriter
+	min := logMin
+	color := logColor
+	logMu.RUnlock()
 
-	// Level with color
-	var levelStr, levelColor string
+	if level < min {
+		return
+	}
+
+	now := time.Now().Format("15:04:05.000")
+	fullMsg := formatMsg(msg, args)
+
+	var levelStr string
 	switch level {
 	case slog.LevelDebug:
 		levelStr = "DEBUG"
-		levelColor = ColorGreen
 	case slog.LevelInfo:
 		levelStr = "INFO "
-		levelColor = ColorWhite
 	case slog.LevelWarn:
 		levelStr = "WARN "
-		levelColor = ColorYellow
 	case slog.LevelError:
 		levelStr = "ERROR"
-		levelColor = ColorRed
 	default:
 		levelStr = "?????"
+	}
+
+	if !color {
+		fmt.Fprintf(out, "%s %s [%s] %s\n", now, strings.TrimSpace(levelStr), prefix, fullMsg)
+		return
+	}
+
+	var levelColor string
+	switch level {
+	case slog.LevelDebug:
+		levelColor = ColorGreen
+	case slog.LevelInfo:
+		levelColor = ColorWhite
+	case slog.LevelWarn:
+		levelColor = ColorYellow
+	case slog.LevelError:
+		levelColor = ColorRed
+	default:
 		levelColor = ColorWhite
 	}
 
-	// Prefix with color
 	prefixColor := ColorCyan
 	if prefix == "core" {
 		prefixColor = ColorBlue
 	}
 
-	// Format message
-	var fullMsg string
-	if len(args) == 0 {
-		fullMsg = msg
-	} else {
-		fullMsg = fmt.Sprintf("%s %v", msg, args)
-	}
-
-	// Output colored line
-	fmt.Fprintf(os.Stdout, "%s%s%s %s%s%s %s[%s]%s %s\n",
+	fmt.Fprintf(out, "%s%s%s %s%s%s %s[%s]%s %s\n",
 		ColorGray, now, ColorReset,
 		levelColor, levelStr, ColorReset,
 		prefixColor, prefix, ColorReset,

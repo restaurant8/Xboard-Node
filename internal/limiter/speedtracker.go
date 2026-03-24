@@ -54,54 +54,50 @@ func (t *SpeedTracker) UpdateBuckets() {
 	}
 	t.limiter.mu.RUnlock()
 
-	t.mu.Lock()
+	func() {
+		t.mu.Lock()
+		defer t.mu.Unlock()
 
-	newUUIDMap := make(map[string]int, len(currentUsers))
-	activeIDs := make(map[int]struct{}, len(currentUsers))
+		newUUIDMap := make(map[string]int, len(currentUsers))
+		activeIDs := make(map[int]struct{}, len(currentUsers))
 
-	for _, user := range currentUsers {
-		activeIDs[user.ID] = struct{}{}
-		if user.UUID != "" {
-			newUUIDMap[user.UUID] = user.ID
+		for _, user := range currentUsers {
+			activeIDs[user.ID] = struct{}{}
+			if user.UUID != "" {
+				newUUIDMap[user.UUID] = user.ID
+			}
+
+			if user.SpeedLimit <= 0 {
+				delete(t.buckets, user.ID)
+				continue
+			}
+
+			bytesPerSec := int(user.SpeedLimit) * 1_000_000 / 8
+			burst := bytesPerSec
+			if burst < 64*1024 {
+				burst = 64 * 1024
+			}
+			if cap4s := bytesPerSec * 4; cap4s > 64*1024 && burst > cap4s {
+				burst = cap4s
+			}
+
+			if existing, ok := t.buckets[user.ID]; ok {
+				existing.SetLimit(rate.Limit(bytesPerSec))
+				existing.SetBurst(burst)
+			} else {
+				t.buckets[user.ID] = rate.NewLimiter(rate.Limit(bytesPerSec), burst)
+			}
 		}
 
-		if user.SpeedLimit <= 0 {
-			delete(t.buckets, user.ID)
-			continue
+		for id := range t.buckets {
+			if _, ok := activeIDs[id]; !ok {
+				delete(t.buckets, id)
+			}
 		}
 
-		bytesPerSec := int(user.SpeedLimit) * 1_000_000 / 8
-		burst := bytesPerSec
-		if burst < 64*1024 {
-			burst = 64 * 1024
-		}
-		if cap4s := bytesPerSec * 4; cap4s > 64*1024 && burst > cap4s {
-			burst = cap4s
-		}
-
-		if existing, ok := t.buckets[user.ID]; ok {
-			existing.SetLimit(rate.Limit(bytesPerSec))
-			existing.SetBurst(burst)
-		} else {
-			t.buckets[user.ID] = rate.NewLimiter(rate.Limit(bytesPerSec), burst)
-		}
-	}
-
-	// Remove limiters for users who are no longer in the list
-	for id := range t.buckets {
-		if _, ok := activeIDs[id]; !ok {
-			delete(t.buckets, id)
-		}
-	}
-
-	t.uuidMap = newUUIDMap
-	t.hasLimits.Store(len(t.buckets) > 0)
-
-	// IMPORTANT: logFunc must run after Unlock. The callback installed in
-	// service.startKernel calls LimitedUserCount(), which needs RLock on t.mu.
-	// Calling it while this goroutine holds Lock causes a self-deadlock on
-	// sync.RWMutex (writer blocked forever waiting for itself to release).
-	t.mu.Unlock()
+		t.uuidMap = newUUIDMap
+		t.hasLimits.Store(len(t.buckets) > 0)
+	}()
 
 	if t.logFunc != nil {
 		t.logFunc("buckets updated")
