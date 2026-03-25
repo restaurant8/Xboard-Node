@@ -43,8 +43,7 @@ func (t *SpeedTracker) SetLogCallback(f SpeedTrackerLogCallback) {
 	t.logFunc = f
 }
 
-// UpdateBuckets updates the UUID→userID mapping and cleans up removed users.
-// Rate limiters are created on-demand in GetLimiter.
+// UpdateBuckets updates the UUID→userID mapping and syncs existing limiters.
 func (t *SpeedTracker) UpdateBuckets() {
 	currentUsers := make([]panel.User, 0, 32)
 	t.limiter.mu.RLock()
@@ -64,6 +63,21 @@ func (t *SpeedTracker) UpdateBuckets() {
 			activeIDs[user.ID] = struct{}{}
 			if user.UUID != "" {
 				newUUIDMap[user.UUID] = user.ID
+			}
+
+			// Update existing limiter if speed changed
+			if lim, ok := t.buckets[user.ID]; ok {
+				if user.SpeedLimit > 0 {
+					bytesPerSec := int(user.SpeedLimit) * 1_000_000 / 8
+					burst := bytesPerSec
+					if burst < 64*1024 {
+						burst = 64 * 1024
+					}
+					lim.SetLimit(rate.Limit(bytesPerSec))
+					lim.SetBurst(burst)
+				} else {
+					delete(t.buckets, user.ID)
+				}
 			}
 		}
 

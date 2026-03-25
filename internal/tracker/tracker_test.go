@@ -164,10 +164,10 @@ func TestFlushAliveIPs(t *testing.T) {
 		t.Errorf("user 2 IPs: got %d, want 1", len(flushed[2]))
 	}
 
-	// Without another Process call, aliveIPs still reflect last known state
+	// Without another Process call, hash is same → returns nil (skip duplicate)
 	flushed2 := tr.FlushAliveIPs()
-	if len(flushed2[1]) != 2 {
-		t.Errorf("expected same IPs without new Process, got %v", flushed2)
+	if flushed2 != nil {
+		t.Errorf("expected nil on duplicate flush, got %v", flushed2)
 	}
 }
 
