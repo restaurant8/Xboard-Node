@@ -35,7 +35,7 @@ const drainTimeout = 5 * time.Second
 type SingBox struct {
 	cfg config.KernelConfig
 
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	box    *box.Box
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -389,6 +389,24 @@ func (s *SingBox) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) {
 	s.deviceLimitFunc = fn
 	if s.connTracker != nil {
 		s.connTracker.SetDeviceLimitFunc(fn)
+	}
+}
+
+// UpdateGlobalDevices updates the global device state from panel (for multi-node).
+func (s *SingBox) UpdateGlobalDevices(users map[int][]string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.connTracker != nil {
+		s.connTracker.UpdateGlobalDevices(users)
+	}
+}
+
+// ClearGlobalDevices clears the global device state (on WS disconnect).
+func (s *SingBox) ClearGlobalDevices() {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.connTracker != nil {
+		s.connTracker.ClearGlobalDevices()
 	}
 }
 

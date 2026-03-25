@@ -19,6 +19,8 @@ const (
 	WSEventSyncConfig    = "sync.config"
 	WSEventSyncUsers     = "sync.users"
 	WSEventSyncUserDelta = "sync.user.delta"
+	WSEventSyncDevices   = "sync.devices"   // panel → node: global device state
+	WSEventReportDevices = "report.devices" // node → panel: report device snapshot
 )
 
 // WSEvent is a parsed data event delivered to the service layer.
@@ -28,6 +30,9 @@ type WSEvent struct {
 	Users       []User
 	DeltaAction string // "add" or "remove" (only for sync.user.delta)
 	DeltaUsers  []User // users affected by the delta
+
+	// Device sync fields
+	DeviceUsers map[int][]string // userID -> IPs (for sync.devices)
 }
 
 // WSStatusChange notifies the service when WS connectivity changes.
@@ -59,6 +64,20 @@ type syncUserDeltaPayload struct {
 	Timestamp int64  `json:"timestamp"`
 }
 
+// syncDevicesPayload carries global device state from panel.
+type syncDevicesPayload struct {
+	Users     map[int][]string `json:"users"`
+	Timestamp int64            `json:"timestamp"`
+}
+
+// WSClientConfig holds WebSocket client tuning options.
+type WSClientConfig struct {
+	StatusInterval   time.Duration
+	HandshakeTimeout time.Duration
+	BackoffInitial   time.Duration
+	BackoffMax       time.Duration
+}
+
 // WSClient connects to the panel's Workerman WS server using native WebSocket.
 // Authentication is done via query parameters (token + node_id) during the
 // WebSocket handshake — no separate auth step needed.
@@ -70,17 +89,37 @@ type WSClient struct {
 	onStatus func(WSStatusChange)
 	onPing   func() map[string]interface{}
 
+	cfg WSClientConfig
+
 	connected atomic.Bool
+
+	// writeCh allows sending messages from outside the connect loop.
+	// It is set in connect() and cleared on disconnect.
+	writeCh chan wsMessage
 }
 
 // NewWSClient creates a new WebSocket client.
 // wsURL is the base WebSocket URL (e.g. "ws://panel.example.com:8076").
 // token and nodeID are used for authentication via query parameters.
-func NewWSClient(wsURL string, token string, nodeID int, onEvent func(WSEvent), onStatus func(WSStatusChange), onPing func() map[string]interface{}) *WSClient {
+func NewWSClient(wsURL string, token string, nodeID int, cfg WSClientConfig, onEvent func(WSEvent), onStatus func(WSStatusChange), onPing func() map[string]interface{}) *WSClient {
+	// Apply defaults
+	if cfg.StatusInterval == 0 {
+		cfg.StatusInterval = 10 * time.Second
+	}
+	if cfg.HandshakeTimeout == 0 {
+		cfg.HandshakeTimeout = 15 * time.Second
+	}
+	if cfg.BackoffInitial == 0 {
+		cfg.BackoffInitial = time.Second
+	}
+	if cfg.BackoffMax == 0 {
+		cfg.BackoffMax = 60 * time.Second
+	}
 	return &WSClient{
 		wsURL:    wsURL,
 		token:    token,
 		nodeID:   nodeID,
+		cfg:      cfg,
 		onEvent:  onEvent,
 		onStatus: onStatus,
 		onPing:   onPing,
@@ -97,7 +136,7 @@ func (w *WSClient) notifyStatus(connected bool) {
 
 // Run connects and reconnects until ctx is cancelled.
 func (w *WSClient) Run(ctx context.Context) {
-	backoff := time.Second
+	backoff := w.cfg.BackoffInitial
 	for {
 		start := time.Now()
 		err := w.connect(ctx)
@@ -122,7 +161,7 @@ func (w *WSClient) Run(ctx context.Context) {
 
 		// Reset backoff if the connection was up for a meaningful duration.
 		if time.Since(start) > 2*time.Minute {
-			backoff = time.Second
+			backoff = w.cfg.BackoffInitial
 		}
 
 		// Apply exponential backoff with jitter to prevent thundering herd.
@@ -136,8 +175,8 @@ func (w *WSClient) Run(ctx context.Context) {
 			return
 		case <-timer.C:
 		}
-		if backoff < 60*time.Second {
-			backoff = min(backoff*2, 60*time.Second)
+		if backoff < w.cfg.BackoffMax {
+			backoff = min(backoff*2, w.cfg.BackoffMax)
 		}
 	}
 }
@@ -156,7 +195,7 @@ func (w *WSClient) connect(ctx context.Context) error {
 	nlog.Core().Debug("ws connecting", "url", u.Host)
 
 	dialer := websocket.Dialer{
-		HandshakeTimeout: 15 * time.Second,
+		HandshakeTimeout: w.cfg.HandshakeTimeout,
 	}
 	conn, _, err := dialer.DialContext(ctx, u.String(), nil)
 	if err != nil {
@@ -171,6 +210,7 @@ func (w *WSClient) connect(ctx context.Context) error {
 	if err := conn.ReadJSON(&firstMsg); err != nil {
 		return fmt.Errorf("read auth response: %w", err)
 	}
+	nlog.Core().Debug("ws recv", "event", firstMsg.Event, "data", string(firstMsg.Data))
 
 	if firstMsg.Event == "error" {
 		var errData struct {
@@ -194,8 +234,9 @@ func (w *WSClient) connect(ctx context.Context) error {
 	}
 
 	// Ping interval: send pong responses to server pings.
-	// We also use this timer to trigger periodic status pushes (10s interval).
-	const reportInterval = 10 * time.Second
+	// We also use this timer to trigger periodic status pushes.
+	reportTicker := time.NewTicker(w.cfg.StatusInterval)
+	defer reportTicker.Stop()
 
 	msgCh := make(chan wsMessage, 16)
 	errCh := make(chan error, 1)
@@ -211,6 +252,7 @@ func (w *WSClient) connect(ctx context.Context) error {
 				}
 				return
 			}
+			nlog.Core().Debug("ws recv", "event", msg.Event, "data", string(msg.Data))
 			select {
 			case msgCh <- msg:
 			case <-ctx.Done():
@@ -221,11 +263,10 @@ func (w *WSClient) connect(ctx context.Context) error {
 		}
 	}()
 
-	reportTicker := time.NewTicker(reportInterval)
-	defer reportTicker.Stop()
-
 	// writeCh decouples data collection from network I/O.
-	writeCh := make(chan wsMessage, 8)
+	writeCh := make(chan wsMessage, 16)
+	w.writeCh = writeCh
+	defer func() { w.writeCh = nil }()
 
 	for {
 		select {
@@ -268,6 +309,7 @@ func (w *WSClient) connect(ctx context.Context) error {
 
 		case msg := <-writeCh:
 			// Perform the actual network write asynchronously in this loop.
+			nlog.Core().Debug("ws send", "event", msg.Event, "data", string(msg.Data))
 			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := conn.WriteJSON(msg); err != nil {
 				return fmt.Errorf("write: %w", err)
@@ -292,6 +334,9 @@ func (w *WSClient) handleMessage(msg wsMessage) {
 		w.handleDataEvent(msg)
 
 	case WSEventSyncUserDelta:
+		w.handleDataEvent(msg)
+
+	case WSEventSyncDevices:
 		w.handleDataEvent(msg)
 
 	default:
@@ -356,7 +401,59 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 		}
 		event.DeltaAction = p.Action
 		event.DeltaUsers = p.Users
+
+	case WSEventSyncDevices:
+		nlog.Core().Debug("ws sync devices event received")
+		var p syncDevicesPayload
+		if err := decodeData(msg.Data, &p); err != nil {
+			nlog.Core().Warn("ws: cannot decode devices payload", "error", err)
+			return
+		}
+		event.DeviceUsers = p.Users
 	}
 
 	w.onEvent(event)
+}
+
+// SendDeviceReport sends local device snapshot to panel via WS.
+// Format: {"123": ["1.1.1.1", "2.2.2.2"], "456": ["3.3.3.3"]}
+func (w *WSClient) SendDeviceReport(devices map[int][]string) {
+	if !w.connected.Load() {
+		return
+	}
+
+	msg := wsMessage{
+		Event:     WSEventReportDevices,
+		Timestamp: time.Now().Unix(),
+	}
+	d, err := json.Marshal(devices)
+	if err != nil {
+		return
+	}
+	msg.Data = d
+
+	select {
+	case w.writeCh <- msg:
+	default:
+		nlog.Core().Warn("ws write channel full, skipping device report")
+	}
+}
+
+// SendRaw sends a raw message to the panel via WebSocket.
+func (w *WSClient) SendRaw(event string, data json.RawMessage) {
+	if !w.connected.Load() {
+		return
+	}
+
+	msg := wsMessage{
+		Event:     event,
+		Data:      data,
+		Timestamp: time.Now().Unix(),
+	}
+
+	select {
+	case w.writeCh <- msg:
+	default:
+		nlog.Core().Warn("ws write channel full, skipping raw message", "event", event)
+	}
 }

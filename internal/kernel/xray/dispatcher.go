@@ -159,7 +159,7 @@ func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destina
 	isTCP = dest.Network == net.Network_TCP
 
 	if d.checkDeviceLimit(email, sourceIP, isTCP) {
-		nlog.Core().Info("xray: device limit exceeded", "email", email, "ip", sourceIP)
+		nlog.Core().Debug("xray: device limit exceeded", "email", email, "ip", sourceIP)
 		return "", "", false, errors.New("device limit exceeded for " + email)
 	}
 	return email, sourceIP, isTCP, nil

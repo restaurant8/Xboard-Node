@@ -158,20 +158,22 @@ func (s *Service) Run(ctx context.Context) error {
 	defer s.kernel.Stop()
 
 	// Set up tickers
-	trackTicker := time.NewTicker(10 * time.Second)
+	trackTicker := time.NewTicker(time.Duration(s.cfg.Node.TrackInterval) * time.Second)
 	pushInterval := time.Duration(math.Max(float64(s.pushInterval), 5)) * time.Second
 	pullInterval := time.Duration(s.pullInterval) * time.Second
 	reportTicker := time.NewTicker(pushInterval)
 	pullTicker := time.NewTicker(pullInterval)
+	deviceReportTicker := time.NewTicker(time.Duration(s.cfg.Node.DeviceReportInterval) * time.Second)
 
 	// WS discovery: when in REST-only mode, periodically re-handshake to check
 	// if WS has been enabled. When WS is disconnected for too long, re-check
 	// if it's still available.
-	wsDiscoveryTicker := time.NewTicker(5 * time.Minute)
+	wsDiscoveryTicker := time.NewTicker(time.Duration(s.cfg.WS.DiscoveryInterval) * time.Second)
 
 	defer trackTicker.Stop()
 	defer reportTicker.Stop()
 	defer pullTicker.Stop()
+	defer deviceReportTicker.Stop()
 	defer wsDiscoveryTicker.Stop()
 
 	s.startWSClient(ctx)
@@ -187,6 +189,9 @@ func (s *Service) Run(ctx context.Context) error {
 
 		case <-reportTicker.C:
 			s.pushReportAsync()
+
+		case <-deviceReportTicker.C:
+			s.reportDevices()
 
 		case <-pullTicker.C:
 			// When WebSocket is connected, skip REST polling entirely.
@@ -391,10 +396,17 @@ func (s *Service) startWSClient(ctx context.Context) {
 
 // newWSClient creates a WSClient with standard event/status callbacks.
 func (s *Service) newWSClient(wsURL string) *panel.WSClient {
+	wsCfg := panel.WSClientConfig{
+		StatusInterval:   time.Duration(s.cfg.WS.StatusInterval) * time.Second,
+		HandshakeTimeout: time.Duration(s.cfg.WS.HandshakeTimeout) * time.Second,
+		BackoffInitial:   time.Duration(s.cfg.WS.BackoffInitial) * time.Second,
+		BackoffMax:       time.Duration(s.cfg.WS.BackoffMax) * time.Second,
+	}
 	return panel.NewWSClient(
 		wsURL,
 		s.cfg.Panel.Token,
 		s.cfg.Panel.NodeID,
+		wsCfg,
 		func(event panel.WSEvent) {
 			select {
 			case s.wsEvents <- event:
@@ -446,6 +458,8 @@ func (s *Service) handleWSStatus(ctx context.Context, status panel.WSStatusChang
 		} else {
 			nlog.Core().Info("ws disconnected")
 		}
+		// Clear global device state on disconnect
+		s.kernel.ClearGlobalDevices()
 		s.pullViaAPIAsync(ctx)
 	}
 }
@@ -550,6 +564,12 @@ func (s *Service) handleWSEvent(ctx context.Context, event panel.WSEvent) {
 			s.nodeLog.Info(fmt.Sprintf("users delta: %s, %d users", event.DeltaAction, len(event.DeltaUsers)))
 		}
 		s.applyUserDelta(ctx, event.DeltaAction, event.DeltaUsers)
+
+	case panel.WSEventSyncDevices:
+		// Sync global device state
+		if event.DeviceUsers != nil {
+			s.kernel.UpdateGlobalDevices(event.DeviceUsers)
+		}
 
 	default:
 		nlog.Core().Debug(fmt.Sprintf("unknown ws event: %v", event.Type))
@@ -1067,4 +1087,27 @@ func computeUserHash(users []panel.User) string {
 		h.Write(buf[:])
 	}
 	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+// ─── Device management ──────────────────────────────────────────────────
+
+// sendDeviceBatch reports local device snapshot to panel via WS.
+func (s *Service) sendDeviceBatch() {
+	if s.wsClient == nil || !s.wsClient.IsConnected() {
+		return
+	}
+
+	devices := s.tracker.FlushAliveIPs()
+	// FlushAliveIPs returns nil if no changes since last flush
+	if devices == nil {
+		nlog.Core().Debug("device snapshot unchanged, skipping")
+		return
+	}
+	s.wsClient.SendDeviceReport(devices)
+	nlog.Core().Debug("device snapshot sent", "users", len(devices))
+}
+
+// reportDevices periodically reports device snapshot to panel.
+func (s *Service) reportDevices() {
+	s.sendDeviceBatch()
 }

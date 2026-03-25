@@ -244,6 +244,12 @@ func (x *Xray) SetSpeedLimitFunc(_ func(string) *rate.Limiter) {}
 // gate-kept by LimitDispatcher.checkDeviceLimit at Dispatch time.
 func (x *Xray) SetDeviceLimitFunc(_ func(string) (int, bool)) {}
 
+// UpdateGlobalDevices is a no-op for xray — xray handles device limits differently.
+func (x *Xray) UpdateGlobalDevices(_ map[int][]string) {}
+
+// ClearGlobalDevices is a no-op for xray.
+func (x *Xray) ClearGlobalDevices() {}
+
 // ─── User management (non-disruptive where possible) ────────────────────────
 
 // AddUsers adds new users to the running kernel via xray's UserManager API.

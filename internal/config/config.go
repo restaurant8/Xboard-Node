@@ -20,6 +20,7 @@ type Config struct {
 	Cert    CertConfig    `yaml:"cert"`
 	Log     LogConfig     `yaml:"log"`
 	Runtime RuntimeConfig `yaml:"runtime"`
+	WS      WSConfig      `yaml:"ws"`
 	// HealthPort enables a lightweight HTTP health-check endpoint on the
 	// given port (e.g. 65530). 0 = disabled (default).
 	HealthPort int `yaml:"health_port"`
@@ -77,8 +78,19 @@ type PanelConfig struct {
 }
 
 type NodeConfig struct {
-	PushInterval int `yaml:"push_interval"`
-	PullInterval int `yaml:"pull_interval"`
+	PushInterval         int `yaml:"push_interval"`
+	PullInterval         int `yaml:"pull_interval"`
+	TrackInterval        int `yaml:"track_interval"`         // sec, default 10
+	DeviceReportInterval int `yaml:"device_report_interval"` // sec, default 30
+}
+
+// WSConfig holds WebSocket client tuning options.
+type WSConfig struct {
+	StatusInterval    int `yaml:"status_interval"`    // node.status interval (sec), default 10
+	HandshakeTimeout  int `yaml:"handshake_timeout"`  // WS handshake timeout (sec), default 15
+	BackoffInitial    int `yaml:"backoff_initial"`    // initial reconnect delay (sec), default 1
+	BackoffMax        int `yaml:"backoff_max"`        // max reconnect delay (sec), default 60
+	DiscoveryInterval int `yaml:"discovery_interval"` // WS discovery interval (sec), default 300
 }
 
 type KernelConfig struct {
@@ -239,6 +251,29 @@ func (c *Config) setDefaults() {
 	}
 	if c.Cert.HTTPPort == 0 {
 		c.Cert.HTTPPort = 80
+	}
+	// WS defaults
+	if c.WS.StatusInterval == 0 {
+		c.WS.StatusInterval = 10
+	}
+	if c.WS.HandshakeTimeout == 0 {
+		c.WS.HandshakeTimeout = 15
+	}
+	if c.WS.BackoffInitial == 0 {
+		c.WS.BackoffInitial = 1
+	}
+	if c.WS.BackoffMax == 0 {
+		c.WS.BackoffMax = 60
+	}
+	if c.WS.DiscoveryInterval == 0 {
+		c.WS.DiscoveryInterval = 300
+	}
+	// Node defaults
+	if c.Node.TrackInterval == 0 {
+		c.Node.TrackInterval = 10
+	}
+	if c.Node.DeviceReportInterval == 0 {
+		c.Node.DeviceReportInterval = 30
 	}
 }
 

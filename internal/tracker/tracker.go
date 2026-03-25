@@ -1,6 +1,9 @@
 package tracker
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -49,6 +52,9 @@ type Tracker struct {
 	// aliveIPsBuf is a reusable buffer for FlushAliveIPs output.
 	// Avoids allocating a new map+slice every 60s.
 	aliveIPsBuf map[int][]string
+
+	// lastAliveIPsHash detects changes to avoid duplicate reports.
+	lastAliveIPsHash string
 }
 
 func New() *Tracker {
@@ -154,12 +160,22 @@ func (t *Tracker) HasTraffic() bool {
 }
 
 // FlushAliveIPs returns per-user alive IPs.
-// Reuses internal buffer to avoid allocation every 60s.
+// Reuses internal buffer. Returns nil if unchanged.
 func (t *Tracker) FlushAliveIPs() map[int][]string {
 	s := t.live.Load()
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
+	// Calculate hash of current aliveIPs
+	currentHash := calcAliveIPsHash(s.aliveIPs)
+
+	// If no changes, return nil to avoid duplicate reporting
+	if currentHash == t.lastAliveIPsHash {
+		return nil
+	}
+
+	t.lastAliveIPsHash = currentHash
 
 	// Clear old buffer entries.
 	for k := range t.aliveIPsBuf {
@@ -180,6 +196,40 @@ func (t *Tracker) FlushAliveIPs() map[int][]string {
 	}
 
 	return t.aliveIPsBuf
+}
+
+// calcAliveIPsHash computes a deterministic hash for change detection.
+func calcAliveIPsHash(aliveIPs map[int]map[string]bool) string {
+	if len(aliveIPs) == 0 {
+		return ""
+	}
+
+	h := sha256.New()
+
+	// Sort user IDs for consistent hashing
+	userIDs := make([]int, 0, len(aliveIPs))
+	for uid := range aliveIPs {
+		userIDs = append(userIDs, uid)
+	}
+	sort.Ints(userIDs)
+
+	for _, uid := range userIDs {
+		ips := aliveIPs[uid]
+		// Sort IPs for consistent hashing
+		ipList := make([]string, 0, len(ips))
+		for ip := range ips {
+			ipList = append(ipList, ip)
+		}
+		sort.Strings(ipList)
+
+		// Write user ID and IPs to hash
+		h.Write([]byte{byte(uid >> 24), byte(uid >> 16), byte(uid >> 8), byte(uid)})
+		for _, ip := range ipList {
+			h.Write([]byte(ip))
+		}
+	}
+
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // CurrentOnline returns a snapshot copy of user_id → device count (distinct IPs).
