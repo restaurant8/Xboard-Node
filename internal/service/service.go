@@ -766,6 +766,15 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 			return
 		}
 
+		for _, delta := range deltaUsers {
+			for _, old := range s.lastUsers {
+				if old.ID == delta.ID && old.UUID != delta.UUID {
+					s.kernel.RemoveUsers([]panel.User{old})
+					break
+				}
+			}
+		}
+
 		added, err := s.kernel.AddUsers(deltaUsers)
 		if err != nil {
 			nlog.Core().Warn(fmt.Sprintf("AddUsers failed: %v, falling back to UpdateUsers", err))
