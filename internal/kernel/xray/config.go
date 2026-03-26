@@ -45,8 +45,8 @@ func buildConfig(kcfg config.KernelConfig, nc *panel.NodeConfig, users []panel.U
 	cfg := M{
 		"log": M{
 			"loglevel": xrayLogLevel(kcfg.LogLevel),
-			"error":    "stdout",
-			"access":   "stdout",
+			"error":    "",
+			"access":   "",
 		},
 		"stats": M{},
 		"policy": M{

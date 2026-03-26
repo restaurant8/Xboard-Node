@@ -77,6 +77,21 @@ func TestBuildInbound_VMess_WithTLS(t *testing.T) {
 	assertMapValue(t, tls, "key_path", "/path/key.pem")
 }
 
+// Panel tls=1 with cert_mode none (no paths): inbound must be plain — TLS terminated at nginx/CDN.
+func TestBuildInbound_VMess_TLS_PanelOn_NoCertFiles(t *testing.T) {
+	nc := &panel.NodeConfig{
+		Protocol:   "vmess",
+		ServerPort: 8888,
+		Network:    "ws",
+		TLS:        1,
+		ServerName: "example.com",
+	}
+	inbound := buildInbound(nc, testUsers, "", "")
+	if _, exists := inbound["tls"]; exists {
+		t.Fatal("expected no tls block when cert/key paths are empty (nginx offload)")
+	}
+}
+
 func TestBuildInbound_VMess_NoTLS(t *testing.T) {
 	nc := &panel.NodeConfig{
 		Protocol:   "vmess",
@@ -245,13 +260,10 @@ func TestBuildInbound_Trojan_NoTLS(t *testing.T) {
 		TLS:        0,
 	}
 	inbound := buildInbound(nc, testUsers, "", "")
-	// Trojan requires TLS; buildTrojan should force-enable self-signed TLS
-	// even when the panel sends tls=0.
-	tls, exists := inbound["tls"].(M)
-	if !exists {
-		t.Fatal("trojan with tls=0 should still get TLS (force-enabled)")
+	// Without certificate paths there is no TLS layer; sing-box trojan needs certs or Reality.
+	if _, exists := inbound["tls"]; exists {
+		t.Fatal("expected no tls when cert paths are empty and tls=0")
 	}
-	assertMapValue(t, tls, "enabled", true)
 }
 
 func TestBuildInbound_Trojan_WithTLS(t *testing.T) {
@@ -643,14 +655,14 @@ func TestBuildTLSConfig_WithCert(t *testing.T) {
 func TestBuildTLSConfig_NoCert(t *testing.T) {
 	nc := &panel.NodeConfig{ServerName: "example.com"}
 	tls := buildTLSConfig(nc, "", "")
-	assertMapValue(t, tls, "enabled", true)
-	// Now we fallback to self-signed certificates when both cert and key are empty
-	assertMapValue(t, tls, "certificate_path", "self-signed")
+	if tls != nil {
+		t.Fatalf("expected nil tls config when cert paths are empty, got %+v", tls)
+	}
 }
 
 func TestBuildTLSConfig_FallbackToHost(t *testing.T) {
 	nc := &panel.NodeConfig{Host: "fallback.com"}
-	tls := buildTLSConfig(nc, "", "")
+	tls := buildTLSConfig(nc, "/c.pem", "/k.pem")
 	assertMapValue(t, tls, "server_name", "fallback.com")
 }
 
@@ -661,7 +673,7 @@ func TestBuildTLSConfig_TLSSettingsOverride(t *testing.T) {
 			"server_name": "override.com",
 		},
 	}
-	tls := buildTLSConfig(nc, "", "")
+	tls := buildTLSConfig(nc, "/c.pem", "/k.pem")
 	assertMapValue(t, tls, "server_name", "override.com")
 }
 

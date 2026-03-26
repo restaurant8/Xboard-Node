@@ -451,7 +451,9 @@ func buildVMess(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyF
 	applyMultiplex(base, nc)
 
 	if nc.TLS == 1 {
-		base["tls"] = buildTLSConfig(nc, certFile, keyFile)
+		if tls := buildTLSConfig(nc, certFile, keyFile); tls != nil {
+			base["tls"] = tls
+		}
 	}
 
 	return base
@@ -478,7 +480,9 @@ func buildVLESS(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyF
 	applyMultiplex(base, nc)
 
 	if nc.TLS == 1 {
-		base["tls"] = buildTLSConfig(nc, certFile, keyFile)
+		if tls := buildTLSConfig(nc, certFile, keyFile); tls != nil {
+			base["tls"] = tls
+		}
 	} else if nc.TLS == 2 {
 		base["tls"] = buildRealityConfig(nc)
 	}
@@ -504,16 +508,22 @@ func buildTrojan(base M, nc *panel.NodeConfig, users []panel.User, certFile, key
 	applyMultiplex(base, nc)
 
 	if nc.TLS == 1 {
-		base["tls"] = buildTLSConfig(nc, certFile, keyFile)
+		if tls := buildTLSConfig(nc, certFile, keyFile); tls != nil {
+			base["tls"] = tls
+		}
 	} else if nc.TLS == 2 {
 		base["tls"] = buildRealityConfig(nc)
 	}
 
-	// Trojan requires TLS or Reality to be enabled.
-	// If the panel didn't explicitly set TLS=1 or TLS=2, but we have certs,
-	// we should enable a default TLS config to ensure the inbound can start.
+	// If still no TLS/Reality but cert paths exist, enable TLS (panel may omit tls=1).
 	if _, ok := base["tls"]; !ok {
-		base["tls"] = buildTLSConfig(nc, certFile, keyFile)
+		if tls := buildTLSConfig(nc, certFile, keyFile); tls != nil {
+			base["tls"] = tls
+		}
+	}
+
+	if base["tls"] == nil {
+		nlog.Core().Warn("trojan inbound has no TLS (no certificate paths and no Reality); sing-box may refuse to start until cert_mode provides cert/key or Reality is configured")
 	}
 
 	return base
@@ -558,6 +568,10 @@ func buildHysteria(base M, nc *panel.NodeConfig, users []panel.User, certFile, k
 	}
 
 	tls := buildTLSConfig(nc, certFile, keyFile)
+	if tls == nil {
+		nlog.Core().Warn("hysteria requires TLS certificate files on disk; configure cert_mode (self, file, http, dns, or content). Sing-box will not start this inbound without tls.")
+		return base
+	}
 	// Hysteria/Hysteria2 uses QUIC and requires ALPN; default to h3 if not set.
 	if _, ok := tls["alpn"]; !ok {
 		tls["alpn"] = []string{"h3"}
@@ -584,6 +598,10 @@ func buildTUIC(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFi
 	}
 
 	tls := buildTLSConfig(nc, certFile, keyFile)
+	if tls == nil {
+		nlog.Core().Warn("tuic requires TLS certificate files on disk; configure cert_mode (self, file, http, dns, or content). Sing-box will not start this inbound without tls.")
+		return base
+	}
 	// TUIC requires ALPN for QUIC negotiation; default to h3 if not set by panel.
 	if _, ok := tls["alpn"]; !ok {
 		tls["alpn"] = []string{"h3"}
@@ -608,7 +626,11 @@ func buildAnyTLS(base M, nc *panel.NodeConfig, users []panel.User, certFile, key
 		base["padding_scheme"] = string(nc.PaddingScheme)
 	}
 
-	base["tls"] = buildTLSConfig(nc, certFile, keyFile)
+	if tls := buildTLSConfig(nc, certFile, keyFile); tls != nil {
+		base["tls"] = tls
+	} else {
+		nlog.Core().Warn("anytls requires TLS certificate files on disk; configure cert_mode (self, file, http, dns, or content). Sing-box will not start this inbound without tls.")
+	}
 	return base
 }
 
@@ -625,7 +647,9 @@ func buildNaive(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyF
 	base["users"] = userList
 
 	if nc.TLS == 1 {
-		base["tls"] = buildTLSConfig(nc, certFile, keyFile)
+		if tls := buildTLSConfig(nc, certFile, keyFile); tls != nil {
+			base["tls"] = tls
+		}
 	}
 	return base
 }
@@ -658,7 +682,9 @@ func buildHTTP(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFi
 
 	applyProxyProtocol(base, nc)
 	if nc.TLS == 1 {
-		base["tls"] = buildTLSConfig(nc, certFile, keyFile)
+		if tls := buildTLSConfig(nc, certFile, keyFile); tls != nil {
+			base["tls"] = tls
+		}
 	}
 	return base
 }
@@ -715,7 +741,15 @@ func applyTransport(base M, nc *panel.NodeConfig) {
 	base["transport"] = transport
 }
 
+// buildTLSConfig returns sing-box inbound TLS options when certificate and key paths exist.
+// If either path is missing, it returns nil: the inbound should run without a TLS layer
+// (e.g. TLS terminated at nginx/CDN while the panel still shows tls=1).
+// Sing-box does not accept a magic "self-signed" path — it tries to open that name as a file.
 func buildTLSConfig(nc *panel.NodeConfig, certFile, keyFile string) M {
+	if certFile == "" || keyFile == "" {
+		return nil
+	}
+
 	tls := M{"enabled": true}
 
 	serverName := nc.ServerName
@@ -735,15 +769,8 @@ func buildTLSConfig(nc *panel.NodeConfig, certFile, keyFile string) M {
 		}
 	}
 
-	if certFile != "" && keyFile != "" {
-		tls["certificate_path"] = certFile
-		tls["key_path"] = keyFile
-	} else {
-		// If no real certificates are provided, but TLS is requested,
-		// use a self-signed certificate as fallback to prevent sing-box
-		// from failing with "missing certificate".
-		tls["certificate_path"] = "self-signed"
-	}
+	tls["certificate_path"] = certFile
+	tls["key_path"] = keyFile
 
 	return tls
 }
