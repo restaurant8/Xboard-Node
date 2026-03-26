@@ -578,7 +578,7 @@ func (c *trackedConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
 	if n > 0 {
 		if c.us != nil {
-			c.us.download.Add(int64(n))
+			c.us.upload.Add(int64(n)) // 从入站读取 = 用户上传
 		}
 		if c.limiter != nil {
 			// Non-blocking rate limiting
@@ -626,7 +626,7 @@ func (c *trackedConn) Write(b []byte) (int, error) {
 
 	n, err := c.Conn.Write(b)
 	if n > 0 && c.us != nil {
-		c.us.upload.Add(int64(n))
+		c.us.download.Add(int64(n)) // 向入站写入 = 用户下载
 	}
 	return n, err
 }
@@ -670,14 +670,14 @@ func (c *trackedConn) UnwrapReader() (io.Reader, []N.CountFunc) {
 	if c.us == nil {
 		return c.Conn, nil
 	}
-	return c.Conn, []N.CountFunc{c.makeCountFunc(&c.us.download)}
+	return c.Conn, []N.CountFunc{c.makeCountFunc(&c.us.upload)} // 从入站读取 = 用户上传
 }
 
 func (c *trackedConn) UnwrapWriter() (io.Writer, []N.CountFunc) {
 	if c.us == nil {
 		return c.Conn, nil
 	}
-	return c.Conn, []N.CountFunc{c.makeCountFunc(&c.us.upload)}
+	return c.Conn, []N.CountFunc{c.makeCountFunc(&c.us.download)} // 向入站写入 = 用户下载
 }
 
 func (c *trackedConn) Upstream() any           { return c.Conn }
@@ -703,7 +703,7 @@ func (c *trackedPacketConn) ReadPacket(buffer *buf.Buffer) (singM.Socksaddr, err
 	if err == nil {
 		n := int64(buffer.Len())
 		if c.us != nil {
-			c.us.download.Add(n)
+			c.us.upload.Add(n) // 从入站读取 = 用户上传
 		}
 		if c.limiter != nil {
 			// Non-blocking rate limiting with context cancellation
@@ -749,7 +749,7 @@ func (c *trackedPacketConn) WritePacket(buffer *buf.Buffer, dest singM.Socksaddr
 
 	err := c.PacketConn.WritePacket(buffer, dest)
 	if err == nil && c.us != nil {
-		c.us.upload.Add(n)
+		c.us.download.Add(n) // 向入站写入 = 用户下载
 	}
 	return err
 }
