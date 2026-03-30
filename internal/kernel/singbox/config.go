@@ -460,6 +460,10 @@ func buildVMess(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyF
 }
 
 func buildVLESS(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
+	if nc.Decryption != "" && nc.Decryption != "none" {
+		nlog.Core().Warn("sing-box does not support VLESS encryption (decryption), use xray kernel for this feature")
+	}
+
 	base["type"] = "vless"
 
 	userList := make([]M, 0, len(users))

@@ -85,7 +85,7 @@ func (x *Xray) Name() string { return "xray" }
 func (x *Xray) Protocols() []string {
 	return []string{
 		"vmess", "vless", "trojan", "shadowsocks",
-		"socks", "http", "dokodemo-door",
+		"hysteria", "socks", "http", "dokodemo-door",
 	}
 }
 

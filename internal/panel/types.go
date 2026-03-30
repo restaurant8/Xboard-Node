@@ -92,6 +92,7 @@ type NodeConfig struct {
 	// VMess / VLESS
 	TLS         int                    `json:"tls,omitempty"`
 	Flow        string                 `json:"flow,omitempty"`
+	Decryption  string                 `json:"decryption,omitempty"`
 	TLSSettings map[string]interface{} `json:"tls_settings,omitempty"`
 
 	// Trojan

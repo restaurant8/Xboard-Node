@@ -192,7 +192,7 @@ func (w *WSClient) connect(ctx context.Context) error {
 	q.Set("node_id", strconv.Itoa(w.nodeID))
 	u.RawQuery = q.Encode()
 
-	nlog.Core().Debug("ws connecting", "url", u.Host)
+	nlog.Core().Debug("ws connecting", "url", u.String())
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: w.cfg.HandshakeTimeout,

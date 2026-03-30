@@ -72,7 +72,7 @@ func buildConfig(kcfg config.KernelConfig, nc *panel.NodeConfig, users []panel.U
 	} else {
 		nlog.Core().Warn("xray: unsupported protocol, no inbound configured — node will not accept connections",
 			"protocol", nc.Protocol,
-			"supported", "vmess, vless, trojan, shadowsocks, socks, http")
+			"supported", "vmess, vless, trojan, shadowsocks, hysteria, socks, http")
 	}
 
 	// Merge panel routes and static config routes
@@ -225,6 +225,8 @@ func buildInbound(nc *panel.NodeConfig, users []panel.User, certFile, keyFile st
 		return buildSocks(base, users)
 	case "http":
 		return buildHTTP(base, nc, users, certFile, keyFile)
+	case "hysteria":
+		return buildHysteria(base, nc, users, certFile, keyFile)
 	default:
 		return nil
 	}
@@ -263,9 +265,13 @@ func buildVLESS(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyF
 		}
 		clients = append(clients, client)
 	}
+	decryption := "none"
+	if nc.Decryption != "" {
+		decryption = nc.Decryption
+	}
 	base["settings"] = M{
 		"clients":    clients,
-		"decryption": "none",
+		"decryption": decryption,
 	}
 
 	applyStreamSettings(base, nc, certFile, keyFile)
@@ -389,6 +395,66 @@ func buildHTTP(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFi
 	if nc.TLS == 1 {
 		applyStreamSettings(base, nc, certFile, keyFile)
 	}
+	return base
+}
+
+// buildHysteria creates a Hysteria v2 inbound for xray-core.
+func buildHysteria(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
+	if nc.Version != 2 {
+		nlog.Core().Warn("xray: only supports hysteria v2, skipping v1 inbound")
+		return nil
+	}
+
+	clients := make([]M, 0, len(users))
+	for _, u := range users {
+		clients = append(clients, M{
+			"auth":  u.UUID,
+			"email": userEmail(u.ID),
+		})
+	}
+	base["settings"] = M{"clients": clients}
+
+	ss := M{
+		"network": "hysteria",
+		"hysteriaSettings": M{
+			"version":        nc.Version,
+			"udpIdleTimeout": 60,
+		},
+	}
+
+	if nc.UpMbps > 0 || nc.DownMbps > 0 {
+		quicParams := M{}
+		if nc.UpMbps > 0 {
+			quicParams["brutalUp"] = fmt.Sprintf("%d mbps", nc.UpMbps)
+		}
+		if nc.DownMbps > 0 {
+			quicParams["brutalDown"] = fmt.Sprintf("%d mbps", nc.DownMbps)
+		}
+		ss["finalMask"] = M{
+			"quicParams": quicParams,
+		}
+	}
+
+	if certFile != "" && keyFile != "" {
+		ss["security"] = "tls"
+		ss["tlsSettings"] = M{
+			"certificates": []M{
+				{
+					"certificateFile": certFile,
+					"keyFile":         keyFile,
+				},
+			},
+			"alpn": []string{"h3"},
+		}
+	} else {
+		nlog.Core().Warn("hysteria requires TLS certificate files; configure cert_mode (self, file, http, dns, or content)")
+	}
+
+	if nc.GetProxyProtocol() {
+		ss["sockopt"] = M{"acceptProxyProtocol": true}
+	}
+
+	base["streamSettings"] = ss
 	return base
 }
 
