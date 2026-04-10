@@ -4,13 +4,13 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/cedar2025/xboard-node/internal/panel"
+	"github.com/cedar2025/xboard-node/internal/model"
 )
 
 // Limiter enforces per-user device limits and detects removed users.
 type Limiter struct {
 	mu    sync.RWMutex
-	users map[int]panel.User
+	users map[int]model.UserSpec
 
 	// uuidDeviceLimit provides O(1) UUID→device-limit lookup for the
 	// kernel gate-keeping hot path (called per new connection).
@@ -21,18 +21,18 @@ type Limiter struct {
 
 func New() *Limiter {
 	return &Limiter{
-		users:           make(map[int]panel.User),
+		users:           make(map[int]model.UserSpec),
 		uuidDeviceLimit: make(map[string]int),
 	}
 }
 
 // UpdateUsers refreshes the user limit configuration and returns
 // the IDs of users that were present before but are now removed.
-func (l *Limiter) UpdateUsers(users []panel.User) []int {
+func (l *Limiter) UpdateUsers(users []model.UserSpec) []int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	newUsers := make(map[int]panel.User, len(users))
+	newUsers := make(map[int]model.UserSpec, len(users))
 	for _, u := range users {
 		newUsers[u.ID] = u
 	}

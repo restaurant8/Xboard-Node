@@ -4,14 +4,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cedar2025/xboard-node/internal/panel"
+	"github.com/cedar2025/xboard-node/internal/model"
 )
 
 func TestSpeedTracker_UpdateBuckets(t *testing.T) {
 	l := New()
 	st := NewSpeedTracker(l)
 
-	users := []panel.User{
+	users := []model.UserSpec{
 		{ID: 1, UUID: "u1", SpeedLimit: 3, DeviceLimit: 0},  // 3 Mbps
 		{ID: 2, UUID: "u2", SpeedLimit: 0, DeviceLimit: 0},  // unlimited
 		{ID: 3, UUID: "u3", SpeedLimit: 10, DeviceLimit: 2}, // 10 Mbps
@@ -60,7 +60,7 @@ func TestSpeedTracker_UpdateBuckets_PreservesExisting(t *testing.T) {
 	l := New()
 	st := NewSpeedTracker(l)
 
-	users := []panel.User{
+	users := []model.UserSpec{
 		{ID: 1, UUID: "u1", SpeedLimit: 3, DeviceLimit: 0},
 	}
 	l.UpdateUsers(users)
@@ -72,7 +72,7 @@ func TestSpeedTracker_UpdateBuckets_PreservesExisting(t *testing.T) {
 	}
 
 	// Update same user with different speed — should reuse same *rate.Limiter pointer
-	users2 := []panel.User{
+	users2 := []model.UserSpec{
 		{ID: 1, UUID: "u1", SpeedLimit: 5, DeviceLimit: 0},
 	}
 	l.UpdateUsers(users2)
@@ -97,7 +97,7 @@ func TestSpeedTracker_UpdateBuckets_RemovesUsers(t *testing.T) {
 	l := New()
 	st := NewSpeedTracker(l)
 
-	users := []panel.User{
+	users := []model.UserSpec{
 		{ID: 1, UUID: "u1", SpeedLimit: 3, DeviceLimit: 0},
 		{ID: 2, UUID: "u2", SpeedLimit: 5, DeviceLimit: 0},
 	}
@@ -109,7 +109,7 @@ func TestSpeedTracker_UpdateBuckets_RemovesUsers(t *testing.T) {
 	}
 
 	// Remove user 2
-	users2 := []panel.User{
+	users2 := []model.UserSpec{
 		{ID: 1, UUID: "u1", SpeedLimit: 3, DeviceLimit: 0},
 	}
 	l.UpdateUsers(users2)
@@ -128,7 +128,7 @@ func TestSpeedTracker_UpdateBuckets_RemovesUsers(t *testing.T) {
 func TestSpeedTracker_UpdateBuckets_LogCallbackMayCallLimitedUserCount(t *testing.T) {
 	l := New()
 	st := NewSpeedTracker(l)
-	l.UpdateUsers([]panel.User{{ID: 1, UUID: "u1", SpeedLimit: 1}})
+	l.UpdateUsers([]model.UserSpec{{ID: 1, UUID: "u1", SpeedLimit: 1}})
 	st.SetLogCallback(func(msg string) {
 		_ = st.LimitedUserCount()
 	})

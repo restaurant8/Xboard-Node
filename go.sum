@@ -20,6 +20,8 @@ github.com/caddyserver/certmagic v0.25.2 h1:D7xcS7ggX/WEY54x0czj7ioTkmDWKIgxtIi2
 github.com/caddyserver/certmagic v0.25.2/go.mod h1:llW/CvsNmza8S6hmsuggsZeiX+uS27dkqY27wDIuBWg=
 github.com/caddyserver/zerossl v0.1.5 h1:dkvOjBAEEtY6LIGAHei7sw2UgqSD6TrWweXpV7lvEvE=
 github.com/caddyserver/zerossl v0.1.5/go.mod h1:CxA0acn7oEGO6//4rtrRjYgEoa4MFw/XofZnrYwGqG4=
+github.com/cedar2025/Xray-core v0.0.0-20260409213332-f47935539965 h1:fuJYmFZ1N58sIA9LqzOcEhJrxeWsvBKPOR4mvZLtWig=
+github.com/cedar2025/Xray-core v0.0.0-20260409213332-f47935539965/go.mod h1:OXMlhBloFry8mw0KwWLWLd3RQyXJzEYsCGlgsX36h60=
 github.com/cedar2025/sing-box v1.14.0-alpha.2.0.20260316103356-2e665cb7e295 h1:bmtrfItcjIJ/jGfz17Ic1WBzjPP3aBdAGgagL8X5IPQ=
 github.com/cedar2025/sing-box v1.14.0-alpha.2.0.20260316103356-2e665cb7e295/go.mod h1:DTyWqWrjh/DqOHynCUgMhW8fgrkctleficRKwQmh668=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
@@ -323,8 +325,6 @@ github.com/x448/float16 v0.8.4 h1:qLwI1I70+NjRFUR3zs1JPUCgaCXSh3SW62uAKT1mSBM=
 github.com/x448/float16 v0.8.4/go.mod h1:14CWIYCyZA/cWjXOioeEpHeN/83MdbZDRQHoFcYsOfg=
 github.com/xtls/reality v0.0.0-20260322125925-9234c772ba8f h1:iy2JRioxmUpoJ3SzbFPyTxHZMbR/rSHP7dOOgYaq1O8=
 github.com/xtls/reality v0.0.0-20260322125925-9234c772ba8f/go.mod h1:DsJblcWDGt76+FVqBVwbwRhxyyNJsGV48gJLch0OOWI=
-github.com/xtls/xray-core v1.260327.0 h1:g4TzxMwyPrxslZh6uD+FiG3lXKTrnNO+b4ky2OhogHE=
-github.com/xtls/xray-core v1.260327.0/go.mod h1:OXMlhBloFry8mw0KwWLWLd3RQyXJzEYsCGlgsX36h60=
 github.com/yusufpapurcu/wmi v1.2.4 h1:zFUKzehAFReQwLys1b/iSMl+JQGSCSjtVqQn9bBrPo0=
 github.com/yusufpapurcu/wmi v1.2.4/go.mod h1:SBZ9tNy3G9/m5Oi98Zks0QjeHVDvuK0qfxQmPyzfmi0=
 github.com/zeebo/assert v1.1.0 h1:hU1L1vLTHsnO8x8c9KAR5GmM5QscxHg5RNU5z5qbUWY=

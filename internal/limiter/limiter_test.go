@@ -4,7 +4,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/cedar2025/xboard-node/internal/panel"
+	"github.com/cedar2025/xboard-node/internal/model"
 )
 
 func TestNew(t *testing.T) {
@@ -16,7 +16,7 @@ func TestNew(t *testing.T) {
 
 func TestUpdateUsers(t *testing.T) {
 	l := New()
-	users := []panel.User{
+	users := []model.UserSpec{
 		{ID: 1, UUID: "u1", SpeedLimit: 3, DeviceLimit: 2},
 		{ID: 2, UUID: "u2", SpeedLimit: 0, DeviceLimit: 0},
 	}
@@ -29,14 +29,14 @@ func TestUpdateUsers(t *testing.T) {
 
 func TestUpdateUsers_DetectsRemoved(t *testing.T) {
 	l := New()
-	l.UpdateUsers([]panel.User{
+	l.UpdateUsers([]model.UserSpec{
 		{ID: 1, UUID: "u1"},
 		{ID: 2, UUID: "u2"},
 		{ID: 3, UUID: "u3"},
 	})
 
 	// Remove user 2
-	removed := l.UpdateUsers([]panel.User{
+	removed := l.UpdateUsers([]model.UserSpec{
 		{ID: 1, UUID: "u1"},
 		{ID: 3, UUID: "u3"},
 	})
@@ -48,14 +48,14 @@ func TestUpdateUsers_DetectsRemoved(t *testing.T) {
 
 func TestUpdateUsers_DetectsMultipleRemoved(t *testing.T) {
 	l := New()
-	l.UpdateUsers([]panel.User{
+	l.UpdateUsers([]model.UserSpec{
 		{ID: 1, UUID: "u1"},
 		{ID: 2, UUID: "u2"},
 		{ID: 3, UUID: "u3"},
 	})
 
 	// Remove users 1 and 3
-	removed := l.UpdateUsers([]panel.User{
+	removed := l.UpdateUsers([]model.UserSpec{
 		{ID: 2, UUID: "u2"},
 	})
 
@@ -67,12 +67,12 @@ func TestUpdateUsers_DetectsMultipleRemoved(t *testing.T) {
 
 func TestUpdateUsers_NoRemovals(t *testing.T) {
 	l := New()
-	l.UpdateUsers([]panel.User{
+	l.UpdateUsers([]model.UserSpec{
 		{ID: 1, UUID: "u1"},
 	})
 
 	// Add user, keep existing
-	removed := l.UpdateUsers([]panel.User{
+	removed := l.UpdateUsers([]model.UserSpec{
 		{ID: 1, UUID: "u1"},
 		{ID: 2, UUID: "u2"},
 	})
@@ -84,10 +84,10 @@ func TestUpdateUsers_NoRemovals(t *testing.T) {
 
 func TestUpdateUsers_ReplacesAll(t *testing.T) {
 	l := New()
-	l.UpdateUsers([]panel.User{{ID: 1, DeviceLimit: 1}})
+	l.UpdateUsers([]model.UserSpec{{ID: 1, DeviceLimit: 1}})
 
 	// Replace with different users
-	removed := l.UpdateUsers([]panel.User{{ID: 2, DeviceLimit: 1}})
+	removed := l.UpdateUsers([]model.UserSpec{{ID: 2, DeviceLimit: 1}})
 
 	if len(removed) != 1 || removed[0] != 1 {
 		t.Errorf("expected removed=[1], got %v", removed)
@@ -96,7 +96,7 @@ func TestUpdateUsers_ReplacesAll(t *testing.T) {
 
 func TestGetDeviceLimitByUUID(t *testing.T) {
 	l := New()
-	l.UpdateUsers([]panel.User{
+	l.UpdateUsers([]model.UserSpec{
 		{ID: 1, UUID: "u1", DeviceLimit: 3},
 		{ID: 2, UUID: "u2", DeviceLimit: 0},
 	})

@@ -23,3 +23,5 @@ Thumbs.db
 vendor/
 config.json
 benchmark/
+third_party
+bench-results

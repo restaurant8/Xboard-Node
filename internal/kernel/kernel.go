@@ -7,9 +7,18 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/cedar2025/xboard-node/internal/panel"
+	"github.com/cedar2025/xboard-node/internal/model"
 	"golang.org/x/time/rate"
 )
+
+type Capabilities struct {
+	PerUserSpeedLimit    bool
+	DeviceLimit          bool
+	BuiltInTrafficStats  bool
+	AliveIPTracking      bool
+	ForceCloseConnection bool
+	ForceCloseUser       bool
+}
 
 // Kernel is the interface for proxy kernel backends (sing-box, xray, etc.).
 //
@@ -25,12 +34,14 @@ type Kernel interface {
 	Name() string
 	// Protocols returns the protocol names this kernel supports.
 	Protocols() []string
+	// Capabilities returns the explicit runtime semantics supported by the kernel.
+	Capabilities() Capabilities
 
 	// ─── Lifecycle ──────────────────────────────────────────────────────
 	// Start initialises the kernel with the given node config and initial
 	// user set, binds listeners, and begins accepting connections.
 	// Calling Start on an already-running kernel stops the old instance first.
-	Start(nodeConfig *panel.NodeConfig, users []panel.User, certFile, keyFile string) error
+	Start(nodeConfig *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) error
 	// Stop gracefully shuts down the kernel, draining active connections.
 	Stop()
 	// IsRunning returns whether the kernel is currently accepting connections.
@@ -38,21 +49,21 @@ type Kernel interface {
 	// Reload re-generates the full config and hot-swaps listeners/routes.
 	// Use this when port, protocol, or TLS settings change.
 	// Existing connections MAY be briefly interrupted.
-	Reload(nodeConfig *panel.NodeConfig, users []panel.User, certFile, keyFile string) error
+	Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) error
 
 	// ─── User management (non-disruptive) ───────────────────────────────
 	// AddUsers registers new users with the running kernel.
 	// Existing connections are unaffected. Returns the count actually added
 	// (duplicates are silently skipped).
-	AddUsers(users []panel.User) (added int, err error)
+	AddUsers(users []model.UserSpec) (added int, err error)
 	// RemoveUsers deregisters users from the running kernel.
 	// Active connections of removed users are terminated. Returns the count
 	// actually removed (unknown IDs are silently skipped).
-	RemoveUsers(users []panel.User) (removed int, err error)
+	RemoveUsers(users []model.UserSpec) (removed int, err error)
 	// UpdateUsers replaces the entire user set atomically.
 	// This is equivalent to computing the diff and calling Add/Remove, but
 	// may be more efficient for bulk changes. Returns (added, removed) counts.
-	UpdateUsers(users []panel.User) (added, removed int, err error)
+	UpdateUsers(users []model.UserSpec) (added, removed int, err error)
 
 	// ─── Observability ──────────────────────────────────────────────────
 	// GetUserTraffic returns per-user cumulative traffic counters and
@@ -81,11 +92,11 @@ type Kernel interface {
 
 // ComputeHash returns a hash of config + user identities that would
 // require a kernel restart/reconstruction if changed.
-func ComputeHash(nc *panel.NodeConfig, users []panel.User) string {
+func ComputeHash(nc *model.NodeSpec, users []model.UserSpec) string {
 	h := sha256.New()
 	configData, _ := json.Marshal(nc)
 	h.Write(configData)
-	sorted := make([]panel.User, len(users))
+	sorted := make([]model.UserSpec, len(users))
 	copy(sorted, users)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID < sorted[j].ID })
 	for _, u := range sorted {
@@ -97,12 +108,12 @@ func ComputeHash(nc *panel.NodeConfig, users []panel.User) string {
 // UserDiff computes which users to add and which to remove when transitioning
 // from oldUsers to newUsers. This is a pure helper used by callers; kernels
 // may also use it internally.
-func UserDiff(oldUsers, newUsers []panel.User) (toAdd, toRemove []panel.User) {
-	oldMap := make(map[int]panel.User, len(oldUsers))
+func UserDiff(oldUsers, newUsers []model.UserSpec) (toAdd, toRemove []model.UserSpec) {
+	oldMap := make(map[int]model.UserSpec, len(oldUsers))
 	for _, u := range oldUsers {
 		oldMap[u.ID] = u
 	}
-	newMap := make(map[int]panel.User, len(newUsers))
+	newMap := make(map[int]model.UserSpec, len(newUsers))
 	for _, u := range newUsers {
 		newMap[u.ID] = u
 	}

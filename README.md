@@ -4,6 +4,20 @@ Dedicated node backend for [Xboard](https://github.com/cedar2025/Xboard). Fully 
 
 > **Disclaimer**: This project is for educational and learning purposes only.
 
+## Overview
+
+| Item | Description |
+| --- | --- |
+| Role | Xboard-compatible node backend |
+| Kernels | `sing-box` (default), `xray-core` |
+| Protocols | V2Ray family, Trojan, Shadowsocks, Hysteria2, TUIC, Naive |
+| Modes | Panel-managed mode, `standalone` mode |
+| Sync | WebSocket push, REST polling/report fallback |
+| User controls | Per-user speed limit, device limit, alive IP tracking |
+| Runtime ops | Hot user add/remove/update |
+| Reporting | Traffic, online/alive-IP state, CPU, memory, swap, disk, connection count |
+| Deployment | Single Go service, Docker, Docker Compose |
+
 ## Install
 
 ### Docker
@@ -24,7 +38,6 @@ git clone -b compose --depth 1 https://github.com/cedar2025/xboard-node.git
 cd xboard-node
 ```
 
-
 **2. Edit local config**
 
 ```bash
@@ -37,14 +50,6 @@ vim config/config.yml
 ```bash
 docker compose up -d
 ```
-
-## Features
-
-- **Kernels**: sing-box (default) / Xray-core.
-- **Protocols**: Full coverage (V2Ray, Trojan, SS, Hysteria2, TUIC, Naive).
-- **Speed**: Kernel-level rate limiting.
-- **Sync**: Real-time WebSocket + REST fallback.
-- **Dev**: Single Go binary.
 
 ## Configuration
 
@@ -59,4 +64,3 @@ panel:
 ## License
 
 MPL-2.0.
-

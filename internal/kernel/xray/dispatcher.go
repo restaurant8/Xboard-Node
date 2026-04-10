@@ -16,7 +16,6 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
-	"golang.org/x/time/rate"
 
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
@@ -59,13 +58,13 @@ func limitDispatcherFactory(ctx context.Context, config interface{}) (interface{
 	return ld, nil
 }
 
-// LimitDispatcher wraps xray's DefaultDispatcher to add per-user device
-// limit enforcement, speed limiting, and per-user traffic counting.
+// LimitDispatcher wraps xray's DefaultDispatcher to enforce per-user
+// admission checks before a request is dispatched into xray-core.
 //
-// Architecture: traffic bytes are accumulated in per-user atomic counters
-// (not per-connection maps). IP tracking uses sync.Map for unlimited users
-// (lock-free) and RWMutex-protected map for limited users (deterministic).
-// This means GetUserTraffic() is O(users), not O(connections).
+// It intentionally does NOT mutate transport.Link.Reader/Writer. Xray's
+// mux/XUDP close path requires the original concrete *pipe.Reader to remain
+// intact, so the dispatcher is limited to gate-keeping and safe connection
+// lifecycle bookkeeping.
 type LimitDispatcher struct {
 	inner     interface{}        // original DefaultDispatcher (Feature + Dispatcher)
 	innerDisp routing.Dispatcher // same object, typed as Dispatcher
@@ -75,41 +74,30 @@ type LimitDispatcher struct {
 	mu           sync.RWMutex
 	limitedIPs   map[string]map[string]int // email → sourceIP → refcount
 	deviceLimits map[string]int            // email → max devices
-	speedLimits  map[string]int            // email → Mbps
 	emailToUID   map[string]int            // email → panel user ID
 
 	// unlimitedIPs: users without device limit — sync.Map for lock-free access.
-	// Each entry is *ipCounter{count atomic.Int64, ips sync.Map}.
+	// Each entry is *ipCounter{ips sync.Map}.
 	unlimitedIPs sync.Map // email → *ipCounter
 
-	speedBuckets sync.Map // email → *rate.Limiter
-
-	// Per-user traffic counters — lock-free atomics for the data path.
-	userTraffic sync.Map // email → *userTrafficCounter
-
-	connCount atomic.Int64 // total active connections (for metrics)
+	connCount atomic.Int64 // total active connections tracked by dispatcher
 }
 
 // ipCounter tracks IPs for unlimited users without any lock.
 type ipCounter struct {
-	count atomic.Int64 // total TCP connections (for connCount reporting)
-	ips   sync.Map     // sourceIP → *atomic.Int64 (refcount)
+	ips sync.Map // sourceIP → *atomic.Int64 (refcount)
 }
 
 // aliveIPs returns a snapshot of distinct IPs.
 func (ic *ipCounter) aliveIPs() map[string]bool {
 	result := make(map[string]bool)
 	ic.ips.Range(func(key, _ interface{}) bool {
-		result[key.(string)] = true
+		if rv, ok := ic.ips.Load(key); ok && rv.(*atomic.Int64).Load() > 0 {
+			result[key.(string)] = true
+		}
 		return true
 	})
 	return result
-}
-
-// userTrafficCounter holds per-user cumulative traffic counters.
-type userTrafficCounter struct {
-	upload   atomic.Int64
-	download atomic.Int64
 }
 
 // ─── routing.Dispatcher ──────────────────────────────────────────────────────
@@ -129,7 +117,7 @@ func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*
 	}
 
 	if email != "" {
-		d.wrapLink(ctx, link, email, sourceIP, isTCP)
+		d.trackLink(link, email, sourceIP, isTCP)
 	}
 	return link, nil
 }
@@ -141,7 +129,7 @@ func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination
 	}
 
 	if email != "" {
-		d.wrapLink(ctx, link, email, sourceIP, isTCP)
+		d.trackLink(link, email, sourceIP, isTCP)
 	}
 	return d.innerDisp.DispatchLink(ctx, dest, link)
 }
@@ -165,13 +153,10 @@ func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destina
 	return email, sourceIP, isTCP, nil
 }
 
-// wrapLink instruments a transport.Link with per-user byte counting,
-// rate limiting, and lifecycle tracking. Must only be called when email != "".
-func (d *LimitDispatcher) wrapLink(ctx context.Context, link *transport.Link, email, sourceIP string, isTCP bool) {
-	// Get or create per-user traffic counter
-	v, _ := d.userTraffic.LoadOrStore(email, &userTrafficCounter{})
-	utc := v.(*userTrafficCounter)
-
+// trackLink records connection lifecycle without mutating xray-core owned
+// transport primitives. This keeps mux/XUDP compatible while still allowing
+// the dispatcher to release device-limit state when the link closes.
+func (d *LimitDispatcher) trackLink(link *transport.Link, email, sourceIP string, isTCP bool) {
 	d.connCount.Add(1)
 
 	onClose := func() {
@@ -181,19 +166,8 @@ func (d *LimitDispatcher) wrapLink(ctx context.Context, link *transport.Link, em
 		d.connCount.Add(-1)
 	}
 
-	limiter := d.getBucket(email)
-
-	link.Reader = &statsCloseReader{
-		Reader:  link.Reader,
-		counter: &utc.upload,
-		limiter: limiter,
-		ctx:     ctx,
-	}
-	link.Writer = &statsCloseWriter{
+	link.Writer = &closeTrackingWriter{
 		Writer:  link.Writer,
-		counter: &utc.download,
-		limiter: limiter,
-		ctx:     ctx,
 		onClose: onClose,
 	}
 }
@@ -218,19 +192,12 @@ func (d *LimitDispatcher) Close() error {
 
 // ─── Limit management (called by Xray kernel) ──────────────────────────────
 
-func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits, speedLimits map[string]int) {
+func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits, _ map[string]int) {
 	d.mu.Lock()
 	d.emailToUID = emailToUID
 	d.deviceLimits = deviceLimits
-	d.speedLimits = speedLimits
 	d.mu.Unlock()
 
-	d.speedBuckets.Range(func(key, _ interface{}) bool {
-		if _, ok := speedLimits[key.(string)]; !ok {
-			d.speedBuckets.Delete(key)
-		}
-		return true
-	})
 }
 
 func (d *LimitDispatcher) ResetConns() {
@@ -244,21 +211,12 @@ func (d *LimitDispatcher) ResetConns() {
 		return true
 	})
 
-	d.userTraffic.Range(func(key, _ interface{}) bool {
-		d.userTraffic.Delete(key)
-		return true
-	})
 	d.connCount.Store(0)
-
-	d.speedBuckets.Range(func(key, _ interface{}) bool {
-		d.speedBuckets.Delete(key)
-		return true
-	})
 }
 
-// GetUserTraffic returns per-user cumulative traffic and alive IPs.
-// O(users), not O(connections).
-func (d *LimitDispatcher) GetUserTraffic() (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int) {
+// GetConnectionState returns dispatcher-tracked alive IPs and connection count.
+// Traffic bytes are intentionally left to xray's built-in stats pipeline.
+func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool, connCount int) {
 	d.mu.RLock()
 	emailToUID := d.emailToUID
 	limitedIPs := d.limitedIPs
@@ -302,22 +260,6 @@ func (d *LimitDispatcher) GetUserTraffic() (traffic map[int][2]int64, aliveIPs m
 		return true
 	})
 
-	traffic = make(map[int][2]int64)
-	d.userTraffic.Range(func(key, value interface{}) bool {
-		email := key.(string)
-		utc := value.(*userTrafficCounter)
-		uid := emailToUID[email]
-		if uid == 0 {
-			return true
-		}
-		up := utc.upload.Load()
-		down := utc.download.Load()
-		if up > 0 || down > 0 {
-			traffic[uid] = [2]int64{up, down}
-		}
-		return true
-	})
-
 	connCount = int(d.connCount.Load())
 	return
 }
@@ -337,7 +279,6 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) b
 		if isTCP {
 			v, _ := d.unlimitedIPs.LoadOrStore(email, &ipCounter{})
 			ic := v.(*ipCounter)
-			ic.count.Add(1)
 
 			// Increment IP refcount atomically.
 			rv, _ := ic.ips.LoadOrStore(sourceIP, &atomic.Int64{})
@@ -445,93 +386,20 @@ func (d *LimitDispatcher) delConn(email, sourceIP string) {
 	}
 }
 
-func (d *LimitDispatcher) getBucket(email string) *rate.Limiter {
-	d.mu.RLock()
-	mbps, ok := d.speedLimits[email]
-	d.mu.RUnlock()
-	if !ok || mbps <= 0 {
-		return nil
-	}
-	bytesPerSec := int(mbps) * 1_000_000 / 8
-	burst := bytesPerSec
-	if burst < 64*1024 {
-		burst = 64 * 1024
-	}
-	v, loaded := d.speedBuckets.LoadOrStore(email, rate.NewLimiter(rate.Limit(bytesPerSec), burst))
-	lim := v.(*rate.Limiter)
-	if loaded {
-		// Update existing limiter in case speed limit changed.
-		lim.SetLimit(rate.Limit(bytesPerSec))
-		lim.SetBurst(burst)
-	}
-	return lim
-}
-
-// ─── I/O wrappers ───────────────────────────────────────────────────────────
-
-const xrayRateLimitThreshold = 64 * 1024
-
-type statsCloseReader struct {
-	buf.Reader
-	counter       *atomic.Int64
-	limiter       *rate.Limiter
-	ctx           context.Context
-	pendingTokens atomic.Int64
-}
-
-func (r *statsCloseReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
-	mb, err := r.Reader.ReadMultiBuffer()
-	if n := int64(mb.Len()); n > 0 {
-		r.counter.Add(n)
-		if r.limiter != nil {
-			if pending := r.pendingTokens.Add(n); pending >= xrayRateLimitThreshold {
-				tokens := int(r.pendingTokens.Swap(0))
-				if burst := r.limiter.Burst(); tokens > burst {
-					tokens = burst
-				}
-				_ = r.limiter.WaitN(r.ctx, tokens)
-			}
-		}
-	}
-	return mb, err
-}
-
-func (r *statsCloseReader) Close() error { return common.Close(r.Reader) }
-func (r *statsCloseReader) Interrupt()   { common.Interrupt(r.Reader) }
-
-type statsCloseWriter struct {
+type closeTrackingWriter struct {
 	buf.Writer
-	counter       *atomic.Int64
-	limiter       *rate.Limiter
-	ctx           context.Context
-	onClose       func()
-	closed        atomic.Bool
-	pendingTokens atomic.Int64
+	onClose func()
+	closed  atomic.Bool
 }
 
-func (w *statsCloseWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	n := int64(mb.Len())
-	if w.limiter != nil {
-		if pending := w.pendingTokens.Add(n); pending >= xrayRateLimitThreshold {
-			tokens := int(w.pendingTokens.Swap(0))
-			if burst := w.limiter.Burst(); tokens > burst {
-				tokens = burst
-			}
-			_ = w.limiter.WaitN(w.ctx, tokens)
-		}
-	}
-	w.counter.Add(n)
-	return w.Writer.WriteMultiBuffer(mb)
-}
-
-func (w *statsCloseWriter) Close() error {
+func (w *closeTrackingWriter) Close() error {
 	if w.closed.CompareAndSwap(false, true) {
 		w.onClose()
 	}
 	return common.Close(w.Writer)
 }
 
-func (w *statsCloseWriter) Interrupt() {
+func (w *closeTrackingWriter) Interrupt() {
 	if w.closed.CompareAndSwap(false, true) {
 		w.onClose()
 	}

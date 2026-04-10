@@ -17,6 +17,7 @@ import (
 	xrayCore "github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/stats"
+	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	"github.com/xtls/xray-core/infra/conf/serial"
 	xrayProxy "github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/shadowsocks"
@@ -32,7 +33,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/kernel/geodata"
 	"github.com/cedar2025/xboard-node/internal/nlog"
-	"github.com/cedar2025/xboard-node/internal/panel"
+	"github.com/cedar2025/xboard-node/internal/model"
 )
 
 const (
@@ -59,14 +60,15 @@ type Xray struct {
 	mu              sync.Mutex
 	instance        *xrayCore.Instance
 	limitDispatcher *LimitDispatcher
-	users           []panel.User
-	nodeConfig      *panel.NodeConfig
+	users           []model.UserSpec
+	nodeConfig      *model.NodeSpec
 	certFile        string
 	keyFile         string
 	protocol        string
 	inboundTag      string
 	lastKernelHash  string
 	cumTraffic      map[int][2]int64
+	speedLimitFunc  func(string) *rate.Limiter
 
 	// running is set after a successful Start and cleared before shutdown.
 	// Atomic so IsRunning / GetConnections never block.
@@ -81,6 +83,17 @@ func New(cfg config.KernelConfig) *Xray {
 }
 
 func (x *Xray) Name() string { return "xray" }
+
+func (x *Xray) Capabilities() kernel.Capabilities {
+	return kernel.Capabilities{
+		PerUserSpeedLimit:    true,
+		DeviceLimit:          true,
+		BuiltInTrafficStats:  true,
+		AliveIPTracking:      true,
+		ForceCloseConnection: false,
+		ForceCloseUser:       false,
+	}
+}
 
 func (x *Xray) Protocols() []string {
 	return []string{
@@ -102,7 +115,7 @@ func (x *Xray) Protocols() []string {
 //	Phase 3 – StartNew:   instance.Start            (no lock, potentially slow)
 //	Phase 4 – Swap:       store new, extract old     (brief kernel lock)
 //	Phase 5 – RecycleOld: close old in background    (non-blocking)
-func (x *Xray) Start(nodeConfig *panel.NodeConfig, users []panel.User, certFile, keyFile string) error {
+func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) error {
 	// ── Phase 1: Build config (no shared state) ─────────────────────────
 	x.ensureGeoData(nodeConfig)
 
@@ -152,6 +165,7 @@ func (x *Xray) Start(nodeConfig *panel.NodeConfig, users []panel.User, certFile,
 	closeOld(old, oldLD)
 
 	x.updateDispatcherLimits(users)
+	x.updateBandwidthLimits(users)
 
 	nlog.Core().Info("xray started",
 		"users", len(users),
@@ -164,8 +178,9 @@ func (x *Xray) Start(nodeConfig *panel.NodeConfig, users []panel.User, certFile,
 // Since Xray does not support granular inbound reconstruction without an
 // instance restart for most transport/TLS settings, it triggers a full restart
 // if any kernel-affecting fields (hash mismatch) have changed.
-func (x *Xray) Reload(nodeConfig *panel.NodeConfig, users []panel.User, certFile, keyFile string) error {
+func (x *Xray) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) error {
 	x.updateDispatcherLimits(users)
+	x.updateBandwidthLimits(users)
 
 	newHash := kernel.ComputeHash(nodeConfig, users)
 
@@ -204,8 +219,10 @@ func (x *Xray) IsRunning() bool { return x.running.Load() }
 
 // ─── Observability ──────────────────────────────────────────────────────────
 
-// GetUserTraffic returns per-user cumulative traffic and alive IPs.
-// Reads from LimitDispatcher's per-user atomic counters — O(users).
+// GetUserTraffic returns per-user cumulative traffic from xray's built-in
+// stats pipeline and connection state from the admission dispatcher when
+// available. The dispatcher intentionally no longer wraps transport links,
+// so traffic accounting must come from xray-core itself.
 func (x *Xray) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error) {
 	if !x.running.Load() {
 		return nil, nil, 0, nil
@@ -213,18 +230,16 @@ func (x *Xray) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliv
 
 	x.mu.Lock()
 	ld := x.limitDispatcher
-	x.mu.Unlock()
-
-	if ld != nil {
-		traffic, aliveIPs, connCount = ld.GetUserTraffic()
-		return traffic, aliveIPs, connCount, nil
-	}
-
-	// Fallback path: aggregateStats needs x.mu.
-	x.mu.Lock()
 	traffic, err = x.aggregateStats()
 	x.mu.Unlock()
-	return traffic, nil, 0, err
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	if ld != nil {
+		aliveIPs, connCount = ld.GetConnectionState()
+	}
+	return traffic, aliveIPs, connCount, nil
 }
 
 func (x *Xray) CloseConnection(_ context.Context, _ string) error {
@@ -238,7 +253,15 @@ func (x *Xray) CloseUserConnections(_ context.Context, _ string) error {
 	return nil
 }
 
-func (x *Xray) SetSpeedLimitFunc(_ func(string) *rate.Limiter) {}
+// SetSpeedLimitFunc wires xray's patched bandwidth feature to the shared
+// per-user limiter callback used by the service layer. Unlike the old no-op
+// behavior, xray now consumes this callback to support dynamic speed updates.
+func (x *Xray) SetSpeedLimitFunc(fn func(string) *rate.Limiter) {
+	x.mu.Lock()
+	x.speedLimitFunc = fn
+	x.mu.Unlock()
+	x.updateBandwidthLimits(nil)
+}
 
 // SetDeviceLimitFunc is a no-op for xray — device limits are already
 // gate-kept by LimitDispatcher.checkDeviceLimit at Dispatch time.
@@ -260,7 +283,7 @@ func (x *Xray) ClearGlobalDevices() {}
 // Delta "add" events also carry property updates (speed/device limits) for
 // existing users, so this method always merges properties and refreshes the
 // dispatcher limits — even when no brand-new users need to be added.
-func (x *Xray) AddUsers(users []panel.User) (int, error) {
+func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 	x.mu.Lock()
 	if x.instance == nil {
 		x.mu.Unlock()
@@ -268,18 +291,18 @@ func (x *Xray) AddUsers(users []panel.User) (int, error) {
 	}
 
 	// Merge: overwrite existing users' properties, collect truly new ones.
-	userMap := make(map[int]panel.User, len(x.users))
+	userMap := make(map[int]model.UserSpec, len(x.users))
 	for _, u := range x.users {
 		userMap[u.ID] = u
 	}
-	var toAdd []panel.User
+	var toAdd []model.UserSpec
 	for _, u := range users {
 		if _, exists := userMap[u.ID]; !exists {
 			toAdd = append(toAdd, u)
 		}
 		userMap[u.ID] = u // always overwrite properties
 	}
-	merged := make([]panel.User, 0, len(userMap))
+	merged := make([]model.UserSpec, 0, len(userMap))
 	for _, u := range userMap {
 		merged = append(merged, u)
 	}
@@ -289,6 +312,7 @@ func (x *Xray) AddUsers(users []panel.User) (int, error) {
 		x.users = merged
 		x.mu.Unlock()
 		x.updateDispatcherLimits(merged)
+	x.updateBandwidthLimits(merged)
 		return 0, nil
 	}
 
@@ -328,6 +352,7 @@ func (x *Xray) AddUsers(users []panel.User) (int, error) {
 	x.users = merged
 	x.mu.Unlock()
 	x.updateDispatcherLimits(merged)
+	x.updateBandwidthLimits(merged)
 
 	nlog.Core().Info("xray: users added via UserManager", "added", added, "total", len(merged))
 	return added, nil
@@ -335,7 +360,7 @@ func (x *Xray) AddUsers(users []panel.User) (int, error) {
 
 // RemoveUsers removes users from the running kernel via xray's UserManager API.
 // Truly hitless for supported protocols — remaining connections unaffected.
-func (x *Xray) RemoveUsers(users []panel.User) (int, error) {
+func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 	x.mu.Lock()
 	if x.instance == nil {
 		x.mu.Unlock()
@@ -345,7 +370,7 @@ func (x *Xray) RemoveUsers(users []panel.User) (int, error) {
 	for _, u := range users {
 		removeSet[u.ID] = struct{}{}
 	}
-	var kept []panel.User
+	var kept []model.UserSpec
 	removed := 0
 	for _, u := range x.users {
 		if _, rm := removeSet[u.ID]; rm {
@@ -392,6 +417,7 @@ func (x *Xray) RemoveUsers(users []panel.User) (int, error) {
 	x.users = kept
 	x.mu.Unlock()
 	x.updateDispatcherLimits(kept)
+	x.updateBandwidthLimits(kept)
 
 	nlog.Core().Info("xray: users removed via UserManager", "removed", actualRemoved, "total", len(kept))
 	return actualRemoved, nil
@@ -400,7 +426,7 @@ func (x *Xray) RemoveUsers(users []panel.User) (int, error) {
 // UpdateUsers replaces the entire user set. If only speed/device limits
 // changed, updates the dispatcher without restarting. Otherwise uses
 // UserManager for hitless add/remove where supported.
-func (x *Xray) UpdateUsers(users []panel.User) (added, removed int, err error) {
+func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err error) {
 	x.mu.Lock()
 	if x.instance == nil {
 		x.mu.Unlock()
@@ -414,6 +440,7 @@ func (x *Xray) UpdateUsers(users []panel.User) (added, removed int, err error) {
 		x.users = users
 		x.mu.Unlock()
 		x.updateDispatcherLimits(users)
+		x.updateBandwidthLimits(users)
 		nlog.Core().Info("xray: limits updated, kernel unchanged")
 		return 0, 0, nil
 	}
@@ -458,6 +485,7 @@ func (x *Xray) UpdateUsers(users []panel.User) (added, removed int, err error) {
 	x.users = users
 	x.mu.Unlock()
 	x.updateDispatcherLimits(users)
+	x.updateBandwidthLimits(users)
 
 	nlog.Core().Info("xray: users updated via UserManager", "added", added, "removed", removed, "total", len(users))
 	return
@@ -502,9 +530,9 @@ func (x *Xray) getUserManager() (xrayProxy.UserManager, error) {
 	return um, nil
 }
 
-// toMemoryUser converts a panel.User into an xray protocol.MemoryUser for the
+// toMemoryUser converts a model.UserSpec into an xray protocol.MemoryUser for the
 // given protocol. Each protocol needs a different Account type.
-func toMemoryUser(proto string, nc *panel.NodeConfig, u panel.User) (*protocol.MemoryUser, error) {
+func toMemoryUser(proto string, nc *model.NodeSpec, u model.UserSpec) (*protocol.MemoryUser, error) {
 	email := userEmail(u.ID)
 	mu := &protocol.MemoryUser{Email: email, Level: 0}
 
@@ -598,7 +626,7 @@ func hexEncode(dst, src []byte) {
 }
 
 // ensureGeoData downloads geo databases when routes reference geoip/geosite.
-func (x *Xray) ensureGeoData(nc *panel.NodeConfig) {
+func (x *Xray) ensureGeoData(nc *model.NodeSpec) {
 	needIP, needSite := kernel.NeedsGeoIP(nc.Routes), kernel.NeedsGeoSite(nc.Routes)
 	if !needIP && !needSite {
 		return
@@ -611,7 +639,7 @@ func (x *Xray) ensureGeoData(nc *panel.NodeConfig) {
 }
 
 // marshalConfig builds the xray JSON config and returns the raw bytes.
-func marshalConfig(cfg config.KernelConfig, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) ([]byte, error) {
+func marshalConfig(cfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) ([]byte, error) {
 	cfgMap := buildConfig(cfg, nc, users, certFile, keyFile)
 	data, err := json.MarshalIndent(cfgMap, "", "  ")
 	if err != nil {
@@ -712,9 +740,44 @@ func (x *Xray) aggregateStats() (map[int][2]int64, error) {
 	return traffic, nil
 }
 
+// updateBandwidthLimits configures the patched xray-core bandwidth feature
+// with per-user speed limits in bytes per second.
+func (x *Xray) updateBandwidthLimits(users []model.UserSpec) {
+	x.mu.Lock()
+	inst := x.instance
+	fn := x.speedLimitFunc
+	currentUsers := x.users
+	x.mu.Unlock()
+	if inst == nil {
+		return
+	}
+	feat := inst.GetFeature(featurebandwidth.ManagerType())
+	if feat == nil {
+		return
+	}
+	bm, ok := feat.(featurebandwidth.Manager)
+	if !ok {
+		return
+	}
+	bm.Reset()
+	if users == nil {
+		users = currentUsers
+	}
+	for _, u := range users {
+		email := userEmail(u.ID)
+		if fn != nil {
+			bm.SetUserLimiter(email, fn(u.UUID))
+			continue
+		}
+		bps := int64(u.SpeedLimit) * 1_000_000 / 8
+		bm.SetUserLimit(email, bps)
+	}
+}
+
 // updateDispatcherLimits configures the LimitDispatcher with per-user
-// device and speed limits.
-func (x *Xray) updateDispatcherLimits(users []panel.User) {
+// device-limit admission metadata only. Speed limits are enforced by the
+// patched xray-core bandwidth feature.
+func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
 	x.mu.Lock()
 	ld := x.limitDispatcher
 	x.mu.Unlock()
@@ -724,7 +787,6 @@ func (x *Xray) updateDispatcherLimits(users []panel.User) {
 
 	emailToUID := make(map[string]int, len(users)*2)
 	deviceLimits := make(map[string]int)
-	speedLimits := make(map[string]int)
 
 	for _, u := range users {
 		email := userEmail(u.ID)
@@ -734,13 +796,9 @@ func (x *Xray) updateDispatcherLimits(users []panel.User) {
 			deviceLimits[email] = u.DeviceLimit
 			deviceLimits[u.UUID] = u.DeviceLimit
 		}
-		if u.SpeedLimit > 0 {
-			speedLimits[email] = u.SpeedLimit
-			speedLimits[u.UUID] = u.SpeedLimit
-		}
 	}
 
-	ld.UpdateLimits(emailToUID, deviceLimits, speedLimits)
+	ld.UpdateLimits(emailToUID, deviceLimits, nil)
 }
 
 // xrayCreationMu serialises xrayCore.New() + globalLimitDispatcher capture

@@ -267,3 +267,59 @@ node:
 		t.Errorf("pull_interval: got %d", cfg.Node.PullInterval)
 	}
 }
+
+func TestLoad_StandaloneConfig(t *testing.T) {
+	path := writeTemp(t, `
+standalone:
+  enabled: true
+  node:
+    protocol: "vless"
+    server_port: 8443
+    network: "ws"
+    tls: 1
+    network_settings:
+      path: "/ws"
+  users:
+    - id: 1
+      uuid: "11111111-1111-1111-1111-111111111111"
+kernel:
+  type: xray
+cert:
+  cert_mode: none
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.IsStandalone() {
+		t.Fatal("expected standalone mode to be enabled")
+	}
+	if cfg.Standalone.Node.Protocol != "vless" {
+		t.Errorf("standalone.node.protocol: got %q", cfg.Standalone.Node.Protocol)
+	}
+	if cfg.Standalone.Node.ServerPort != 8443 {
+		t.Errorf("standalone.node.server_port: got %d", cfg.Standalone.Node.ServerPort)
+	}
+	if len(cfg.Standalone.Users) != 1 {
+		t.Fatalf("standalone.users: got %d", len(cfg.Standalone.Users))
+	}
+	if cfg.Standalone.Users[0].UUID != "11111111-1111-1111-1111-111111111111" {
+		t.Errorf("standalone.users[0].uuid: got %q", cfg.Standalone.Users[0].UUID)
+	}
+}
+
+func TestLoad_StandaloneRequiresUsers(t *testing.T) {
+	path := writeTemp(t, `
+standalone:
+  enabled: true
+  node:
+    protocol: "trojan"
+    server_port: 443
+kernel:
+  type: singbox
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for standalone mode without users")
+	}
+}

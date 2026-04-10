@@ -10,15 +10,15 @@ import (
 
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
+	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/nlog"
-	"github.com/cedar2025/xboard-node/internal/panel"
 	"github.com/go-viper/mapstructure/v2"
 )
 
 // M is a shorthand for building JSON-like maps
 type M = map[string]interface{}
 
-func buildConfig(kcfg config.KernelConfig, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
+func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
 	var outbounds []M
 	tags := make(map[string]bool)
 
@@ -80,7 +80,7 @@ func buildConfig(kcfg config.KernelConfig, nc *panel.NodeConfig, users []panel.U
 // outboundConfigToSingbox converts a structured OutboundConfig (from the panel)
 // into a sing-box outbound object. sing-box uses a flat layout where all
 // protocol-specific fields sit at the top level alongside "type" and "tag".
-func outboundConfigToSingbox(oc panel.OutboundConfig) M {
+func outboundConfigToSingbox(oc model.OutboundConfig) M {
 	m := M{
 		"type": oc.Protocol,
 		"tag":  oc.Tag,
@@ -144,7 +144,7 @@ func mergeRouteList(a, b []map[string]any) []map[string]any {
 	return res
 }
 
-func buildRoutes(panelRoutes []panel.RouteRule, custom []map[string]any) M {
+func buildRoutes(panelRoutes []model.RouteRule, custom []map[string]any) M {
 	var rules []M
 
 	// Custom Routes (Panel-pushed or Local) go FIRST to have highest priority
@@ -326,7 +326,7 @@ func mergeCustomSingboxRoute(cfg M, customRoute map[string]any) {
 	}
 }
 
-func buildInbound(nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
+func buildInbound(nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
 	base := M{
 		"tag":         nc.Protocol + "-in",
 		"listen":      "::",
@@ -361,7 +361,7 @@ func buildInbound(nc *panel.NodeConfig, users []panel.User, certFile, keyFile st
 	}
 }
 
-func buildMieru(base M, nc *panel.NodeConfig, users []panel.User) M {
+func buildMieru(base M, nc *model.NodeSpec, users []model.UserSpec) M {
 	base["type"] = "mieru"
 	if nc.Transport != "" {
 		base["transport"] = nc.Transport
@@ -392,7 +392,7 @@ var ss2022Methods = map[string]ss2022Config{
 	"2022-blake3-chacha20-poly1305": {"2022-blake3-chacha20-poly1305", 32},
 }
 
-func buildShadowsocks(base M, nc *panel.NodeConfig, users []panel.User) M {
+func buildShadowsocks(base M, nc *model.NodeSpec, users []model.UserSpec) M {
 	base["type"] = "shadowsocks"
 	base["method"] = nc.Cipher
 
@@ -433,7 +433,7 @@ func buildShadowsocks(base M, nc *panel.NodeConfig, users []panel.User) M {
 	return base
 }
 
-func buildVMess(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
+func buildVMess(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
 	base["type"] = "vmess"
 
 	userList := make([]M, 0, len(users))
@@ -459,7 +459,7 @@ func buildVMess(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyF
 	return base
 }
 
-func buildVLESS(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
+func buildVLESS(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
 	if nc.Decryption != "" && nc.Decryption != "none" {
 		nlog.Core().Warn("sing-box does not support VLESS encryption (decryption), use xray kernel for this feature")
 	}
@@ -494,7 +494,7 @@ func buildVLESS(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyF
 	return base
 }
 
-func buildTrojan(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
+func buildTrojan(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
 	base["type"] = "trojan"
 
 	userList := make([]M, len(users))
@@ -533,7 +533,7 @@ func buildTrojan(base M, nc *panel.NodeConfig, users []panel.User, certFile, key
 	return base
 }
 
-func buildHysteria(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
+func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
 	if nc.Version == 2 {
 		base["type"] = "hysteria2"
 
@@ -584,7 +584,7 @@ func buildHysteria(base M, nc *panel.NodeConfig, users []panel.User, certFile, k
 	return base
 }
 
-func buildTUIC(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
+func buildTUIC(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
 	base["type"] = "tuic"
 
 	userList := make([]M, 0, len(users))
@@ -614,7 +614,7 @@ func buildTUIC(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFi
 	return base
 }
 
-func buildAnyTLS(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
+func buildAnyTLS(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
 	base["type"] = "anytls"
 
 	userList := make([]M, 0, len(users))
@@ -627,7 +627,7 @@ func buildAnyTLS(base M, nc *panel.NodeConfig, users []panel.User, certFile, key
 	base["users"] = userList
 
 	if nc.PaddingScheme != "" {
-		base["padding_scheme"] = string(nc.PaddingScheme)
+		base["padding_scheme"] = nc.PaddingScheme
 	}
 
 	if tls := buildTLSConfig(nc, certFile, keyFile); tls != nil {
@@ -638,7 +638,7 @@ func buildAnyTLS(base M, nc *panel.NodeConfig, users []panel.User, certFile, key
 	return base
 }
 
-func buildNaive(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
+func buildNaive(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
 	base["type"] = "naive"
 
 	userList := make([]M, 0, len(users))
@@ -658,7 +658,7 @@ func buildNaive(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyF
 	return base
 }
 
-func buildSocks(base M, users []panel.User) M {
+func buildSocks(base M, users []model.UserSpec) M {
 	base["type"] = "socks"
 
 	userList := make([]M, 0, len(users))
@@ -672,7 +672,7 @@ func buildSocks(base M, users []panel.User) M {
 	return base
 }
 
-func buildHTTP(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
+func buildHTTP(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
 	base["type"] = "http"
 
 	userList := make([]M, 0, len(users))
@@ -693,7 +693,7 @@ func buildHTTP(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFi
 	return base
 }
 
-func applyTransport(base M, nc *panel.NodeConfig) {
+func applyTransport(base M, nc *model.NodeSpec) {
 	if nc.Network == "" || nc.Network == "tcp" {
 		return
 	}
@@ -723,6 +723,8 @@ func applyTransport(base M, nc *panel.NodeConfig) {
 		case "grpc":
 			if v, ok := nc.NetworkSettings["serviceName"]; ok {
 				transport["service_name"] = v
+			} else if v, ok := nc.NetworkSettings["service_name"]; ok {
+				transport["service_name"] = v
 			}
 		case "httpupgrade":
 			if v, ok := nc.NetworkSettings["path"]; ok {
@@ -749,7 +751,7 @@ func applyTransport(base M, nc *panel.NodeConfig) {
 // If either path is missing, it returns nil: the inbound should run without a TLS layer
 // (e.g. TLS terminated at nginx/CDN while the panel still shows tls=1).
 // Sing-box does not accept a magic "self-signed" path — it tries to open that name as a file.
-func buildTLSConfig(nc *panel.NodeConfig, certFile, keyFile string) M {
+func buildTLSConfig(nc *model.NodeSpec, certFile, keyFile string) M {
 	if certFile == "" || keyFile == "" {
 		return nil
 	}
@@ -779,7 +781,7 @@ func buildTLSConfig(nc *panel.NodeConfig, certFile, keyFile string) M {
 	return tls
 }
 
-func buildRealityConfig(nc *panel.NodeConfig) M {
+func buildRealityConfig(nc *model.NodeSpec) M {
 	tls := M{"enabled": true}
 	if nc.TLSSettings == nil {
 		return tls
@@ -845,7 +847,7 @@ func buildRealityConfig(nc *panel.NodeConfig) M {
 	return tls
 }
 
-func applyMultiplex(base M, nc *panel.NodeConfig) {
+func applyMultiplex(base M, nc *model.NodeSpec) {
 	if nc.Multiplex == nil || !nc.Multiplex.Enabled {
 		return
 	}
@@ -873,7 +875,7 @@ func applyMultiplex(base M, nc *panel.NodeConfig) {
 	base["multiplex"] = mux
 }
 
-func applyProxyProtocol(base M, nc *panel.NodeConfig) {
+func applyProxyProtocol(base M, nc *model.NodeSpec) {
 	// if !nc.GetProxyProtocol() {
 	// 	return
 	// }

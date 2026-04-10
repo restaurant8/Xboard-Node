@@ -2,90 +2,86 @@
 # Copy this file to config.yml and modify as needed
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MINIMAL CONFIGURATION (Recommended)
-# Most settings (Node ID, Kernel, TLS, Rules) can be managed via the Panel.
+# PANEL MODE (Default)
+# Connect to an Xboard panel for config / users / reporting.
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Panel connection settings
 panel:
-  # Xboard panel URL (required)
+  # Xboard panel URL (required in panel mode)
   url: "https://panel.example.com"
-  # Server communication token (required, must match panel settings)
+  # Server communication token (required in panel mode)
   token: "your-server-token"
   # Node ID as configured in the panel
   node_id: 1
 
-# Kernel settings (optional defaults)
+# Kernel settings (used by both panel mode and standalone mode)
 kernel:
   # Kernel type: "singbox" (default) or "xray"
   type: "singbox"
   # Directory to store generated configs (default: /etc/xboard-node)
   config_dir: "/etc/xboard-node"
-  # Kernel log level: debug/info/warn/error (default: warn, can be overridden by panel)
+  # Kernel log level: debug/info/warn/error (default: warn)
   log_level: "warn"
 
-# TLS certificate settings (optional, can be managed by panel)
+# TLS certificate settings
 # cert_mode: "http" | "dns" | "self" | "file" | "none"
-#   http  - ACME HTTP-01 challenge (requires port 80 open to internet)
-#   dns   - ACME DNS-01 challenge (supports wildcard certs, requires dns_provider)
-#   self  - self-signed certificate (valid 10 years, no external dependency)
-#   file  - manually specify cert_file / key_file
-#   none  - no TLS (default)
 cert:
   cert_mode: "none"
-  # Domain for ACME or self-signed cert
   # domain: "node.example.com"
-  # Email for ACME registration
   # email: "admin@example.com"
-
-  # ── HTTP-01 mode ──
-  # http_port: 80               # local port for ACME challenge (default: 80)
-
-  # ── DNS-01 mode ──
-  # dns_provider: "cloudflare"   # supported: cloudflare, alidns
-  # dns_env:                     # provider-specific credentials
+  # http_port: 80
+  # dns_provider: "cloudflare"
+  # dns_env:
   #   CF_API_TOKEN: "your-cloudflare-api-token"
-
-  # ── File mode ──
   # cert_file: "/etc/ssl/certs/cert.pem"
   # key_file: "/etc/ssl/private/key.pem"
-
-  # Storage directory for auto certs (default: {config_dir}/certs)
   # cert_dir: "/etc/xboard-node/certs"
 
-# Logging settings
 log:
-  # Node log level: debug/info/warn/error (default: info)
   level: "info"
-  # Log output: stdout/stderr or file path (default: stdout)
   output: "stdout"
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ADVANCED / MULTI-NODE MODE
-# Run multiple nodes with one configuration file.
-# Each node gets its own isolated working directory.
-# ══════════════════════════════════════════════════════════════════════════════
+# Standalone mode runs the node entirely from local config and never contacts
+# the panel. When enabled, panel.* is ignored.
+#
+# standalone:
+#   enabled: true
+#   node:
+#     protocol: "vless"
+#     listen_ip: "::"
+#     server_port: 8443
+#     network: "ws"
+#     tls: 1
+#     host: "node.example.com"
+#     server_name: "node.example.com"
+#     network_settings:
+#       path: "/app"
+#       host: "node.example.com"
+#     routes:
+#       - match: ["geoip:private"]
+#         action: "direct"
+#   users:
+#     - id: 1
+#       uuid: "11111111-1111-1111-1111-111111111111"
+#       speed_limit: 0
+#       device_limit: 0
+
+# Advanced / multi-node panel mode
 # When `nodes:` is present, the top-level `panel.node_id` is ignored.
 #
 # nodes:
 #   - node_id: 1
-#
 #   - node_id: 2
-#     # Optional overrides per node
-#     kernel_type: "xray"
 #     cert:
 #       auto_tls: true
 #       domain: "node2.example.com"
-#
 #   - node_id: 3
 #     kernel:
 #       config_dir: "/etc/xboard-node/custom-node-3"
 
 # Runtime memory tuning (optional)
 # runtime:
-#   # Soft memory limit (e.g. "30MiB", "512MiB")
 #   gomemlimit: ""
-#   # GOGC target percentage (default: 100)
 #   gogc: 0
 
 # Health check endpoint for Docker/K8s (optional, 0 = disabled)

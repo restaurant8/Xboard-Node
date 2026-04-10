@@ -21,6 +21,8 @@ type Config struct {
 	Log     LogConfig     `yaml:"log"`
 	Runtime RuntimeConfig `yaml:"runtime"`
 	WS      WSConfig      `yaml:"ws"`
+	// Standalone enables a local-only node that never contacts the panel.
+	Standalone *StandaloneConfig `yaml:"standalone,omitempty"`
 	// HealthPort enables a lightweight HTTP health-check endpoint on the
 	// given port (e.g. 65530). 0 = disabled (default).
 	HealthPort int `yaml:"health_port"`
@@ -278,19 +280,25 @@ func (c *Config) setDefaults() {
 }
 
 func (c *Config) validate() error {
-	if c.Panel.URL == "" {
-		return fmt.Errorf("panel.url is required")
-	}
-	if c.Panel.Token == "" {
-		return fmt.Errorf("panel.token is required")
-	}
-	// In multi-node mode panel.node_id is optional; validate each NodeEntry instead.
-	if len(c.Nodes) == 0 && c.Panel.NodeID <= 0 {
-		return fmt.Errorf("panel.node_id must be positive (or use 'nodes:' for multi-node)")
-	}
-	for i, n := range c.Nodes {
-		if n.NodeID <= 0 {
-			return fmt.Errorf("nodes[%d].node_id must be positive", i)
+	if c.IsStandalone() {
+		if err := c.validateStandalone(); err != nil {
+			return err
+		}
+	} else {
+		if c.Panel.URL == "" {
+			return fmt.Errorf("panel.url is required")
+		}
+		if c.Panel.Token == "" {
+			return fmt.Errorf("panel.token is required")
+		}
+		// In multi-node mode panel.node_id is optional; validate each NodeEntry instead.
+		if len(c.Nodes) == 0 && c.Panel.NodeID <= 0 {
+			return fmt.Errorf("panel.node_id must be positive (or use 'nodes:' for multi-node)")
+		}
+		for i, n := range c.Nodes {
+			if n.NodeID <= 0 {
+				return fmt.Errorf("nodes[%d].node_id must be positive", i)
+			}
 		}
 	}
 	switch c.Kernel.Type {

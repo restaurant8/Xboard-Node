@@ -7,14 +7,14 @@ import (
 
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
+	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/nlog"
-	"github.com/cedar2025/xboard-node/internal/panel"
 )
 
 // M is a shorthand for building JSON-like maps
 type M = map[string]interface{}
 
-func buildConfig(kcfg config.KernelConfig, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
+func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
 	var outbounds []M
 	tags := make(map[string]bool)
 
@@ -85,7 +85,7 @@ func buildConfig(kcfg config.KernelConfig, nc *panel.NodeConfig, users []panel.U
 // outboundConfigToXray converts a structured OutboundConfig (from the panel)
 // into an Xray outbound object. Xray uses a nested layout where protocol-
 // specific fields go inside a "settings" key, and chain proxying uses "proxySettings".
-func outboundConfigToXray(oc panel.OutboundConfig) M {
+func outboundConfigToXray(oc model.OutboundConfig) M {
 	m := M{
 		"protocol": oc.Protocol,
 		"tag":      oc.Tag,
@@ -195,7 +195,7 @@ func xrayLogLevel(singboxLevel string) string {
 	}
 }
 
-func buildInbound(nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
+func buildInbound(nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
 	listenAddr := "::"
 	if nc.ListenIP != "" {
 		listenAddr = nc.ListenIP
@@ -238,7 +238,7 @@ func userEmail(userID int) string {
 	return fmt.Sprintf("user@%d", userID)
 }
 
-func buildVMess(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
+func buildVMess(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
 	clients := make([]M, 0, len(users))
 	for _, u := range users {
 		clients = append(clients, M{
@@ -253,7 +253,7 @@ func buildVMess(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyF
 	return base
 }
 
-func buildVLESS(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
+func buildVLESS(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
 	clients := make([]M, 0, len(users))
 	for _, u := range users {
 		client := M{
@@ -278,7 +278,7 @@ func buildVLESS(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyF
 	return base
 }
 
-func buildTrojan(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
+func buildTrojan(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
 	clients := make([]M, len(users))
 	for i := range users {
 		u := &users[i]
@@ -314,7 +314,7 @@ var ss2022Methods = map[string]ss2022Config{
 	"2022-blake3-chacha20-poly1305": {"2022-blake3-chacha20-poly1305", 32},
 }
 
-func buildShadowsocks(base M, nc *panel.NodeConfig, users []panel.User) M {
+func buildShadowsocks(base M, nc *model.NodeSpec, users []model.UserSpec) M {
 	ss2022, isSS2022 := ss2022Methods[nc.Cipher]
 
 	clients := make([]M, 0, len(users))
@@ -360,7 +360,7 @@ func buildShadowsocks(base M, nc *panel.NodeConfig, users []panel.User) M {
 	return base
 }
 
-func buildSocks(base M, users []panel.User) M {
+func buildSocks(base M, users []model.UserSpec) M {
 	base["protocol"] = "socks"
 	accounts := make([]M, 0, len(users))
 	for _, u := range users {
@@ -378,7 +378,7 @@ func buildSocks(base M, users []panel.User) M {
 	return base
 }
 
-func buildHTTP(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
+func buildHTTP(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
 	base["protocol"] = "http"
 	accounts := make([]M, 0, len(users))
 	for _, u := range users {
@@ -399,7 +399,7 @@ func buildHTTP(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFi
 }
 
 // buildHysteria creates a Hysteria v2 inbound for xray-core.
-func buildHysteria(base M, nc *panel.NodeConfig, users []panel.User, certFile, keyFile string) M {
+func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
 	if nc.Version != 2 {
 		nlog.Core().Warn("xray: only supports hysteria v2, skipping v1 inbound")
 		return nil
@@ -458,7 +458,7 @@ func buildHysteria(base M, nc *panel.NodeConfig, users []panel.User, certFile, k
 	return base
 }
 
-func applyStreamSettings(base M, nc *panel.NodeConfig, certFile, keyFile string) {
+func applyStreamSettings(base M, nc *model.NodeSpec, certFile, keyFile string) {
 	ss := M{}
 
 	// Network / transport
@@ -496,6 +496,8 @@ func applyStreamSettings(base M, nc *panel.NodeConfig, certFile, keyFile string)
 		grpcSettings := M{}
 		if nc.NetworkSettings != nil {
 			if v, ok := nc.NetworkSettings["serviceName"]; ok {
+				grpcSettings["serviceName"] = v
+			} else if v, ok := nc.NetworkSettings["service_name"]; ok {
 				grpcSettings["serviceName"] = v
 			}
 		}
@@ -577,7 +579,7 @@ func applyStreamSettings(base M, nc *panel.NodeConfig, certFile, keyFile string)
 	base["streamSettings"] = ss
 }
 
-func buildRealitySettings(nc *panel.NodeConfig) M {
+func buildRealitySettings(nc *model.NodeSpec) M {
 	reality := M{"show": false}
 
 	if nc.TLSSettings == nil {
@@ -614,7 +616,7 @@ func buildRealitySettings(nc *panel.NodeConfig) M {
 	return reality
 }
 
-func buildRouting(rules []panel.RouteRule, customRules []map[string]any) M {
+func buildRouting(rules []model.RouteRule, customRules []map[string]any) M {
 	var xrayRules []M
 
 	// Custom route rules (from Panel CustomRoutes or local config) have HIGHEST priority

@@ -4,7 +4,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/cedar2025/xboard-node/internal/panel"
+	"github.com/cedar2025/xboard-node/internal/model"
 	"golang.org/x/time/rate"
 )
 
@@ -45,7 +45,7 @@ func (t *SpeedTracker) SetLogCallback(f SpeedTrackerLogCallback) {
 
 // UpdateBuckets updates the UUID→userID mapping and syncs existing limiters.
 func (t *SpeedTracker) UpdateBuckets() {
-	currentUsers := make([]panel.User, 0, 32)
+	currentUsers := make([]model.UserSpec, 0, 32)
 	t.limiter.mu.RLock()
 	for _, u := range t.limiter.users {
 		currentUsers = append(currentUsers, u)
