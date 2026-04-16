@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -179,6 +181,8 @@ func run(args []string) error {
 	case "version", "-v", "--version":
 		fmt.Printf("xbctl %s (built %s)\n", version, buildTime)
 		return nil
+	case "config":
+		return runConfig(args[1:])
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
@@ -194,6 +198,8 @@ func printUsage() {
   xbctl list [--output text|json]
   xbctl instance list [--output text|json]
   xbctl instance get <id> [--output text|json]
+  xbctl config init --mode node|machine --panel-url URL --token TOKEN [flags]
+  xbctl config health-port [--config PATH]
   xbctl service status|start|stop|restart|logs
   xbctl health
   xbctl bind add-node --panel URL --token TOKEN --node-id ID [--node-type TYPE] [--kernel singbox|xray]
@@ -624,46 +630,11 @@ func pruneCredentialKeys(path string, removed []config.Config) error {
 }
 
 func writeInstallMeta(path string, root *config.RootConfig) error {
-	versionValue := "unknown"
+	ver := "unknown"
 	if meta, err := loadInstallMeta(path); err == nil && strings.TrimSpace(meta.Version) != "" {
-		versionValue = meta.Version
+		ver = meta.Version
 	}
-	instances := normalizeRootInstances(root)
-	items := make([]instanceSummary, 0, len(instances))
-	latestID := ""
-	for _, inst := range instances {
-		id, err := inst.AutoInstanceID()
-		if err != nil {
-			return err
-		}
-		latestID = id
-		item := instanceSummary{
-			ID:         id,
-			PanelURL:   inst.Panel.URL,
-			Mode:       instanceMode(inst),
-			NodeID:     intPtr(inst.Panel.NodeID),
-			MachineID:  machineIDPtr(&inst),
-			HealthPort: inst.HealthPort,
-		}
-		if item.Mode == "machine" {
-			item.NodeID = nil
-		}
-		items = append(items, item)
-	}
-	meta := installMeta{
-		ConfigMode:       "instances",
-		Version:          versionValue,
-		LatestInstanceID: latestID,
-		InstanceCount:    len(items),
-		Instances:        items,
-		UpdatedAt:        time.Now().UTC().Format("2006-01-02T15:04:05Z"),
-	}
-	data, err := json.MarshalIndent(meta, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal install meta: %w", err)
-	}
-	data = append(data, '\n')
-	return os.WriteFile(path, data, 0o644)
+	return writeInstallMetaVersioned(path, root, ver, "")
 }
 
 func instanceMode(inst config.Config) string {
@@ -791,4 +762,377 @@ func machineIDPtr(cfg *config.Config) *int {
 	}
 	vv := cfg.Machine.MachineID
 	return &vv
+}
+
+// ── config subcommand ─────────────────────────────────────────────────
+
+func runConfig(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: xbctl config <init|health-port>")
+	}
+	switch args[0] {
+	case "init":
+		return runConfigInit(args[1:])
+	case "health-port":
+		return runConfigHealthPort(args[1:])
+	default:
+		return fmt.Errorf("unknown config command: %s", args[0])
+	}
+}
+
+// runConfigInit generates/merges an instance into config.yml, writes
+// credentials.env and install-meta.json. It replaces the Python PY_INST,
+// PY_CFG, PY_ENV, and PY_META heredoc blocks in install.sh.
+//
+// Output (stdout, one per line):
+//
+//	INSTANCE_ID=<generated-id>
+//	ENV_KEY=<credential-env-var-name>
+func runConfigInit(args []string) error {
+	var (
+		configIn       string
+		configOut      string
+		credentialsIn  string
+		credentialsOut string
+		metaPath       string
+		mode           string
+		panelURL       string
+		nodeID         int
+		nodeType       string
+		machineID      int
+		kernelType     string
+		healthPort     int
+		gomemlimit     string
+		gogc           int
+		installRoot    string
+		token          string
+		releaseVersion string
+	)
+
+	for i := 0; i < len(args); i++ {
+		if i+1 >= len(args) {
+			break
+		}
+		switch args[i] {
+		case "--config":
+			i++
+			configIn = args[i]
+		case "--output":
+			i++
+			configOut = args[i]
+		case "--credentials-in":
+			i++
+			credentialsIn = args[i]
+		case "--credentials-out":
+			i++
+			credentialsOut = args[i]
+		case "--meta":
+			i++
+			metaPath = args[i]
+		case "--mode":
+			i++
+			mode = args[i]
+		case "--panel-url":
+			i++
+			panelURL = args[i]
+		case "--node-id":
+			i++
+			v, err := strconv.Atoi(args[i])
+			if err != nil {
+				return fmt.Errorf("invalid --node-id: %w", err)
+			}
+			nodeID = v
+		case "--node-type":
+			i++
+			nodeType = args[i]
+		case "--machine-id":
+			i++
+			v, err := strconv.Atoi(args[i])
+			if err != nil {
+				return fmt.Errorf("invalid --machine-id: %w", err)
+			}
+			machineID = v
+		case "--kernel":
+			i++
+			kernelType = args[i]
+		case "--health-port":
+			i++
+			v, err := strconv.Atoi(args[i])
+			if err != nil {
+				return fmt.Errorf("invalid --health-port: %w", err)
+			}
+			healthPort = v
+		case "--gomemlimit":
+			i++
+			gomemlimit = args[i]
+		case "--gogc":
+			i++
+			v, err := strconv.Atoi(args[i])
+			if err != nil {
+				return fmt.Errorf("invalid --gogc: %w", err)
+			}
+			gogc = v
+		case "--install-root":
+			i++
+			installRoot = args[i]
+		case "--token":
+			i++
+			token = args[i]
+		case "--version":
+			i++
+			releaseVersion = args[i]
+		}
+	}
+
+	if mode == "" {
+		return errors.New("--mode is required (node or machine)")
+	}
+	if panelURL == "" {
+		return errors.New("--panel-url is required")
+	}
+	if mode == "node" && nodeID <= 0 {
+		return errors.New("--node-id is required for node mode")
+	}
+	if mode == "machine" && machineID <= 0 {
+		return errors.New("--machine-id is required for machine mode")
+	}
+
+	// Build the new instance.
+	inst := config.Config{
+		Panel: config.PanelConfig{URL: panelURL},
+		Kernel: config.KernelConfig{
+			Type:     kernelType,
+			LogLevel: "warn",
+		},
+		Log:        config.LogConfig{Level: "info", Output: "stdout"},
+		HealthPort: healthPort,
+	}
+
+	if mode == "machine" {
+		inst.Machine = &config.MachineConfig{MachineID: machineID}
+	} else {
+		inst.Panel.NodeID = nodeID
+		if nodeType != "" {
+			inst.Panel.NodeType = nodeType
+		}
+	}
+
+	// Generate deterministic instance ID.
+	instanceID, err := inst.AutoInstanceID()
+	if err != nil {
+		return fmt.Errorf("generate instance ID: %w", err)
+	}
+	inst.InstanceID = instanceID
+
+	if installRoot == "" {
+		installRoot = "/etc/xboard-node"
+	}
+	inst.Kernel.ConfigDir = filepath.Join(installRoot, "instances", instanceID)
+
+	// Build credential env key.
+	envKey := "INSTANCE_" + strings.ToUpper(strings.ReplaceAll(instanceID, "-", "_"))
+	if mode == "machine" {
+		envKey += "_MACHINE_TOKEN"
+		inst.Machine.TokenEnv = envKey
+	} else {
+		envKey += "_API_KEY"
+		inst.Panel.TokenEnv = envKey
+	}
+
+	if gomemlimit != "" {
+		inst.Runtime.GoMemLimit = gomemlimit
+	}
+	if gogc > 0 {
+		inst.Runtime.GoGCPercent = gogc
+	}
+
+	// Load existing config (if any).
+	root := &config.RootConfig{}
+	hasExisting := false
+	if configIn != "" {
+		if loaded, loadErr := loadWritableRootConfig(configIn); loadErr == nil {
+			root = loaded
+			hasExisting = len(root.Instances) > 0 || root.Config.Panel.URL != "" || root.Config.Kernel.Type != ""
+		}
+	}
+
+	// Normalise existing instance IDs so dedup works correctly.
+	var instances []config.Config
+	if hasExisting {
+		instances = normalizeRootInstances(root)
+		seen := make(map[string]bool)
+		deduped := make([]config.Config, 0, len(instances))
+		for _, existing := range instances {
+			autoID, idErr := existing.AutoInstanceID()
+			if idErr == nil && autoID != "" {
+				existing.InstanceID = autoID
+			}
+			id := existing.InstanceID
+			if id != "" && seen[id] {
+				continue
+			}
+			if id != "" {
+				seen[id] = true
+			}
+			deduped = append(deduped, existing)
+		}
+		instances = deduped
+	}
+
+	// Merge: replace if same ID exists, otherwise append.
+	replaced := false
+	for i, existing := range instances {
+		if existing.InstanceID == instanceID {
+			instances[i] = inst
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		instances = append(instances, inst)
+	}
+	root.Instances = instances
+
+	// Write config.
+	if configOut == "" {
+		configOut = configIn
+	}
+	if configOut == "" {
+		return errors.New("--output (or --config) is required")
+	}
+	if err := writeRootConfig(configOut, root); err != nil {
+		return err
+	}
+
+	// Write credentials.
+	if token != "" && credentialsOut != "" {
+		if err := mergeCredentials(credentialsIn, credentialsOut, envKey, token); err != nil {
+			return err
+		}
+	}
+
+	// Write install-meta.json.
+	if metaPath != "" {
+		if err := writeInstallMetaVersioned(metaPath, root, releaseVersion, instanceID); err != nil {
+			return err
+		}
+	}
+
+	// Output for bash capture.
+	fmt.Printf("INSTANCE_ID=%s\n", instanceID)
+	fmt.Printf("ENV_KEY=%s\n", envKey)
+	return nil
+}
+
+// mergeCredentials reads existing key=value credentials, adds/replaces
+// the given key, and writes the result preserving insertion order.
+func mergeCredentials(srcPath, dstPath, key, value string) error {
+	entries := make(map[string]string)
+	var order []string
+	if srcPath != "" {
+		data, err := os.ReadFile(srcPath)
+		if err == nil {
+			for _, raw := range strings.Split(string(data), "\n") {
+				line := strings.TrimSpace(raw)
+				if line == "" || strings.HasPrefix(line, "#") || !strings.Contains(line, "=") {
+					continue
+				}
+				k, v, _ := strings.Cut(line, "=")
+				if _, exists := entries[k]; !exists {
+					order = append(order, k)
+				}
+				entries[k] = v
+			}
+		}
+	}
+	if _, exists := entries[key]; !exists {
+		order = append(order, key)
+	}
+	entries[key] = value
+
+	var buf strings.Builder
+	for _, k := range order {
+		fmt.Fprintf(&buf, "%s=%s\n", k, entries[k])
+	}
+	return os.WriteFile(dstPath, []byte(buf.String()), 0o600)
+}
+
+// writeInstallMetaVersioned writes install-meta.json with an explicit
+// version and latest-instance-ID. When latestID is empty, the last
+// instance in the config is used (backward compat with writeInstallMeta).
+func writeInstallMetaVersioned(path string, root *config.RootConfig, ver, latestID string) error {
+	if ver == "" {
+		ver = "unknown"
+	}
+	instances := normalizeRootInstances(root)
+	items := make([]instanceSummary, 0, len(instances))
+	for _, inst := range instances {
+		id, err := inst.AutoInstanceID()
+		if err != nil {
+			return err
+		}
+		if latestID == "" {
+			latestID = id
+		}
+		item := instanceSummary{
+			ID:         id,
+			PanelURL:   inst.Panel.URL,
+			Mode:       instanceMode(inst),
+			NodeID:     intPtr(inst.Panel.NodeID),
+			MachineID:  machineIDPtr(&inst),
+			HealthPort: inst.HealthPort,
+		}
+		if item.Mode == "machine" {
+			item.NodeID = nil
+		}
+		items = append(items, item)
+	}
+	meta := installMeta{
+		ConfigMode:       "instances",
+		Version:          ver,
+		LatestInstanceID: latestID,
+		InstanceCount:    len(items),
+		Instances:        items,
+		UpdatedAt:        time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+	}
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal install meta: %w", err)
+	}
+	data = append(data, '\n')
+	return os.WriteFile(path, data, 0o644)
+}
+
+// runConfigHealthPort reads health_port from an existing config file and
+// prints it to stdout. Exits silently if the file does not exist or has
+// no health_port.
+func runConfigHealthPort(args []string) error {
+	cfgPath := defaultConfigPath
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--config" && i+1 < len(args) {
+			i++
+			cfgPath = args[i]
+		}
+	}
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return nil // file not found → no health port
+	}
+	root := &config.RootConfig{}
+	if err := yaml.Unmarshal(data, root); err != nil {
+		return nil
+	}
+	// Check instances first, then legacy top-level.
+	if len(root.Instances) > 0 {
+		for _, inst := range root.Instances {
+			if inst.HealthPort > 0 {
+				fmt.Println(inst.HealthPort)
+				return nil
+			}
+		}
+	}
+	if root.Config.HealthPort > 0 {
+		fmt.Println(root.Config.HealthPort)
+	}
+	return nil
 }

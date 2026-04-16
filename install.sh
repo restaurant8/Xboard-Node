@@ -77,20 +77,12 @@ load_health_port_from_config() {
         return
     fi
     local parsed
-    parsed=$(python3 - "$cfg_path" <<'PYCFG'
-import sys
-try:
-    import yaml
-except Exception:
-    sys.exit(0)
-with open(sys.argv[1], 'r', encoding='utf-8') as f:
-    data = yaml.safe_load(f) or {}
-port = data.get('health_port', 0)
-if isinstance(port, int):
-    print(port)
-PYCFG
-)
-    if [ -n "$parsed" ] && [[ "$parsed" =~ ^[0-9]+$ ]]; then
+    if [ -x "$CLI_PATH" ]; then
+        parsed=$("$CLI_PATH" config health-port --config "$cfg_path" 2>/dev/null)
+    else
+        parsed=$(grep -m1 'health_port:' "$cfg_path" 2>/dev/null | sed 's/.*health_port:[[:space:]]*//' | tr -cd '0-9')
+    fi
+    if [ -n "$parsed" ] && [ "$parsed" -ge 0 ] 2>/dev/null; then
         HEALTH_PORT="$parsed"
         if [ "$HEALTH_PORT" -eq 0 ]; then
             HEALTH_ENABLED=0
@@ -449,17 +441,6 @@ validate_install_request() {
     esac
 }
 
-json_escape() {
-    python3 - <<'PY' "$1"
-import json, sys
-print(json.dumps(sys.argv[1]))
-PY
-}
-
-current_mode() { :; }
-
-current_target() { :; }
-
 detect_current_state() {
     local has_binary=0 has_config=0 has_service=0
     [ -x "$BINARY_PATH" ] && has_binary=1
@@ -562,229 +543,49 @@ stage_xbctl() {
     fi
 }
 
-render_runtime_block() {
-    local output=""
-    if [ -n "$RUNTIME_GOMEMLIMIT" ] || [ -n "$RUNTIME_GOGC" ]; then
-        output+=$'runtime:\n'
-        if [ -n "$RUNTIME_GOMEMLIMIT" ]; then
-            output+="  gomemlimit: \"${RUNTIME_GOMEMLIMIT}\"\n"
-        fi
-        if [ -n "$RUNTIME_GOGC" ]; then
-            output+="  gogc: ${RUNTIME_GOGC}\n"
-        fi
-    fi
-    printf '%b' "$output"
-}
-
 render_config() {
-    INSTANCE_ID=$(python3 - "$MODE" "$PANEL_URL" "$NODE_ID" "$MACHINE_ID" <<'PY_INST'
-import hashlib
-import sys
-from urllib.parse import urlparse
-mode, panel_url, node_id, machine_id = sys.argv[1:]
-node_id = int(node_id or 0)
-machine_id = int(machine_id or 0)
-u = urlparse((panel_url or '').strip())
-if not u.scheme or not u.netloc:
-    raise SystemExit(f"invalid panel url: {panel_url}")
-scheme = u.scheme.lower()
-host = u.netloc.lower()
-path = u.path.rstrip('/')
-normalized = f"{scheme}://{host}{path}"
-slug_src = f"{host}{('-' + path.strip('/')) if path.strip('/') else ''}".lower()
-slug = []
-last_dash = False
-for ch in slug_src:
-    if ch.isalnum():
-        slug.append(ch)
-        last_dash = False
-    elif not last_dash:
-        slug.append('-')
-        last_dash = True
-slug = ''.join(slug).strip('-') or 'panel'
-slug = (slug[:48].strip('-') or 'panel')
-target_value = str(machine_id) if mode == "machine" else str(node_id)
-target_label = f"machine-{machine_id}" if mode == "machine" else f"node-{node_id}"
-short = hashlib.sha1(f"{normalized}|{mode}|{target_value}".encode()).hexdigest()[:6]
-print(f"{slug}-{target_label}-{short}")
-PY_INST
-)
-
-    python3 - "$CONFIG_FILE" "$TMP_DIR/config.yml" "$MODE" "$PANEL_URL" "$NODE_ID" "$NODE_TYPE" "$MACHINE_ID" "$KERNEL_TYPE" "$HEALTH_PORT" "$RUNTIME_GOMEMLIMIT" "$RUNTIME_GOGC" "$INSTALL_ROOT" "$INSTANCE_ID" <<'PY_CFG'
-import os
-import sys
-from copy import deepcopy
-import yaml
-config_file, out_file, mode, panel_url, node_id, node_type, machine_id, kernel_type, health_port, gomemlimit, gogc, install_root, instance_id = sys.argv[1:]
-node_id = int(node_id or 0)
-machine_id = int(machine_id or 0)
-health_port = int(health_port or 0)
-if os.path.exists(config_file):
-    with open(config_file, 'r', encoding='utf-8') as f:
-        data = yaml.safe_load(f) or {}
-else:
-    data = {}
-legacy_keys = ["panel", "node", "kernel", "cert", "log", "runtime", "ws", "standalone", "health_port", "nodes", "machine"]
-instances = data.get("instances")
-if not isinstance(instances, list):
-    instances = []
-    if any(k in data for k in legacy_keys):
-        legacy = {k: deepcopy(data[k]) for k in legacy_keys if k in data}
-        if legacy:
-            instances.append(legacy)
-for k in legacy_keys:
-    data.pop(k, None)
-
-def normalize_existing_id(inst):
-    panel = inst.get("panel") or {}
-    machine = inst.get("machine") or {}
-    panel_url_existing = panel.get("url", "")
-    from urllib.parse import urlparse
-    u = urlparse((panel_url_existing or '').strip())
-    if not u.scheme or not u.netloc:
-        return inst.get("id", "")
-    normalized_existing = f"{u.scheme.lower()}://{u.netloc.lower()}{u.path.rstrip('/')}"
-    if machine and machine.get("machine_id"):
-        existing_mode = "machine"
-        target_value = str(machine.get("machine_id"))
-        target_label = f"machine-{machine.get('machine_id')}"
-    else:
-        existing_mode = "node"
-        target_value = str(panel.get("node_id", 0))
-        target_label = f"node-{panel.get('node_id', 0)}"
-    slug_src = f"{u.netloc.lower()}{('-' + u.path.rstrip('/').strip('/')) if u.path.rstrip('/').strip('/') else ''}".lower()
-    slug = []
-    last_dash = False
-    for ch in slug_src:
-        if ch.isalnum():
-            slug.append(ch)
-            last_dash = False
-        elif not last_dash:
-            slug.append('-')
-            last_dash = True
-    slug = ''.join(slug).strip('-') or 'panel'
-    slug = (slug[:48].strip('-') or 'panel')
-    short = __import__('hashlib').sha1(f"{normalized_existing}|{existing_mode}|{target_value}".encode()).hexdigest()[:6]
-    return f"{slug}-{target_label}-{short}"
-
-normalized_instances = []
-seen_ids = set()
-for inst in instances:
-    inst = deepcopy(inst)
-    normalized_id = normalize_existing_id(inst)
-    if normalized_id:
-        inst["id"] = normalized_id
-    current_id = inst.get("id")
-    if current_id and current_id in seen_ids:
-        continue
-    if current_id:
-        seen_ids.add(current_id)
-    normalized_instances.append(inst)
-instances = normalized_instances
-
-env_key = f"INSTANCE_{instance_id.upper().replace('-', '_')}_{'MACHINE_TOKEN' if mode == 'machine' else 'API_KEY'}"
-new_inst = {
-    "id": instance_id,
-    "panel": {"url": panel_url},
-    "kernel": {
-        "type": kernel_type,
-        "config_dir": f"{install_root}/instances/{instance_id}",
-        "log_level": "warn",
-    },
-    "log": {"level": "info", "output": "stdout"},
-}
-if health_port > 0:
-    new_inst["health_port"] = health_port
-if gomemlimit or gogc:
-    new_inst["runtime"] = {}
-    if gomemlimit:
-        new_inst["runtime"]["gomemlimit"] = gomemlimit
-    if gogc:
-        new_inst["runtime"]["gogc"] = int(gogc)
-if mode == 'machine':
-    new_inst["machine"] = {"machine_id": machine_id, "token_env": env_key}
-else:
-    new_inst["panel"]["node_id"] = node_id
-    new_inst["panel"]["token_env"] = env_key
-    if node_type:
-        new_inst["panel"]["node_type"] = node_type
-    new_inst["node"] = {"push_interval": 0, "pull_interval": 0}
-replaced = False
-for i, inst in enumerate(instances):
-    if inst.get("id") == instance_id:
-        instances[i] = new_inst
-        replaced = True
-        break
-if not replaced:
-    instances.append(new_inst)
-data["instances"] = instances
-with open(out_file, 'w', encoding='utf-8') as f:
-    yaml.safe_dump(data, f, sort_keys=False, allow_unicode=False)
-PY_CFG
-
-    local env_key
-    if [ "$MODE" = "machine" ]; then
-        env_key="INSTANCE_$(printf '%s' "$INSTANCE_ID" | tr '[:lower:]-' '[:upper:]_')_MACHINE_TOKEN"
-    else
-        env_key="INSTANCE_$(printf '%s' "$INSTANCE_ID" | tr '[:lower:]-' '[:upper:]_')_API_KEY"
+    local init_args=(
+        config init
+        --mode "$MODE"
+        --panel-url "$PANEL_URL"
+        --kernel "${KERNEL_TYPE:-singbox}"
+        --health-port "${HEALTH_PORT:-0}"
+        --token "$TOKEN"
+        --version "$RELEASE_VERSION"
+        --output "$TMP_DIR/config.yml"
+        --credentials-out "$TMP_DIR/credentials.env"
+        --meta "$TMP_DIR/install-meta.json"
+        --install-root "$INSTALL_ROOT"
+    )
+    if [ -f "$CONFIG_FILE" ]; then
+        init_args+=(--config "$CONFIG_FILE")
     fi
-    python3 - "$CREDENTIALS_FILE" "$TMP_DIR/credentials.env" "$env_key" "$TOKEN" <<'PY_ENV'
-import os
-import sys
-src, out, key, value = sys.argv[1:]
-entries = {}
-order = []
-if os.path.exists(src):
-    with open(src, 'r', encoding='utf-8') as f:
-        for raw in f:
-            line = raw.rstrip('\n')
-            if not line or line.startswith('#') or '=' not in line:
-                continue
-            k, v = line.split('=', 1)
-            if k not in entries:
-                order.append(k)
-            entries[k] = v
-if key not in entries:
-    order.append(key)
-entries[key] = value
-with open(out, 'w', encoding='utf-8') as f:
-    for k in order:
-        f.write(f"{k}={entries[k]}\n")
-PY_ENV
-    chmod 600 "$TMP_DIR/credentials.env"
-}
+    if [ -f "$CREDENTIALS_FILE" ]; then
+        init_args+=(--credentials-in "$CREDENTIALS_FILE")
+    fi
+    if [ "$MODE" = "machine" ]; then
+        init_args+=(--machine-id "$MACHINE_ID")
+    else
+        init_args+=(--node-id "$NODE_ID")
+        if [ -n "$NODE_TYPE" ]; then
+            init_args+=(--node-type "$NODE_TYPE")
+        fi
+    fi
+    if [ -n "$RUNTIME_GOMEMLIMIT" ]; then
+        init_args+=(--gomemlimit "$RUNTIME_GOMEMLIMIT")
+    fi
+    if [ -n "$RUNTIME_GOGC" ] && [ "$RUNTIME_GOGC" -gt 0 ] 2>/dev/null; then
+        init_args+=(--gogc "$RUNTIME_GOGC")
+    fi
 
-render_install_meta() {
-    python3 - "$TMP_DIR/config.yml" "$TMP_DIR/install-meta.json" "$RELEASE_VERSION" "$INSTANCE_ID" <<'PY_META'
-import json
-import sys
-import yaml
-from datetime import datetime, timezone
-cfg_path, out_path, version, latest_id = sys.argv[1:]
-with open(cfg_path, 'r', encoding='utf-8') as f:
-    data = yaml.safe_load(f) or {}
-instances = []
-for inst in data.get('instances', []) or []:
-    item = {
-        'id': inst.get('id', ''),
-        'panel_url': ((inst.get('panel') or {}).get('url', '')),
-        'mode': 'machine' if inst.get('machine') else ('standalone' if inst.get('standalone') else 'node'),
-        'node_id': ((inst.get('panel') or {}).get('node_id')),
-        'machine_id': ((inst.get('machine') or {}).get('machine_id')),
-        'health_port': inst.get('health_port', 0),
+    local output
+    output=$("$TMP_DIR/xbctl" "${init_args[@]}") || {
+        log_error "xbctl config init failed"
+        exit 1
     }
-    instances.append(item)
-meta = {
-    'config_mode': 'instances',
-    'version': version,
-    'latest_instance_id': latest_id,
-    'instance_count': len(instances),
-    'instances': instances,
-    'updated_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-}
-with open(out_path, 'w', encoding='utf-8') as f:
-    json.dump(meta, f, indent=2)
-PY_META
+
+    INSTANCE_ID=$(echo "$output" | grep '^INSTANCE_ID=' | cut -d= -f2-)
+    chmod 600 "$TMP_DIR/credentials.env"
 }
 
 render_service() {
@@ -850,7 +651,7 @@ install_staged_files() {
     install -m 600 "$TMP_DIR/config.yml" "$CONFIG_FILE"
     install -m 600 "$TMP_DIR/credentials.env" "$CREDENTIALS_FILE"
     install -m 644 "$TMP_DIR/install-meta.json" "$INSTALL_META"
-    if [ "$(realpath "$0")" != "$(realpath "$INSTALLER_COPY_PATH" 2>/dev/null || echo "$INSTALLER_COPY_PATH")" ]; then
+    if [ -f "$0" ] && [ "$(realpath "$0")" != "$(realpath "$INSTALLER_COPY_PATH" 2>/dev/null || echo "$INSTALLER_COPY_PATH")" ]; then
         install -m 755 "$0" "$INSTALLER_COPY_PATH"
     fi
     install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
@@ -909,7 +710,6 @@ perform_install() {
     stage_binary
     stage_xbctl
     render_config
-    render_install_meta
     render_service
     backup_existing_state
     install_staged_files
@@ -972,12 +772,11 @@ perform_uninstall() {
     fi
     rm -f "$BINARY_PATH"
     rm -f "$CLI_PATH"
-    rm -f "$INSTALL_META"
     if [ "$PURGE" -eq 1 ]; then
         rm -rf "$INSTALL_ROOT"
         log_info "Removed ${INSTALL_ROOT}"
     else
-        rm -f "$CONFIG_FILE" "$CREDENTIALS_FILE"
+        rm -f "$INSTALL_META"
         log_info "Config preserved under ${INSTALL_ROOT}"
     fi
     log_info "Uninstall complete"
@@ -990,27 +789,17 @@ perform_status() {
     echo "  state:   ${CURRENT_STATE}"
     if [ -f "$INSTALL_META" ]; then
         echo "  meta:    ${INSTALL_META}"
-        python3 - "$INSTALL_META" <<'PY'
-import json, sys
-with open(sys.argv[1]) as f:
-    data = json.load(f)
-config_mode = data.get("config_mode")
-if config_mode:
-    print(f"  config_mode: {config_mode}")
-for key in ("mode", "panel_url", "kernel", "node_id", "machine_id", "health_port", "version", "updated_at", "latest_instance_id", "instance_count"):
-    if key in data:
-        print(f"  {key}: {data[key]}")
-instances = data.get("instances") or []
-if instances:
-    print("  instances:")
-    for item in instances:
-        mode = item.get("mode", "")
-        panel_url = item.get("panel_url", "")
-        node_id = item.get("node_id")
-        machine_id = item.get("machine_id")
-        target = f"node_id={node_id}" if node_id else (f"machine_id={machine_id}" if machine_id else "")
-        print(f"    - id={item.get('id','')} mode={mode} panel_url={panel_url} {target}".rstrip())
-PY
+        if [ -x "$CLI_PATH" ]; then
+            "$CLI_PATH" list 2>/dev/null || true
+        else
+            # Simple key extraction from JSON (no Python needed)
+            local val
+            for key in config_mode version latest_instance_id instance_count updated_at; do
+                val=$(sed -n "s/.*\"${key}\": *\"\{0,1\}\([^\"]*\)\"\{0,1\}.*/\1/p" "$INSTALL_META" | head -1)
+                val="${val%,}"  # strip trailing comma from numeric JSON values
+                [ -n "$val" ] && echo "  ${key}: ${val}"
+            done
+        fi
     fi
     if [ -f "$SERVICE_PATH" ]; then
         echo "  service: ${SERVICE_NAME}"
