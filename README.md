@@ -42,13 +42,6 @@ curl -fsSL https://raw.githubusercontent.com/cedar2025/xboard-node/dev/install.s
 curl -fsSL https://raw.githubusercontent.com/cedar2025/xboard-node/dev/install.sh | \
   sudo bash -s -- --mode machine --panel https://panel.example.com --token TOKEN --machine-id 1
 
-# Run again with another --panel to append a binding. No manual instance management needed.
-# Upgrade
-curl -fsSL .../install.sh | sudo bash -s -- upgrade
-# Uninstall
-curl -fsSL .../install.sh | sudo bash -s -- uninstall --purge --yes
-```
-
 ## xbctl
 
 Run `xbctl` after installation for help. Common commands:
