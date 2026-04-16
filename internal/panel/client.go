@@ -316,7 +316,7 @@ func (c *Client) ResetETags() {
 
 // GetMachineNodes fetches the list of active nodes bound to this machine.
 func (c *Client) GetMachineNodes() (*MachineNodesResponse, error) {
-	resp, err := c.doRequest("GET", "/api/v2/server/machine/nodes", nil, "")
+	resp, err := c.doRequest("POST", "/api/v2/server/machine/nodes", nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("get machine nodes: %w", err)
 	}
