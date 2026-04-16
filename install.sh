@@ -655,6 +655,7 @@ install_staged_files() {
         install -m 755 "$0" "$INSTALLER_COPY_PATH"
     fi
     install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
+    ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
     install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
@@ -722,6 +723,7 @@ perform_install() {
     if [ "$HEALTH_ENABLED" -eq 1 ]; then
         log_info "Health: http://127.0.0.1:${HEALTH_PORT}/healthz"
     fi
+    log_info "CLI: ${CLI_PATH}  (run '${CLI_PATH} list' if xbctl is not in PATH)"
 }
 
 perform_upgrade() {
@@ -739,6 +741,7 @@ perform_upgrade() {
     backup_existing_state
     install -m 755 "$TMP_DIR/xboard-node" "$BINARY_PATH"
     install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
+    ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
     install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
     systemctl daemon-reload
     systemctl restart "$SERVICE_NAME"
@@ -772,6 +775,7 @@ perform_uninstall() {
     fi
     rm -f "$BINARY_PATH"
     rm -f "$CLI_PATH"
+    rm -f /usr/bin/xbctl 2>/dev/null || true
     if [ "$PURGE" -eq 1 ]; then
         rm -rf "$INSTALL_ROOT"
         log_info "Removed ${INSTALL_ROOT}"
