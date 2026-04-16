@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -63,11 +64,14 @@ type Service struct {
 	// pullResults delivers async pullViaAPI results back to the main goroutine.
 	pullResults chan pullResult
 
-	wsClient       controlplane.PushClient   // Push client (nil if push is not enabled)
-	wsEvents       chan controlplane.Event   // receives data events from push transport
-	wsStatusCh     chan controlplane.StatusChange // receives push connectivity notifications
-	wsCancel       context.CancelFunc        // cancels the WS client goroutine
-	wsDisconnectAt time.Time                 // when WS last disconnected (zero if connected)
+	wsClient         controlplane.PushClient        // Push client (nil if push is not enabled)
+	wsEvents         chan controlplane.Event        // receives data events from push transport
+	wsStatusCh       chan controlplane.StatusChange // receives push connectivity notifications
+	wsCancel         context.CancelFunc             // cancels the WS client goroutine
+	wsDisconnectAt   time.Time                      // when WS last disconnected (zero if connected)
+	wsResyncPending  atomic.Bool
+	machineMailbox   *controlplane.NodeMailbox
+	machineMailboxCh <-chan struct{}
 
 	// metricsMu: lastUsers, lastConfig, wsClient, wsDisconnectAt (buildMetrics vs main loop).
 	metricsMu sync.RWMutex
@@ -115,7 +119,24 @@ func (b *apiBackoff) onFailure() {
 }
 
 func New(cfg *config.Config) *Service {
-		certMgr := cert.NewManager(cfg.Cert)
+	var cp controlplane.ControlPlane
+	if cfg.IsStandalone() {
+		cp = controlplane.NewLocalControlPlane(cfg)
+	} else {
+		cp = controlplane.NewPanelControlPlane(cfg.Panel, cfg.WS, cfg.Kernel)
+	}
+	return newService(cfg, cp)
+}
+
+// NewWithControlPlane creates a Service with an externally-provided
+// ControlPlane. Used by the machine orchestrator to inject a
+// MachinePanelControlPlane with WS mux routing.
+func NewWithControlPlane(cfg *config.Config, cp controlplane.ControlPlane) *Service {
+	return newService(cfg, cp)
+}
+
+func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
+	certMgr := cert.NewManager(cfg.Cert)
 
 	var k kernel.Kernel
 	switch cfg.Kernel.Type {
@@ -124,19 +145,12 @@ func New(cfg *config.Config) *Service {
 	case "xray":
 		k = xray.New(cfg.Kernel)
 	default:
-		nlog.Core().Error("unsupported kernel type, defaulting to sing-box", "type", cfg.Kernel.Type)
+		nlog.Core().Warn("unsupported kernel type, defaulting to sing-box", "type", cfg.Kernel.Type)
 		k = singbox.New(cfg.Kernel)
 	}
 
 	l := limiter.New()
 	st := limiter.NewSpeedTracker(l)
-
-	var cp controlplane.ControlPlane
-	if cfg.IsStandalone() {
-		cp = controlplane.NewLocalControlPlane(cfg)
-	} else {
-		cp = controlplane.NewPanelControlPlane(cfg.Panel, cfg.WS)
-	}
 
 	return &Service{
 		cfg:          cfg,
@@ -165,7 +179,6 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("initial setup: %w", err)
 	}
 	defer s.kernel.Stop()
-
 
 	// Set up tickers
 	trackTicker := time.NewTicker(time.Duration(s.cfg.Node.TrackInterval) * time.Second)
@@ -221,6 +234,9 @@ func (s *Service) Run(ctx context.Context) error {
 		case status := <-s.wsStatusCh:
 			s.handleWSStatus(ctx, status)
 
+		case <-s.machineMailboxCh:
+			s.drainMachineMailbox(ctx)
+
 		case event := <-s.wsEvents:
 			s.handleWSEvent(ctx, event)
 		}
@@ -231,7 +247,6 @@ func (s *Service) initialSetup(ctx context.Context) error {
 	// Register speed limit lookup with kernel unconditionally (before push/poll branch).
 	s.kernel.SetSpeedLimitFunc(s.speedTracker.GetLimiter)
 	s.kernel.SetDeviceLimitFunc(s.limiter.GetDeviceLimitByUUID)
-
 
 	bootstrap, err := s.source.Initial(ctx, s.wsMetrics, s.wsEvents, s.wsStatusCh)
 	if err != nil {
@@ -258,10 +273,22 @@ func (s *Service) initialSetup(ctx context.Context) error {
 
 	if bootstrap.Push != nil {
 		s.wsClient = bootstrap.Push
-		return nil
+	}
+	s.machineMailbox = bootstrap.Mailbox
+	if s.machineMailbox != nil {
+		s.machineMailboxCh = s.machineMailbox.NotifyCh()
 	}
 	if bootstrap.Config == nil {
+		if bootstrap.Push != nil {
+			// In machine mode a shared WS client may be available before the first
+			// per-node snapshot arrives. In that case we wait for subsequent WS/REST
+			// updates instead of failing startup.
+			return nil
+		}
 		return fmt.Errorf("initial config is nil")
+	}
+	if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), bootstrap.Config, s.cert.TLSCert()); err != nil {
+		return err
 	}
 
 	s.metricsMu.Lock()
@@ -278,6 +305,7 @@ func (s *Service) initialSetup(ctx context.Context) error {
 
 	if len(bootstrap.Users) == 0 {
 		nlog.Core().Warn("no users, kernel will not start until users are available")
+		s.markMailboxReadyAndDrain(ctx)
 		return nil
 	}
 
@@ -285,6 +313,7 @@ func (s *Service) initialSetup(ctx context.Context) error {
 	if !s.startKernel(bootstrap.Config, bootstrap.Users) {
 		return fmt.Errorf("start kernel")
 	}
+	s.markMailboxReadyAndDrain(ctx)
 	return nil
 }
 
@@ -334,7 +363,7 @@ func (s *Service) applyNodeCert(ctx context.Context, newCfg *config.CertConfig) 
 	}
 	s.cfg.Cert = cfgCopy
 	if changed {
-		msg := fmt.Sprintf("cert: paths updated cert=%s key=%s", s.cert.CertFile(), s.cert.KeyFile())
+		msg := fmt.Sprintf("cert: material updated, has_cert=%v", s.cert.HasCert())
 		if s.nodeLog != nil {
 			s.nodeLog.Info(msg)
 		} else {
@@ -354,6 +383,52 @@ func (s *Service) startWSClient(ctx context.Context) {
 	go s.wsClient.Run(wsCtx)
 }
 
+func (s *Service) markMailboxReadyAndDrain(ctx context.Context) {
+	if s.machineMailbox == nil {
+		return
+	}
+	// Seed mailbox with bootstrap state so delta events can be applied
+	// incrementally instead of always triggering REST reconciliation.
+	s.metricsMu.RLock()
+	users := s.lastUsers
+	config := s.lastConfig
+	s.metricsMu.RUnlock()
+	s.machineMailbox.SeedBaseline(users, config)
+	s.machineMailbox.MarkReady()
+	s.drainMachineMailbox(ctx)
+}
+
+func (s *Service) drainMachineMailbox(ctx context.Context) {
+	if s.machineMailbox == nil {
+		return
+	}
+	state := s.machineMailbox.DrainIfReady()
+	if state.HasConfig {
+		s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncConfig, Config: state.Config})
+	}
+	if state.HasUsers {
+		s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncUsers, Users: state.Users})
+	}
+	if state.HasDevices {
+		s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncDevices, DeviceUsers: state.DeviceUsers})
+	}
+	if state.NeedsReconcile {
+		s.requestWSResync(ctx, "machine_mailbox_reconcile")
+	}
+}
+
+func (s *Service) requestWSResync(ctx context.Context, reason string) {
+	if !s.wsResyncPending.CompareAndSwap(false, true) {
+		return
+	}
+	if s.nodeLog != nil {
+		s.nodeLog.Warn("ws state may be stale, scheduling REST reconciliation", "reason", reason)
+	} else {
+		nlog.Core().Warn("ws state may be stale, scheduling REST reconciliation", "reason", reason)
+	}
+	s.pullViaAPIAsync(ctx)
+}
+
 func (s *Service) wsMetrics() map[string]interface{} {
 	status := monitor.Collect()
 	m := s.buildMetrics(status)
@@ -363,10 +438,12 @@ func (s *Service) wsMetrics() map[string]interface{} {
 
 // handleWSStatus reacts to WS connectivity changes.
 
-//
 // - On disconnect: record timestamp, immediately REST poll.
 // - On reconnect: clear disconnect timestamp, REST poll to catch missed events.
 func (s *Service) handleWSStatus(ctx context.Context, status controlplane.StatusChange) {
+	if status.NeedsResync {
+		s.requestWSResync(ctx, "drop_detected")
+	}
 	if status.Connected {
 		s.metricsMu.Lock()
 		s.wsDisconnectAt = time.Time{}
@@ -465,6 +542,10 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		if newConfigHash == s.lastConfigHash {
 			return
 		}
+		if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), event.Config, s.cert.TLSCert()); err != nil {
+			nlog.Core().Warn("ws config validation failed, ignoring update", "error", err)
+			return
+		}
 		// Initialize nodeLog on first config
 		if s.nodeLog == nil {
 			s.nodeLog = nlog.ForNode(event.Config.Protocol, event.Config.ServerPort)
@@ -561,6 +642,7 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 
 // applyPullResult processes the result of an async pullViaAPI on the main goroutine.
 func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
+	s.wsResyncPending.Store(false)
 	configChanged := false
 
 	if result.certChanged {
@@ -569,18 +651,23 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 	}
 
 	if result.config != nil {
-		configChanged = true
-		// Initialize or update node logger
-		if s.nodeLog == nil {
-			s.nodeLog = nlog.ForNode(result.config.Protocol, result.config.ServerPort)
-		}
-		s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(s.lastUsers)))
-		s.metricsMu.Lock()
-		s.lastConfig = result.config
-		s.metricsMu.Unlock()
-		s.lastConfigHash = result.configHash
-		if s.applyRemoteOverrides(ctx, result.config) {
+		if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), result.config, s.cert.TLSCert()); err != nil {
+			nlog.Core().Warn("runtime config validation failed", "error", err)
+			result.config = nil
+		} else {
 			configChanged = true
+			// Initialize or update node logger
+			if s.nodeLog == nil {
+				s.nodeLog = nlog.ForNode(result.config.Protocol, result.config.ServerPort)
+			}
+			s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(s.lastUsers)))
+			s.metricsMu.Lock()
+			s.lastConfig = result.config
+			s.metricsMu.Unlock()
+			s.lastConfigHash = result.configHash
+			if s.applyRemoteOverrides(ctx, result.config) {
+				configChanged = true
+			}
 		}
 	}
 
@@ -643,7 +730,7 @@ func (s *Service) restoreUserState(users []model.UserSpec, hash string) {
 // startKernel starts (or restarts) the kernel with the given config/users and
 // records the successfully applied state. Returns false on error.
 func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
-	if err := s.kernel.Start(nc, users, s.cert.CertFile(), s.cert.KeyFile()); err != nil {
+	if err := s.kernel.Start(nc, users, s.cert.TLSCert()); err != nil {
 		nlog.Core().Error("failed to start kernel", "error", err)
 		return false
 	}
@@ -833,7 +920,7 @@ func (s *Service) applyChanges(ctx context.Context, configChanged, usersChanged 
 	// If config changed, delegate to kernel.Reload. The kernel implementation
 	// decides whether to hot-swap users, reconstruct inbounds, or restart itself.
 	if configChanged && s.kernel.IsRunning() {
-		if err := s.kernel.Reload(s.lastConfig, s.lastUsers, s.cert.CertFile(), s.cert.KeyFile()); err != nil {
+		if err := s.kernel.Reload(s.lastConfig, s.lastUsers, s.cert.TLSCert()); err != nil {
 			nlog.Core().Warn(fmt.Sprintf("reload failed, restarting: %v", err))
 			s.startKernel(s.lastConfig, s.lastUsers)
 		} else {
@@ -897,9 +984,13 @@ func (s *Service) pushReportAsync() {
 	go func() {
 		defer s.pushActive.Store(false)
 		if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
-			nlog.Core().Error("failed to push report", "error", err)
-			if len(traffic) > 0 { s.tracker.RestoreTraffic(traffic) }
-			if len(aliveIPs) > 0 { s.tracker.RestoreAliveIPs(aliveIPs) }
+			nlog.Core().Warn("failed to push report", "error", err)
+			if len(traffic) > 0 {
+				s.tracker.RestoreTraffic(traffic)
+			}
+			if len(aliveIPs) > 0 {
+				s.tracker.RestoreAliveIPs(aliveIPs)
+			}
 			s.pushBackoff.onFailure()
 			return
 		}
@@ -921,7 +1012,7 @@ func (s *Service) pushReportSync() {
 	metrics["kernel_status"] = s.kernel.IsRunning()
 
 	if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
-		nlog.Core().Error("failed to push final report", "error", err)
+		nlog.Core().Warn("failed to push final report", "error", err)
 	}
 }
 
@@ -1055,4 +1146,127 @@ func (s *Service) sendDeviceBatch() {
 // reportDevices periodically reports device snapshot to panel.
 func (s *Service) reportDevices() {
 	s.sendDeviceBatch()
+}
+
+// ─── Runtime validation ─────────────────────────────────────────────────
+
+func validateNodeRuntime(cfg *config.Config, kcfgSupported []string, spec *model.NodeSpec, tls kernel.TLSCert) error {
+	if spec == nil {
+		return fmt.Errorf("node spec is nil")
+	}
+	if !containsString(kcfgSupported, spec.Protocol) {
+		return fmt.Errorf("protocol %q is not supported by kernel %q", spec.Protocol, cfg.Kernel.Type)
+	}
+	if err := validateTLSRequirements(spec, tls, cfgKernelType(cfg)); err != nil {
+		return err
+	}
+	if err := validateRuntimeCertConfig(spec); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateTLSRequirements(spec *model.NodeSpec, tls kernel.TLSCert, kernelType string) error {
+	needsCert := false
+	switch spec.Protocol {
+	case "hysteria", "hysteria2", "tuic", "anytls":
+		needsCert = true
+	case "trojan":
+		if spec.TLS != 2 {
+			needsCert = true
+		}
+	}
+	if needsCert && !hasUsableTLSConfig(spec, tls) {
+		return fmt.Errorf("protocol %q requires TLS certificate files", spec.Protocol)
+	}
+	if spec.TLS == 2 {
+		if err := validateRealityRequirements(spec, kernelType); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func hasUsableTLSConfig(spec *model.NodeSpec, tls kernel.TLSCert) bool {
+	if tls.HasCert() {
+		return true
+	}
+	if spec == nil || spec.CertConfig == nil {
+		return false
+	}
+	mode := strings.ToLower(strings.TrimSpace(spec.CertConfig.CertMode))
+	switch mode {
+	case "self":
+		return true
+	case "content":
+		return strings.TrimSpace(spec.CertConfig.CertContent) != "" && strings.TrimSpace(spec.CertConfig.KeyContent) != ""
+	case "file":
+		return strings.TrimSpace(spec.CertConfig.CertFile) != "" && strings.TrimSpace(spec.CertConfig.KeyFile) != ""
+	case "http":
+		return strings.TrimSpace(spec.CertConfig.Domain) != ""
+	case "dns":
+		return strings.TrimSpace(spec.CertConfig.Domain) != "" && strings.TrimSpace(spec.CertConfig.DNSProvider) != ""
+	default:
+		return false
+	}
+}
+
+func validateRuntimeCertConfig(spec *model.NodeSpec) error {
+	if spec == nil || spec.CertConfig == nil {
+		return nil
+	}
+	mode := strings.ToLower(strings.TrimSpace(spec.CertConfig.CertMode))
+	if mode != "dns" {
+		return nil
+	}
+	provider := strings.ToLower(strings.TrimSpace(spec.CertConfig.DNSProvider))
+	switch provider {
+	case "cloudflare", "cf", "alidns", "aliyun":
+		return nil
+	case "":
+		return fmt.Errorf("dns cert mode requires cert_config.dns_provider")
+	default:
+		return fmt.Errorf("unsupported cert_config.dns_provider %q (supported: cloudflare, alidns)", spec.CertConfig.DNSProvider)
+	}
+}
+
+func validateRealityRequirements(spec *model.NodeSpec, _ string) error {
+	if spec.TLSSettings == nil {
+		return fmt.Errorf("reality tls requires tls_settings")
+	}
+	privateKey := strings.TrimSpace(stringValue(spec.TLSSettings["private_key"]))
+	serverName := strings.TrimSpace(stringValue(spec.TLSSettings["server_name"]))
+	dest := strings.TrimSpace(stringValue(spec.TLSSettings["dest"]))
+	if privateKey == "" {
+		return fmt.Errorf("reality tls requires tls_settings.private_key")
+	}
+	if serverName == "" && dest == "" {
+		return fmt.Errorf("reality tls requires tls_settings.server_name or tls_settings.dest")
+	}
+	return nil
+}
+
+func cfgKernelType(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(cfg.Kernel.Type))
+}
+
+func containsString(items []string, target string) bool {
+	for _, item := range items {
+		if item == target {
+			return true
+		}
+	}
+	return false
+}
+
+func stringValue(v any) string {
+	switch value := v.(type) {
+	case string:
+		return value
+	default:
+		return ""
+	}
 }

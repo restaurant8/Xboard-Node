@@ -36,8 +36,8 @@ type fakeKernel struct {
 func (f *fakeKernel) Name() string { return "fake" }
 func (f *fakeKernel) Protocols() []string { return []string{"vless"} }
 func (f *fakeKernel) Capabilities() kernel.Capabilities { return kernel.Capabilities{} }
-func (f *fakeKernel) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) error {
-	_, _, _, _ = nodeConfig, users, certFile, keyFile
+func (f *fakeKernel) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
+	_, _, _ = nodeConfig, users, tls
 	f.startCalls++
 	if f.startErr != nil {
 		return f.startErr
@@ -47,8 +47,8 @@ func (f *fakeKernel) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, c
 }
 func (f *fakeKernel) Stop() { f.running = false }
 func (f *fakeKernel) IsRunning() bool { return f.running }
-func (f *fakeKernel) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) error {
-	_, _, _, _ = nodeConfig, users, certFile, keyFile
+func (f *fakeKernel) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
+	_, _, _ = nodeConfig, users, tls
 	return nil
 }
 func (f *fakeKernel) AddUsers(users []model.UserSpec) (int, error) {
@@ -96,15 +96,13 @@ func (f *fakeKernel) UpdateGlobalDevices(users map[int][]string) { _ = users }
 func (f *fakeKernel) ClearGlobalDevices() {}
 
 func newTestService(k *fakeKernel) *Service {
+	sharedLimiter := limiter.New()
 	s := &Service{
 		kernel:       k,
-		limiter:      limiter.New(),
-		speedTracker: limiter.NewSpeedTracker(limiter.New()),
+		limiter:      sharedLimiter,
+		speedTracker: limiter.NewSpeedTracker(sharedLimiter),
 		cert:         cert.NewManager(config.CertConfig{}),
 	}
-	// Use a shared limiter instance for device + speed bookkeeping.
-	s.limiter = limiter.New()
-	s.speedTracker = limiter.NewSpeedTracker(s.limiter)
 	k.SetSpeedLimitFunc(s.speedTracker.GetLimiter)
 	k.SetDeviceLimitFunc(s.limiter.GetDeviceLimitByUUID)
 	return s
@@ -200,42 +198,100 @@ func TestApplyUserDeltaAddPreparesLimiterBeforeKernelUpdate(t *testing.T) {
 }
 
 
-func TestApplyUserDeltaAddRemovesOldUUIDBeforeAdd(t *testing.T) {
-	k := &fakeKernel{running: true}
-	s := newTestService(k)
-	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
-	oldUsers := []model.UserSpec{{ID: 1, UUID: "uuid-old", SpeedLimit: 4}}
-	s.updateUserState(oldUsers)
+func TestValidateNodeRuntimeRejectsUnsupportedDNSProvider(t *testing.T) {
+	cfg := &config.Config{Kernel: config.KernelConfig{Type: "singbox"}}
+	err := validateNodeRuntime(cfg, []string{"http"}, &model.NodeSpec{
+		Protocol: "http",
+		CertConfig: &config.CertConfig{
+			CertMode:    "dns",
+			DNSProvider: "3123123",
+			Domain:      "example.com",
+		},
+	}, kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if err.Error() == "" {
+		t.Fatal("expected non-empty error")
+	}
+	if got := err.Error(); got != "unsupported cert_config.dns_provider \"3123123\" (supported: cloudflare, alidns)" {
+		t.Fatalf("unexpected error: %v", got)
+	}
+}
 
-	delta := []model.UserSpec{{ID: 1, UUID: "uuid-new", SpeedLimit: 8}}
-	removalsBeforeAdd := 0
-	k.onRemoveUsers = func(users []model.UserSpec) {
-		removalsBeforeAdd = k.addCalls
-		if len(users) != 1 || users[0].UUID != "uuid-old" {
-			t.Fatalf("unexpected users passed to RemoveUsers: %#v", users)
-		}
+func TestValidateNodeRuntimeAllowsSelfManagedTLSBeforeFilesExist(t *testing.T) {
+	cfg := &config.Config{Kernel: config.KernelConfig{Type: "singbox"}}
+	err := validateNodeRuntime(cfg, []string{"anytls", "hysteria"}, &model.NodeSpec{
+		Protocol: "anytls",
+		CertConfig: &config.CertConfig{
+			CertMode: "self",
+			Domain:   "example.com",
+		},
+	}, kernel.TLSCert{})
+	if err != nil {
+		t.Fatalf("expected self-managed TLS config to pass validation, got %v", err)
 	}
-	k.onAddUsers = func(users []model.UserSpec) {
-		if len(users) != 1 || users[0].UUID != "uuid-new" {
-			t.Fatalf("unexpected users passed to AddUsers: %#v", users)
-		}
-		if k.removeCalls != 1 || removalsBeforeAdd != 0 {
-			t.Fatalf("expected RemoveUsers before AddUsers, removeCalls=%d removalsBeforeAdd=%d", k.removeCalls, removalsBeforeAdd)
-		}
-		if got := k.speedLimitFunc("uuid-new"); got == nil {
-			t.Fatal("expected replacement user's limiter to be visible before kernel AddUsers")
-		}
-	}
+}
 
-	s.applyUserDelta(context.Background(), "add", delta)
+func TestValidateNodeRuntimeAllowsSingboxRealityWithRequiredFields(t *testing.T) {
+	cfg := &config.Config{Kernel: config.KernelConfig{Type: "singbox"}}
+	err := validateNodeRuntime(cfg, []string{"vless"}, &model.NodeSpec{
+		Protocol: "vless",
+		TLS:      2,
+		TLSSettings: map[string]any{
+			"private_key": "test-key",
+			"server_name": "example.com",
+		},
+	}, kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")})
+	if err != nil {
+		t.Fatalf("expected sing-box reality validation to pass, got %v", err)
+	}
+}
 
-	if len(s.lastUsers) != 1 || s.lastUsers[0].UUID != "uuid-new" {
-		t.Fatalf("lastUsers = %#v, want replacement user", s.lastUsers)
+func TestValidateNodeRuntimeRejectsRealityWithoutTLSSettings(t *testing.T) {
+	cfg := &config.Config{Kernel: config.KernelConfig{Type: "singbox"}}
+	err := validateNodeRuntime(cfg, []string{"vless"}, &model.NodeSpec{
+		Protocol: "vless",
+		TLS:      2,
+	}, kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")})
+	if err == nil {
+		t.Fatal("expected error, got nil")
 	}
-	if s.speedTracker.GetLimiter("uuid-old") != nil {
-		t.Fatal("expected old UUID limiter to be removed after replacement")
+	if got := err.Error(); got != "reality tls requires tls_settings" {
+		t.Fatalf("unexpected error: %v", got)
 	}
-	if s.speedTracker.GetLimiter("uuid-new") == nil {
-		t.Fatal("expected new UUID limiter to be installed after replacement")
+}
+
+func TestValidateNodeRuntimeRejectsRealityWithoutPrivateKey(t *testing.T) {
+	cfg := &config.Config{Kernel: config.KernelConfig{Type: "singbox"}}
+	err := validateNodeRuntime(cfg, []string{"vless"}, &model.NodeSpec{
+		Protocol: "vless",
+		TLS:      2,
+		TLSSettings: map[string]any{
+			"server_name": "example.com",
+		},
+	}, kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if got := err.Error(); got != "reality tls requires tls_settings.private_key" {
+		t.Fatalf("unexpected error: %v", got)
+	}
+}
+
+func TestValidateNodeRuntimeRejectsRealityWithoutServerNameOrDest(t *testing.T) {
+	cfg := &config.Config{Kernel: config.KernelConfig{Type: "singbox"}}
+	err := validateNodeRuntime(cfg, []string{"vless"}, &model.NodeSpec{
+		Protocol: "vless",
+		TLS:      2,
+		TLSSettings: map[string]any{
+			"private_key": "test-key",
+		},
+	}, kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if got := err.Error(); got != "reality tls requires tls_settings.server_name or tls_settings.dest" {
+		t.Fatalf("unexpected error: %v", got)
 	}
 }

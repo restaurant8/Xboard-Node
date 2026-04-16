@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/config"
+	"github.com/cedar2025/xboard-node/internal/machine"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/service"
 )
@@ -34,22 +35,27 @@ func main() {
 		os.Exit(0)
 	}
 
-	cfg, err := config.Load(*configPath)
+	rootCfg, err := config.LoadRoot(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
 	}
 
-	config.InitLogger(cfg.Log)
+	instances, err := rootCfg.NormalizeInstances()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to normalize config: %v\n", err)
+		os.Exit(1)
+	}
+	config.InitLogger(instances[0].Log)
 
 	// Apply runtime memory tuning before anything else allocates.
-	applyRuntimeConfig(cfg.Runtime)
+	applyRuntimeConfig(instances[0].Runtime)
 
-	runWithReload(cfg, *configPath)
+	runWithReload(rootCfg, *configPath)
 }
 
 // runWithReload restarts all node services when the config file changes.
-func runWithReload(initialCfg *config.Config, configPath string) {
+func runWithReload(initialRoot *config.RootConfig, configPath string) {
 	var healthSrv *http.Server
 	var healthPort int
 	startHealth := func(port int) {
@@ -77,22 +83,27 @@ func runWithReload(initialCfg *config.Config, configPath string) {
 		}()
 	}
 
-	startHealth(initialCfg.HealthPort)
+	initialInstances, err := initialRoot.NormalizeInstances()
+	if err != nil {
+		nlog.Core().Error("failed to normalize initial config", "error", err)
+		os.Exit(1)
+	}
+	startHealth(initialInstances[0].HealthPort)
 	defer func() {
 		if healthSrv != nil {
 			healthSrv.Close()
 		}
 	}()
 
-	for cfg := initialCfg; ; {
+	for root := initialRoot; ; {
 		ctx, cancel := context.WithCancel(context.Background())
 
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-		reloadCh := make(chan *config.Config, 1)
+		reloadCh := make(chan *config.RootConfig, 1)
 
-		watcher, err := config.WatchConfig(ctx, configPath, func(newCfg *config.Config) {
+		watcher, err := config.WatchConfigRoot(ctx, configPath, func(newCfg *config.RootConfig) {
 			select {
 			case reloadCh <- newCfg:
 			default:
@@ -120,40 +131,77 @@ func runWithReload(initialCfg *config.Config, configPath string) {
 			}
 		}()
 
-		if cfg.HealthPort != healthPort {
+		instances, err := root.NormalizeInstances()
+		if err != nil {
+			nlog.Core().Error("failed to normalize config", "error", err)
+			os.Exit(1)
+		}
+		if err := config.ValidateStartupLayout(instances); err != nil {
+			nlog.Core().Error("startup layout validation failed", "error", err)
+			os.Exit(1)
+		}
+
+		if instances[0].HealthPort != healthPort {
 			if healthSrv != nil {
 				healthSrv.Close()
 				healthSrv = nil
 			}
-			startHealth(cfg.HealthPort)
+			startHealth(instances[0].HealthPort)
 		}
 
-		nodes := cfg.ExpandNodes()
-		nlog.Core().Info(fmt.Sprintf("xboard-node %s starting, %d nodes", version, len(nodes)))
-
-		errCh := make(chan error, len(nodes))
+		errCh := make(chan error, len(instances))
+		doneCh := make(chan struct{})
 		var wg sync.WaitGroup
-		for _, nodeCfg := range nodes {
-			nodeCfg := nodeCfg
+		for _, instanceCfg := range instances {
+			instanceCfg := instanceCfg
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				svc := service.New(nodeCfg)
-				if err := svc.Run(ctx); err != nil {
-					nlog.Core().Error("node service exited with error",
-						"node_id", nodeCfg.Panel.NodeID, "error", err)
-					errCh <- err
-					cancel()
+				if instanceCfg.IsMachineMode() {
+					nlog.Core().Info("starting machine instance", "instance", instanceCfg.InstanceID, "machine_id", instanceCfg.Machine.MachineID, "panel_url", instanceCfg.Panel.URL)
+					orch := machine.New(instanceCfg)
+					if err := orch.Run(ctx); err != nil {
+						nlog.Core().Error("machine instance exited with error", "instance", instanceCfg.InstanceID, "error", err)
+						errCh <- err
+						cancel()
+					}
+					return
 				}
+				nodes := instanceCfg.ExpandNodes()
+				nlog.Core().Info("starting node instance", "instance", instanceCfg.InstanceID, "nodes", len(nodes), "panel_url", instanceCfg.Panel.URL)
+				var instanceWG sync.WaitGroup
+				for idx, nodeCfg := range nodes {
+					nodeCfg := nodeCfg
+					instanceWG.Add(1)
+					go func(idx int) {
+						defer instanceWG.Done()
+						if idx > 0 {
+							delay := time.Duration(idx) * 250 * time.Millisecond
+							if delay > 2*time.Second {
+								delay = 2 * time.Second
+							}
+							select {
+							case <-time.After(delay):
+							case <-ctx.Done():
+								return
+							}
+						}
+						svc := service.New(nodeCfg)
+						if err := svc.Run(ctx); err != nil {
+							nlog.Core().Error("node service exited with error", "instance", nodeCfg.InstanceID, "node_id", nodeCfg.Panel.NodeID, "error", err)
+							errCh <- err
+							cancel()
+						}
+					}(idx)
+				}
+				instanceWG.Wait()
 			}()
 		}
-
-		doneCh := make(chan struct{})
 		go func() { wg.Wait(); close(doneCh) }()
 
-		var newCfg *config.Config
+		var newRoot *config.RootConfig
 		select {
-		case newCfg = <-reloadCh:
+		case newRoot = <-reloadCh:
 			nlog.Core().Info("config changed, restarting all services...")
 			cancel()
 			<-doneCh
@@ -165,7 +213,7 @@ func runWithReload(initialCfg *config.Config, configPath string) {
 			watcher.Stop()
 		}
 
-		if newCfg == nil {
+		if newRoot == nil {
 			close(errCh)
 			if err := <-errCh; err != nil {
 				os.Exit(1)
@@ -174,9 +222,14 @@ func runWithReload(initialCfg *config.Config, configPath string) {
 			return
 		}
 
-		config.InitLogger(newCfg.Log)
-		applyRuntimeConfig(newCfg.Runtime)
-		cfg = newCfg
+		newInstances, err := newRoot.NormalizeInstances()
+		if err != nil {
+			nlog.Core().Error("failed to normalize reloaded config", "error", err)
+			os.Exit(1)
+		}
+		config.InitLogger(newInstances[0].Log)
+		applyRuntimeConfig(newInstances[0].Runtime)
+		root = newRoot
 		nlog.Core().Info("reload complete, services restarting with new config")
 	}
 }

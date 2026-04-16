@@ -18,6 +18,24 @@ func NodeSpecFromStandalone(cfg *config.Config) *NodeSpec {
 		})
 	}
 
+	customRouteRules := make([]CustomRouteRule, 0, len(sc.Node.CustomRouteRules))
+	for _, rule := range sc.Node.CustomRouteRules {
+		customRouteRules = append(customRouteRules, CustomRouteRule{
+			Name:     rule.Name,
+			Disabled: rule.Disabled,
+			Match: RouteMatch{
+				Domains:        cloneStringSlice(rule.Match.Domains),
+				DomainSuffixes: cloneStringSlice(rule.Match.DomainSuffixes),
+				IPCIDRs:        cloneStringSlice(rule.Match.IPCIDRs),
+				Ports:          cloneStringSlice(rule.Match.Ports),
+				Networks:       cloneStringSlice(rule.Match.Networks),
+				SourceCIDRs:    cloneStringSlice(rule.Match.SourceCIDRs),
+				SourcePorts:    cloneStringSlice(rule.Match.SourcePorts),
+			},
+			Action: RouteAction{Type: rule.Action.Type, Target: rule.Action.Target},
+		})
+	}
+
 	var multiplex *MultiplexConfig
 	if sc.Node.Multiplex != nil {
 		multiplex = &MultiplexConfig{
@@ -44,6 +62,7 @@ func NodeSpecFromStandalone(cfg *config.Config) *NodeSpec {
 		Network:             sc.Node.Network,
 		NetworkSettings:     cloneAnyMap(sc.Node.NetworkSettings),
 		Routes:              routes,
+		CustomRouteRules:    customRouteRules,
 		KernelType:          cfg.Kernel.Type,
 		KernelLogLevel:      cfg.Kernel.LogLevel,
 		Cipher:              sc.Node.Cipher,
@@ -68,6 +87,14 @@ func NodeSpecFromStandalone(cfg *config.Config) *NodeSpec {
 		Multiplex:           multiplex,
 		AcceptProxyProtocol: sc.Node.AcceptProxyProtocol,
 	}
+}
+
+func NodeSpecFromStandaloneValidated(cfg *config.Config) (*NodeSpec, error) {
+	spec := NodeSpecFromStandalone(cfg)
+	if err := ValidateNodeSpec(spec, cfg.Kernel); err != nil {
+		return nil, err
+	}
+	return spec, nil
 }
 
 func UserSpecsFromStandalone(cfg *config.Config) []UserSpec {

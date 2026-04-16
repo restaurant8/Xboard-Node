@@ -20,6 +20,19 @@ type Capabilities struct {
 	ForceCloseUser       bool
 }
 
+// TLSCert holds PEM-encoded TLS certificate material.
+// All cert modes (self-signed, file, ACME, panel-content) normalise to PEM
+// so kernels never need to deal with file paths.
+type TLSCert struct {
+	CertPEM []byte
+	KeyPEM  []byte
+}
+
+// HasCert reports whether a valid cert+key pair is available.
+func (t TLSCert) HasCert() bool {
+	return len(t.CertPEM) > 0 && len(t.KeyPEM) > 0
+}
+
 // Kernel is the interface for proxy kernel backends (sing-box, xray, etc.).
 //
 // The interface is split into lifecycle, user management, and observability
@@ -41,7 +54,7 @@ type Kernel interface {
 	// Start initialises the kernel with the given node config and initial
 	// user set, binds listeners, and begins accepting connections.
 	// Calling Start on an already-running kernel stops the old instance first.
-	Start(nodeConfig *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) error
+	Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls TLSCert) error
 	// Stop gracefully shuts down the kernel, draining active connections.
 	Stop()
 	// IsRunning returns whether the kernel is currently accepting connections.
@@ -49,7 +62,7 @@ type Kernel interface {
 	// Reload re-generates the full config and hot-swaps listeners/routes.
 	// Use this when port, protocol, or TLS settings change.
 	// Existing connections MAY be briefly interrupted.
-	Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) error
+	Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls TLSCert) error
 
 	// ─── User management (non-disruptive) ───────────────────────────────
 	// AddUsers registers new users with the running kernel.

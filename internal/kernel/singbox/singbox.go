@@ -1,6 +1,7 @@
 package singbox
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -42,8 +43,7 @@ type SingBox struct {
 
 	users      []model.UserSpec
 	nodeConfig *model.NodeSpec
-	certFile   string
-	keyFile    string
+	tls        kernel.TLSCert
 
 	// connTracker is our lightweight in-process byte/IP tracker.
 	// Created fresh on every Start (full restart).
@@ -85,15 +85,15 @@ func (s *SingBox) Capabilities() kernel.Capabilities {
 func (s *SingBox) Protocols() []string {
 	return []string{
 		"vmess", "vless", "trojan", "shadowsocks",
-		"hysteria2", "tuic", "naive", "socks", "http", "anytls", "mieru",
+		"hysteria", "hysteria2", "tuic", "naive", "socks", "http", "anytls", "mieru",
 	}
 }
 
-func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) error {
+func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cfgMap := buildConfig(s.cfg, nodeConfig, users, certFile, keyFile)
+	cfgMap := buildConfig(s.cfg, nodeConfig, users, tls)
 	data, err := json.Marshal(cfgMap)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
@@ -137,8 +137,7 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, cert
 	s.cancel = cancel
 	s.users = users
 	s.nodeConfig = nodeConfig
-	s.certFile = certFile
-	s.keyFile = keyFile
+	s.tls = tls
 
 	// Fresh tracker on full restart.
 	s.connTracker = NewConnTracker(0)
@@ -193,7 +192,7 @@ func recycleOldBox(oldBox *box.Box, oldCancel context.CancelFunc, oldCtx context
 // Reload hot-swaps the inbound users and routing rules without restarting the box.
 // Routes, outbounds, and the connTracker stay alive so in-flight connections
 // continue to be tracked correctly.
-func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) error {
+func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -201,7 +200,7 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, cer
 		return fmt.Errorf("not running")
 	}
 
-	cfgMap := buildConfig(s.cfg, nodeConfig, users, certFile, keyFile)
+	cfgMap := buildConfig(s.cfg, nodeConfig, users, tls)
 	data, err := json.Marshal(cfgMap)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
@@ -232,7 +231,8 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, cer
 	nopFactory := singLog.NewNOPFactory()
 
 	// Configuration hash check for inbound reconstruction
-	configChanged := s.nodeConfig == nil || kernel.ComputeHash(nodeConfig, users) != kernel.ComputeHash(s.nodeConfig, s.users)
+	tlsChanged := !bytes.Equal(s.tls.CertPEM, tls.CertPEM) || !bytes.Equal(s.tls.KeyPEM, tls.KeyPEM)
+	configChanged := tlsChanged || s.nodeConfig == nil || kernel.ComputeHash(nodeConfig, users) != kernel.ComputeHash(s.nodeConfig, s.users)
 
 	for _, inb := range opts.Inbounds {
 		tag := inb.Tag
@@ -310,8 +310,7 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, cer
 	nlog.Core().Debug("sing-box reloaded", "users", len(users))
 	s.users = users
 	s.nodeConfig = nodeConfig
-	s.certFile = certFile
-	s.keyFile = keyFile
+	s.tls = tls
 	return nil
 }
 
@@ -523,7 +522,7 @@ func (s *SingBox) UpdateUsers(users []model.UserSpec) (added, removed int, err e
 // reloadInboundsLocked hot-swaps inbound users using UpdatableInbound.
 // Must be called with s.mu held.
 func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
-	cfgMap := buildConfig(s.cfg, s.nodeConfig, users, s.certFile, s.keyFile)
+	cfgMap := buildConfig(s.cfg, s.nodeConfig, users, s.tls)
 	data, err := json.Marshal(cfgMap)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)

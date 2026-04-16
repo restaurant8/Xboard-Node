@@ -62,8 +62,29 @@ type Settings struct {
 	PullInterval int `json:"pull_interval"`
 }
 
+// MachineNode is a single entry returned by GET /api/v2/server/machine/nodes.
+type MachineNode struct {
+	ID   int    `json:"id"`
+	Type string `json:"type"`
+	Name string `json:"name"`
+}
+
+// MachineNodesResponse is the response from GET /api/v2/server/machine/nodes.
+type MachineNodesResponse struct {
+	Nodes      []MachineNode      `json:"nodes"`
+	BaseConfig MachineBaseConfig  `json:"base_config"`
+}
+
+// MachineBaseConfig holds polling intervals for machine mode.
+type MachineBaseConfig struct {
+	PushInterval int `json:"push_interval"`
+	PullInterval int `json:"pull_interval"`
+}
+
 // NodeConfig is the response from GET /api/v1/server/UniProxy/config
 type NodeConfig struct {
+	// NodeID is populated in machine-mode WS events for routing.
+	NodeID          int                    `json:"node_id,omitempty"`
 	Protocol        string                 `json:"protocol"`
 	ListenIP        string                 `json:"listen_ip"`
 	ServerPort      int                    `json:"server_port"`
@@ -73,10 +94,11 @@ type NodeConfig struct {
 	Routes          []RouteRule            `json:"routes"`
 
 	// Kernel settings (Xboard extension)
-	KernelType      string           `json:"kernel_type,omitempty"`      // "singbox" or "xray"
-	KernelLogLevel  string           `json:"kernel_log_level,omitempty"` // "info", "warn", etc.
-	CustomOutbounds []OutboundConfig `json:"custom_outbounds,omitempty"`
-	CustomRoutes    []map[string]any `json:"custom_routes,omitempty"`
+	KernelType       string            `json:"kernel_type,omitempty"`      // "singbox" or "xray"
+	KernelLogLevel   string            `json:"kernel_log_level,omitempty"` // "info", "warn", etc.
+	CustomOutbounds  []OutboundConfig  `json:"custom_outbounds,omitempty"`
+	CustomRoutes     []map[string]any  `json:"custom_routes,omitempty"`
+	CustomRouteRules []CustomRouteRule `json:"custom_route_rules,omitempty"`
 
 	// Certificate settings (Xboard extension)
 	CertConfig *CertConfig `json:"cert_config,omitempty"`
@@ -155,9 +177,11 @@ type BrutalConfig struct {
 	DownMbps int  `json:"down_mbps"`
 }
 
-// CertConfig holds certificate automation settings from the panel
+// CertConfig holds certificate automation settings from the panel.
+// The panel may send the mode field as either "cert_mode" or "mode";
+// a custom UnmarshalJSON handles both.
 type CertConfig struct {
-	CertMode    string            `json:"cert_mode"`    // none, dns, http, self, file
+	CertMode    string            `json:"cert_mode"`    // none, dns, http, self, file, content
 	Domain      string            `json:"domain"`       // Certificate domain
 	Email       string            `json:"email"`        // ACME email
 	DNSProvider string            `json:"dns_provider"` // dns mode: cloudflare, alidns, etc.
@@ -167,6 +191,22 @@ type CertConfig struct {
 	KeyFile     string            `json:"key_file"`     // file mode: path to key file
 	CertContent string            `json:"cert_content"` // content mode: certificate raw string
 	KeyContent  string            `json:"key_content"`  // content mode: private key raw string
+}
+
+func (c *CertConfig) UnmarshalJSON(data []byte) error {
+	type plain CertConfig
+	var raw struct {
+		plain
+		ModeFallback string `json:"mode"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*c = CertConfig(raw.plain)
+	if c.CertMode == "" && raw.ModeFallback != "" {
+		c.CertMode = raw.ModeFallback
+	}
+	return nil
 }
 
 // OutboundConfig defines a custom outbound for kernel
@@ -187,6 +227,28 @@ type RouteRule struct {
 	Match       []string `json:"match"`
 	Action      string   `json:"action"`
 	ActionValue string   `json:"action_value,omitempty"`
+}
+
+type CustomRouteRule struct {
+	Name     string      `json:"name,omitempty"`
+	Disabled bool        `json:"disabled,omitempty"`
+	Match    RouteMatch  `json:"match,omitempty"`
+	Action   RouteAction `json:"action"`
+}
+
+type RouteMatch struct {
+	Domains        []string `json:"domains,omitempty"`
+	DomainSuffixes []string `json:"domain_suffixes,omitempty"`
+	IPCIDRs        []string `json:"ip_cidrs,omitempty"`
+	Ports          []string `json:"ports,omitempty"`
+	Networks       []string `json:"networks,omitempty"`
+	SourceCIDRs    []string `json:"source_cidrs,omitempty"`
+	SourcePorts    []string `json:"source_ports,omitempty"`
+}
+
+type RouteAction struct {
+	Type   string `json:"type"`
+	Target string `json:"target,omitempty"`
 }
 
 // User represents a user returned by the panel

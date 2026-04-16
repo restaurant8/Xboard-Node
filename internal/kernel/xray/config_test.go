@@ -1,10 +1,13 @@
 package xray
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/config"
+	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/panel"
 )
@@ -46,7 +49,7 @@ func TestBuildConfig_OutboundPriority(t *testing.T) {
 		},
 	}
 
-	cfg := buildConfig(kcfg, testNodeSpec(nc), testUsers, "", "")
+	cfg := buildConfig(kcfg, testNodeSpec(nc), testUsers, kernel.TLSCert{})
 	outbounds := cfg["outbounds"].([]M)
 
 	// Since we overrode both 'direct' and 'block', the result should contain
@@ -161,7 +164,7 @@ func TestBuildConfig_AllProtocols_ValidJSON(t *testing.T) {
 
 	for _, tc := range protocols {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := buildConfig(testKernelCfg, testNodeSpec(&tc.nc), testUsers, "/cert.pem", "/key.pem")
+			cfg := buildConfig(testKernelCfg, testNodeSpec(&tc.nc), testUsers, kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")})
 
 			data, err := json.Marshal(cfg)
 			if err != nil {
@@ -194,7 +197,7 @@ func TestBuildConfig_VMess_Users(t *testing.T) {
 		Protocol:   "vmess",
 		ServerPort: 10086,
 	}
-	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, "", "")
+	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
 	data, _ := json.Marshal(cfg)
 
 	var parsed map[string]interface{}
@@ -234,7 +237,7 @@ func TestBuildConfig_VLESS_Flow(t *testing.T) {
 			"server_name": "example.com",
 		},
 	}
-	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, "", "")
+	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
 	data, _ := json.Marshal(cfg)
 
 	var parsed map[string]interface{}
@@ -257,7 +260,7 @@ func TestBuildConfig_VLESS_Flow(t *testing.T) {
 }
 
 func TestBuildRouting_Default(t *testing.T) {
-	routing := buildRouting(nil, nil)
+	routing := buildRouting(nil, nil, nil)
 	rules := routing["rules"].([]M)
 
 	if len(rules) != 1 {
@@ -287,7 +290,7 @@ func TestBuildRouting_WithRules(t *testing.T) {
 		},
 	}
 
-	routing := buildRouting(testRouteRules(rules), nil)
+	routing := buildRouting(testRouteRules(rules), nil, nil)
 	xrayRules := routing["rules"].([]M)
 
 	// 1 default + 2 domain rules + 1 IP rule = 4
@@ -322,6 +325,63 @@ func TestBuildRouting_WithRules(t *testing.T) {
 	}
 }
 
+func TestBuildRouting_WithCustomRouteRules(t *testing.T) {
+	customRules := []model.CustomRouteRule{
+		{
+			Name: "proxy-web",
+			Match: model.RouteMatch{
+				Domains:        []string{"full.example.com"},
+				DomainSuffixes: []string{"example.org"},
+				Ports:          []string{"80", "443-445"},
+				Networks:       []string{"tcp", "udp"},
+				SourceCIDRs:    []string{"192.168.1.0/24"},
+				SourcePorts:    []string{"1000-1002"},
+			},
+			Action: model.RouteAction{Type: "route", Target: "warp-jp"},
+		},
+	}
+
+	routing := buildRouting(nil, customRules, nil)
+	xrayRules := routing["rules"].([]M)
+	if len(xrayRules) != 6 {
+		t.Fatalf("expected 6 rules, got %d", len(xrayRules))
+	}
+	if xrayRules[0]["outboundTag"] != "warp-jp" {
+		t.Fatalf("expected first custom outbound warp-jp, got %v", xrayRules[0]["outboundTag"])
+	}
+	if got := xrayRules[0]["domain"].([]string); len(got) != 2 || got[0] != "full.example.com" || got[1] != "domain:example.org" {
+		t.Fatalf("unexpected custom domains: %v", got)
+	}
+	if got := xrayRules[1]["port"]; got != "80,443-445" {
+		t.Fatalf("unexpected port matcher: %v", got)
+	}
+	if got := xrayRules[2]["network"]; got != "tcp,udp" {
+		t.Fatalf("unexpected network matcher: %v", got)
+	}
+	if got := xrayRules[3]["source"].([]string); len(got) != 1 || got[0] != "192.168.1.0/24" {
+		t.Fatalf("unexpected source cidr matcher: %v", got)
+	}
+	if got := xrayRules[4]["sourcePort"]; got != "1000-1002" {
+		t.Fatalf("unexpected source port matcher: %v", got)
+	}
+}
+
+func TestBuildRouting_StructuredCustomRulesRemainFirst(t *testing.T) {
+	raw := []map[string]any{{"type": "field", "domain": []string{"keyword:raw"}, "outboundTag": "raw-tag"}}
+	custom := []model.CustomRouteRule{{
+		Match:  model.RouteMatch{DomainSuffixes: []string{"structured.example"}},
+		Action: model.RouteAction{Type: "direct"},
+	}}
+	routing := buildRouting(nil, custom, raw)
+	xrayRules := routing["rules"].([]M)
+	if xrayRules[0]["outboundTag"] != "direct" {
+		t.Fatalf("expected structured rule first, got %v", xrayRules[0]["outboundTag"])
+	}
+	if xrayRules[1]["outboundTag"] != "raw-tag" {
+		t.Fatalf("expected raw custom rule second, got %v", xrayRules[1]["outboundTag"])
+	}
+}
+
 func TestBuildConfig_LogLevel(t *testing.T) {
 	tests := []struct {
 		input    string
@@ -349,7 +409,7 @@ func TestBuildConfig_StatsEnabled(t *testing.T) {
 		Protocol:   "vmess",
 		ServerPort: 10086,
 	}
-	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, "", "")
+	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
 	data, _ := json.Marshal(cfg)
 
 	var parsed map[string]interface{}
@@ -379,7 +439,7 @@ func TestBuildConfig_Shadowsocks_MultiUserTraditional(t *testing.T) {
 		ServerPort: 8388,
 		Cipher:     "aes-128-gcm",
 	}
-	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, "", "")
+	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
 	data, _ := json.Marshal(cfg)
 
 	var parsed map[string]interface{}
@@ -412,7 +472,7 @@ func TestBuildConfig_Shadowsocks_MultiUser(t *testing.T) {
 		Cipher:     "2022-blake3-aes-128-gcm",
 		ServerKey:  "server-key",
 	}
-	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, "", "")
+	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
 	data, _ := json.Marshal(cfg)
 
 	var parsed map[string]interface{}
@@ -436,7 +496,7 @@ func TestBuildConfig_SocksStats(t *testing.T) {
 		Protocol:   "socks",
 		ServerPort: 1080,
 	}
-	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, "", "")
+	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
 	data, _ := json.Marshal(cfg)
 
 	var parsed map[string]interface{}
@@ -454,5 +514,61 @@ func TestBuildConfig_SocksStats(t *testing.T) {
 	a1 := accounts[0].(map[string]interface{})
 	if a1["email"] != "user@1" {
 		t.Errorf("expected email user@1 for socks account, got %v", a1["email"])
+	}
+}
+
+func TestEchPEMToBase64(t *testing.T) {
+	// Valid ECH KEYS PEM
+	rawBytes := []byte{0x00, 0x04, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x03, 0xCA, 0xFE, 0x00}
+	pemBlock := &pem.Block{Type: "ECH KEYS", Bytes: rawBytes}
+	pemStr := string(pem.EncodeToMemory(pemBlock))
+
+	result := echPEMToBase64([]byte(pemStr))
+	expected := base64.StdEncoding.EncodeToString(rawBytes)
+	if result != expected {
+		t.Errorf("echPEMToBase64 got %q, want %q", result, expected)
+	}
+
+	// Wrong PEM type should return empty
+	wrongBlock := &pem.Block{Type: "ECH CONFIGS", Bytes: rawBytes}
+	wrongPEM := string(pem.EncodeToMemory(wrongBlock))
+	if got := echPEMToBase64([]byte(wrongPEM)); got != "" {
+		t.Errorf("echPEMToBase64 should reject ECH CONFIGS, got %q", got)
+	}
+
+	// Invalid PEM should return empty
+	if got := echPEMToBase64([]byte("-----BEGIN GARBAGE-----\nwhat\n-----END GARBAGE-----")); got != "" {
+		t.Errorf("echPEMToBase64 should reject invalid PEM, got %q", got)
+	}
+
+	// Raw base64 passthrough
+	raw := "AAQDQKDIAAMD"
+	if got := echPEMToBase64([]byte(raw)); got != raw {
+		t.Errorf("echPEMToBase64 raw passthrough: got %q, want %q", got, raw)
+	}
+}
+
+func TestExtractECHServerKeys(t *testing.T) {
+	rawBytes := []byte{0x00, 0x04, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x03, 0xCA, 0xFE, 0x00}
+	pemBlock := &pem.Block{Type: "ECH KEYS", Bytes: rawBytes}
+	pemStr := string(pem.EncodeToMemory(pemBlock))
+
+	tests := []struct {
+		name   string
+		tls    map[string]interface{}
+		expect string
+	}{
+		{"no ech", map[string]interface{}{}, ""},
+		{"disabled", map[string]interface{}{"ech": map[string]interface{}{"enabled": false, "key": pemStr}}, ""},
+		{"enabled with key", map[string]interface{}{"ech": map[string]interface{}{"enabled": true, "key": pemStr}}, base64.StdEncoding.EncodeToString(rawBytes)},
+		{"enabled no key", map[string]interface{}{"ech": map[string]interface{}{"enabled": true}}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractECHServerKeys(tt.tls)
+			if got != tt.expect {
+				t.Errorf("got %q, want %q", got, tt.expect)
+			}
+		})
 	}
 }

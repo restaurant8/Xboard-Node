@@ -1,12 +1,17 @@
 package config
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/cedar2025/xboard-node/internal/nlog"
 	"golang.org/x/term"
@@ -14,6 +19,7 @@ import (
 )
 
 type Config struct {
+	InstanceID string `yaml:"-"`
 	Panel   PanelConfig   `yaml:"panel"`
 	Node    NodeConfig    `yaml:"node"`
 	Kernel  KernelConfig  `yaml:"kernel"`
@@ -30,6 +36,20 @@ type Config struct {
 	// one service instance is started per entry. All entries share the same
 	// panel URL/token, kernel type, log settings and runtime tuning.
 	Nodes []NodeEntry `yaml:"nodes,omitempty"`
+
+	// Machine enables machine mode: a single process manages all nodes
+	// bound to this machine on the panel. Nodes are discovered dynamically
+	// via GET /api/v2/server/machine/nodes. When set, Panel.NodeID, Nodes
+	// and Panel.Token are ignored; the machine token is used instead.
+	Machine *MachineConfig `yaml:"machine,omitempty"`
+}
+
+// MachineConfig identifies this process as a panel-managed machine that
+// dynamically discovers and runs all nodes bound to it.
+type MachineConfig struct {
+	MachineID int    `yaml:"machine_id"`
+	Token     string `yaml:"token"`
+	TokenEnv  string `yaml:"token_env,omitempty"`
 }
 
 // NodeEntry describes a single node in multi-node mode.
@@ -73,10 +93,12 @@ type RuntimeConfig struct {
 }
 
 type PanelConfig struct {
-	URL      string `yaml:"url"`
-	Token    string `yaml:"token"`
-	NodeID   int    `yaml:"node_id"`
-	NodeType string `yaml:"node_type"`
+	URL       string `yaml:"url"`
+	Token     string `yaml:"token"`
+	TokenEnv  string `yaml:"token_env,omitempty"`
+	NodeID    int    `yaml:"node_id"`
+	NodeType  string `yaml:"node_type"`
+	MachineID int    `yaml:"-"`
 }
 
 type NodeConfig struct {
@@ -161,6 +183,174 @@ type LogConfig struct {
 	Output string `yaml:"output"`
 }
 
+type RootConfig struct {
+	Instances []Config `yaml:"instances,omitempty"`
+	Config    `yaml:",inline"`
+}
+
+func LoadRoot(path string) (*RootConfig, error) {
+	rc := &RootConfig{}
+
+	data, err := os.ReadFile(path)
+	if err == nil {
+		if err := yaml.Unmarshal(data, rc); err != nil {
+			return nil, fmt.Errorf("parse config: %w", err)
+		}
+		if len(rc.Instances) == 0 {
+			legacy := &Config{}
+			if err := yaml.Unmarshal(data, legacy); err != nil {
+				return nil, fmt.Errorf("parse legacy config: %w", err)
+			}
+			rc.Config = *legacy
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read config file: %w", err)
+	}
+
+	// In multi-instance mode, top-level settings (log, kernel, node, ws, etc.)
+	// serve as defaults that each instance inherits. Instance-level settings
+	// take precedence over top-level ones.
+	if len(rc.Instances) > 0 {
+		for i := range rc.Instances {
+			rc.Instances[i].inheritFrom(&rc.Config)
+		}
+	}
+
+	// Derive default base directory from the config file's location so that
+	// data (certs, sing-box cache, …) lives next to the config file when
+	// config_dir is not explicitly set. This makes non-root / dev deployments
+	// work without any extra configuration.
+	baseDir := configBaseDir(path)
+
+	rc.applyEnvOverrides()
+	rc.resolveEnvRefs()
+
+	// Compute stable instance IDs early — they're content-based (derived from
+	// panel URL + machine/node ID), so reordering instances in the YAML doesn't
+	// cause data-directory mix-ups. Must run before setDefaultsFrom which uses
+	// InstanceID to derive per-instance config_dir.
+	if err := rc.assignInstanceIDs(); err != nil {
+		return nil, err
+	}
+
+	rc.setDefaultsFrom(baseDir)
+
+	if err := rc.validateRoot(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+
+	return rc, nil
+}
+
+func (rc *RootConfig) applyEnvOverrides() {
+	if len(rc.Instances) == 0 {
+		rc.Config.applyEnvOverrides()
+		return
+	}
+	for i := range rc.Instances {
+		rc.Instances[i].applyEnvOverrides()
+	}
+}
+
+func (rc *RootConfig) resolveEnvRefs() {
+	if len(rc.Instances) == 0 {
+		rc.Config.resolveEnvRefs()
+		return
+	}
+	for i := range rc.Instances {
+		rc.Instances[i].resolveEnvRefs()
+	}
+}
+
+func (rc *RootConfig) setDefaultsFrom(baseDir string) {
+	if len(rc.Instances) == 0 {
+		rc.Config.setDefaultsFrom(baseDir)
+		return
+	}
+	for i := range rc.Instances {
+		instBase := baseDir
+		// When multiple instances share the same base dir, derive a unique
+		// sub-directory per instance to avoid config_dir collisions.
+		// InstanceID is always populated by assignInstanceIDs() before this runs.
+		if len(rc.Instances) > 1 && rc.Instances[i].Kernel.ConfigDir == "" {
+			instBase = filepath.Join(baseDir, rc.Instances[i].InstanceID)
+		}
+		rc.Instances[i].setDefaultsFrom(instBase)
+	}
+}
+
+// assignInstanceIDs computes a stable, content-based InstanceID for each
+// instance that doesn't already have one. The ID is derived from the panel URL
+// and machine/node ID, so reordering instances in the YAML file doesn't cause
+// data directories to swap.
+func (rc *RootConfig) assignInstanceIDs() error {
+	for i := range rc.Instances {
+		if rc.Instances[i].InstanceID != "" {
+			continue
+		}
+		id, err := rc.Instances[i].AutoInstanceID()
+		if err != nil {
+			return fmt.Errorf("instances[%d]: %w", i, err)
+		}
+		rc.Instances[i].InstanceID = id
+	}
+	return nil
+}
+
+// configBaseDir resolves the canonical base directory from the config file path.
+// This directory is used as the default for config_dir when not explicitly set,
+// so that data (certs, sing-box cache, …) lives next to the config file.
+func configBaseDir(configPath string) string {
+	abs, err := filepath.Abs(configPath)
+	if err != nil {
+		return "/etc/xboard-node"
+	}
+	return filepath.Dir(abs)
+}
+
+func (rc *RootConfig) validateRoot() error {
+	if len(rc.Instances) == 0 {
+		return rc.Config.validate()
+	}
+	seen := map[string]struct{}{}
+	for i := range rc.Instances {
+		// InstanceID is already computed by assignInstanceIDs().
+		id := rc.Instances[i].InstanceID
+		if err := rc.Instances[i].validate(); err != nil {
+			return fmt.Errorf("instances[%d]: %w", i, err)
+		}
+		if _, ok := seen[id]; ok {
+			return fmt.Errorf("instances[%d]: duplicate instance id %q", i, id)
+		}
+		seen[id] = struct{}{}
+	}
+	return nil
+}
+
+func (rc *RootConfig) NormalizeInstances() ([]*Config, error) {
+	if len(rc.Instances) == 0 {
+		id, err := rc.Config.AutoInstanceID()
+		if err != nil {
+			return nil, err
+		}
+		rc.Config.InstanceID = id
+		return []*Config{&rc.Config}, nil
+	}
+	out := make([]*Config, 0, len(rc.Instances))
+	for i := range rc.Instances {
+		cfg := rc.Instances[i]
+		if cfg.InstanceID == "" {
+			id, err := cfg.AutoInstanceID()
+			if err != nil {
+				return nil, err
+			}
+			cfg.InstanceID = id
+		}
+		out = append(out, &cfg)
+	}
+	return out, nil
+}
+
 // Load reads configuration from a YAML file, then applies environment variable
 // overrides. If the config file does not exist, a config is built entirely from
 // environment variables (useful for Docker deployment with -e flags).
@@ -176,8 +366,11 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config file: %w", err)
 	}
 
+	baseDir := configBaseDir(path)
+
 	cfg.applyEnvOverrides()
-	cfg.setDefaults()
+	cfg.resolveEnvRefs()
+	cfg.setDefaultsFrom(baseDir)
 
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
@@ -227,14 +420,145 @@ func (c *Config) applyEnvOverrides() {
 	if v := envFirst("logLevel", "LOG_LEVEL"); v != "" {
 		c.Log.Level = v
 	}
+	if v := envFirst("MACHINE_ID"); v != "" {
+		if id, err := strconv.Atoi(v); err == nil {
+			if c.Machine == nil {
+				c.Machine = &MachineConfig{}
+			}
+			c.Machine.MachineID = id
+		}
+	}
+	if v := envFirst("MACHINE_TOKEN"); v != "" {
+		if c.Machine == nil {
+			c.Machine = &MachineConfig{}
+		}
+		c.Machine.Token = v
+	}
 }
 
-func (c *Config) setDefaults() {
+func (c *Config) resolveEnvRefs() {
+	if c.Panel.Token == "" && c.Panel.TokenEnv != "" {
+		c.Panel.Token = os.Getenv(c.Panel.TokenEnv)
+	}
+	if c.Machine != nil && c.Machine.Token == "" && c.Machine.TokenEnv != "" {
+		c.Machine.Token = os.Getenv(c.Machine.TokenEnv)
+	}
+}
+
+// inheritFrom copies non-zero fields from the parent config into c when c's
+// corresponding field is zero-valued. This lets top-level settings serve as
+// defaults for each instance in multi-instance configs.
+// Fields that must be unique per instance (config_dir, cert_dir, instance_id)
+// are intentionally excluded.
+func (c *Config) inheritFrom(parent *Config) {
+	// Log
+	if c.Log.Level == "" {
+		c.Log.Level = parent.Log.Level
+	}
+	if c.Log.Output == "" {
+		c.Log.Output = parent.Log.Output
+	}
+	// Node intervals
+	if c.Node.PushInterval == 0 {
+		c.Node.PushInterval = parent.Node.PushInterval
+	}
+	if c.Node.PullInterval == 0 {
+		c.Node.PullInterval = parent.Node.PullInterval
+	}
+	if c.Node.TrackInterval == 0 {
+		c.Node.TrackInterval = parent.Node.TrackInterval
+	}
+	if c.Node.DeviceReportInterval == 0 {
+		c.Node.DeviceReportInterval = parent.Node.DeviceReportInterval
+	}
+	// WS
+	if c.WS.StatusInterval == 0 {
+		c.WS.StatusInterval = parent.WS.StatusInterval
+	}
+	if c.WS.HandshakeTimeout == 0 {
+		c.WS.HandshakeTimeout = parent.WS.HandshakeTimeout
+	}
+	if c.WS.BackoffInitial == 0 {
+		c.WS.BackoffInitial = parent.WS.BackoffInitial
+	}
+	if c.WS.BackoffMax == 0 {
+		c.WS.BackoffMax = parent.WS.BackoffMax
+	}
+	if c.WS.DiscoveryInterval == 0 {
+		c.WS.DiscoveryInterval = parent.WS.DiscoveryInterval
+	}
+	// Runtime
+	if c.Runtime.GoGCPercent == 0 {
+		c.Runtime.GoGCPercent = parent.Runtime.GoGCPercent
+	}
+	if c.Runtime.GoMemLimit == "" {
+		c.Runtime.GoMemLimit = parent.Runtime.GoMemLimit
+	}
+	// Kernel (NOT config_dir — each instance needs unique dir)
+	if c.Kernel.Type == "" {
+		c.Kernel.Type = parent.Kernel.Type
+	}
+	if c.Kernel.LogLevel == "" {
+		c.Kernel.LogLevel = parent.Kernel.LogLevel
+	}
+	if c.Kernel.GeoDataDir == "" {
+		c.Kernel.GeoDataDir = parent.Kernel.GeoDataDir
+	}
+	if c.Kernel.CustomConfig == "" {
+		c.Kernel.CustomConfig = parent.Kernel.CustomConfig
+	}
+	if len(c.Kernel.CustomOutbound) == 0 {
+		c.Kernel.CustomOutbound = parent.Kernel.CustomOutbound
+	}
+	if len(c.Kernel.CustomRoute) == 0 {
+		c.Kernel.CustomRoute = parent.Kernel.CustomRoute
+	}
+	// Cert (NOT cert_dir — derived from config_dir later)
+	if c.Cert.CertMode == "" {
+		c.Cert.CertMode = parent.Cert.CertMode
+	}
+	if c.Cert.Domain == "" {
+		c.Cert.Domain = parent.Cert.Domain
+	}
+	if c.Cert.Email == "" {
+		c.Cert.Email = parent.Cert.Email
+	}
+	if c.Cert.CertFile == "" {
+		c.Cert.CertFile = parent.Cert.CertFile
+	}
+	if c.Cert.KeyFile == "" {
+		c.Cert.KeyFile = parent.Cert.KeyFile
+	}
+	if c.Cert.DNSProvider == "" {
+		c.Cert.DNSProvider = parent.Cert.DNSProvider
+	}
+	if len(c.Cert.DNSEnv) == 0 {
+		c.Cert.DNSEnv = parent.Cert.DNSEnv
+	}
+	if c.Cert.HTTPPort == 0 {
+		c.Cert.HTTPPort = parent.Cert.HTTPPort
+	}
+	if c.Cert.CertContent == "" {
+		c.Cert.CertContent = parent.Cert.CertContent
+	}
+	if c.Cert.KeyContent == "" {
+		c.Cert.KeyContent = parent.Cert.KeyContent
+	}
+	// Only inherit AutoTLS when the child has no explicit cert configuration.
+	// A child with cert_mode, cert_file, or cert_content explicitly chooses
+	// its own cert strategy — inheriting auto_tls would override that choice.
+	childHasCertConfig := c.Cert.CertMode != "" || c.Cert.CertFile != "" || c.Cert.CertContent != ""
+	if !childHasCertConfig && !c.Cert.AutoTLS && parent.Cert.AutoTLS {
+		c.Cert.AutoTLS = parent.Cert.AutoTLS
+	}
+}
+
+func (c *Config) setDefaultsFrom(baseDir string) {
 	if c.Kernel.Type == "" {
 		c.Kernel.Type = "singbox"
 	}
 	if c.Kernel.ConfigDir == "" {
-		c.Kernel.ConfigDir = "/etc/xboard-node"
+		c.Kernel.ConfigDir = baseDir
 	}
 	if c.Kernel.GeoDataDir == "" {
 		c.Kernel.GeoDataDir = c.Kernel.ConfigDir
@@ -279,10 +603,104 @@ func (c *Config) setDefaults() {
 	}
 }
 
+func (c *Config) IsMachineMode() bool {
+	return c.Machine != nil && c.Machine.MachineID > 0
+}
+
+func (c *Config) AutoInstanceID() (string, error) {
+	mode := "node"
+	target := "0"
+	baseURL := strings.TrimSpace(c.Panel.URL)
+	if c.IsStandalone() {
+		mode = "standalone"
+		target = "local"
+		baseURL = "standalone"
+	} else if c.IsMachineMode() {
+		mode = "machine"
+		target = strconv.Itoa(c.Machine.MachineID)
+	} else if len(c.Nodes) > 0 {
+		// Multi-node mode: include sorted node IDs in the hash to avoid collisions.
+		ids := make([]string, len(c.Nodes))
+		for i, n := range c.Nodes {
+			ids[i] = strconv.Itoa(n.NodeID)
+		}
+		sort.Strings(ids)
+		target = strings.Join(ids, ",")
+	} else {
+		target = strconv.Itoa(c.Panel.NodeID)
+	}
+	normalized, slug, err := normalizeBaseURL(baseURL)
+	if err != nil {
+		return "", err
+	}
+	key := normalized + "|" + mode + "|" + target
+	sum := sha1.Sum([]byte(key))
+	short := hex.EncodeToString(sum[:])[:6]
+	return fmt.Sprintf("%s-%s-%s-%s", slug, mode, target, short), nil
+}
+
+func normalizeBaseURL(raw string) (string, string, error) {
+	if raw == "standalone" {
+		return raw, raw, nil
+	}
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return "", "", fmt.Errorf("invalid panel.url %q: %w", raw, err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return "", "", fmt.Errorf("invalid panel.url %q", raw)
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = strings.ToLower(u.Host)
+	u.RawQuery = ""
+	u.Fragment = ""
+	pathPart := strings.TrimSuffix(u.EscapedPath(), "/")
+	normalized := u.Scheme + "://" + u.Host
+	if pathPart != "" && pathPart != "/" {
+		normalized += pathPart
+	}
+	slugBase := u.Host
+	if pathPart != "" && pathPart != "/" {
+		slugBase += "-" + strings.Trim(pathPart, "/")
+	}
+	slugBase = strings.ToLower(slugBase)
+	var b strings.Builder
+	lastDash := false
+	for _, r := range slugBase {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	slug := strings.Trim(b.String(), "-")
+	if slug == "" {
+		slug = "panel"
+	}
+	if len(slug) > 48 {
+		slug = strings.Trim(slug[:48], "-")
+	}
+	return normalized, slug, nil
+}
+
 func (c *Config) validate() error {
 	if c.IsStandalone() {
 		if err := c.validateStandalone(); err != nil {
 			return err
+		}
+	} else if c.IsMachineMode() {
+		if c.Panel.URL == "" {
+			return fmt.Errorf("panel.url is required")
+		}
+		if c.Machine.Token == "" {
+			return fmt.Errorf("machine.token is required")
+		}
+		if len(c.Nodes) > 0 {
+			return fmt.Errorf("machine mode and nodes: are mutually exclusive")
 		}
 	} else {
 		if c.Panel.URL == "" {
@@ -375,6 +793,23 @@ func (c *Config) ExpandNodes() []*Config {
 	return result
 }
 
+func (c *Config) ExpandMachineNode(nodeID int, nodeType string) *Config {
+	nodeCfg := *c
+	nodeCfg.Nodes = nil
+	nodeCfg.Panel.NodeID = nodeID
+	nodeCfg.Panel.NodeType = nodeType
+	nodeCfg.Panel.Token = c.Machine.Token
+	nodeCfg.Panel.MachineID = c.Machine.MachineID
+
+	nodeCfg.Kernel.ConfigDir = fmt.Sprintf("%s/node-%d", c.Kernel.ConfigDir, nodeID)
+	if nodeCfg.Kernel.GeoDataDir == c.Kernel.ConfigDir {
+		nodeCfg.Kernel.GeoDataDir = c.Kernel.GeoDataDir
+	}
+	nodeCfg.Cert.CertDir = filepath.Join(nodeCfg.Kernel.ConfigDir, "certs")
+
+	return &nodeCfg
+}
+
 func InitLogger(cfg LogConfig) {
 	var minLevel slog.Level
 	switch cfg.Level {
@@ -419,4 +854,53 @@ func InitLogger(cfg LogConfig) {
 	nlog.Init(w, minLevel, useColor)
 	// Application logging goes through nlog; silence slog.Default for stray library use.
 	slog.SetDefault(slog.New(slog.DiscardHandler))
+}
+
+// ValidateStartupLayout checks that multiple instances do not conflict on
+// health ports, kernel config directories, or node bindings.
+func ValidateStartupLayout(instances []*Config) error {
+	healthPorts := make(map[int]string)
+	configDirs := make(map[string]string)
+	nodeBindings := make(map[string]string)
+	for _, instance := range instances {
+		if instance == nil {
+			continue
+		}
+		owner := instance.InstanceID
+		if instance.HealthPort > 0 {
+			if other, ok := healthPorts[instance.HealthPort]; ok {
+				return fmt.Errorf("health_port %d is used by both %s and %s", instance.HealthPort, other, owner)
+			}
+			healthPorts[instance.HealthPort] = owner
+		}
+		if dir := strings.TrimSpace(instance.Kernel.ConfigDir); dir != "" {
+			if other, ok := configDirs[dir]; ok && other != owner {
+				return fmt.Errorf("kernel config_dir %q is shared by %s and %s", dir, other, owner)
+			}
+			configDirs[dir] = owner
+		}
+		// Machine mode discovers nodes dynamically — skip static binding check,
+		// but still validate custom_config if set at the instance level.
+		if instance.IsMachineMode() {
+			if path := strings.TrimSpace(instance.Kernel.CustomConfig); path != "" {
+				if _, err := os.Stat(path); err != nil {
+					return fmt.Errorf("kernel.custom_config %q for %s: %w", path, owner, err)
+				}
+			}
+			continue
+		}
+		for _, node := range instance.ExpandNodes() {
+			binding := fmt.Sprintf("%s/%d", strings.TrimSpace(node.Panel.URL), node.Panel.NodeID)
+			if other, ok := nodeBindings[binding]; ok {
+				return fmt.Errorf("node binding %s is declared by both %s and %s", binding, other, owner)
+			}
+			nodeBindings[binding] = owner
+			if path := strings.TrimSpace(node.Kernel.CustomConfig); path != "" {
+				if _, err := os.Stat(path); err != nil {
+					return fmt.Errorf("kernel.custom_config %q for %s: %w", path, owner, err)
+				}
+			}
+		}
+	}
+	return nil
 }

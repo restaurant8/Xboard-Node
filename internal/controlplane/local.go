@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/model"
@@ -23,10 +24,14 @@ func (l *LocalControlPlane) Initial(ctx context.Context, _ func() map[string]int
 		return Bootstrap{}, ctx.Err()
 	default:
 	}
+	nodeSpec, err := model.NodeSpecFromStandaloneValidated(l.cfg)
+	if err != nil {
+		return Bootstrap{}, fmt.Errorf("load standalone node config: %w", err)
+	}
 	return Bootstrap{
 		PushInterval: l.cfg.Node.PushInterval,
 		PullInterval: l.cfg.Node.PullInterval,
-		Config:       model.NodeSpecFromStandalone(l.cfg),
+		Config:       nodeSpec,
 		Users:        model.UserSpecsFromStandalone(l.cfg),
 	}, nil
 }

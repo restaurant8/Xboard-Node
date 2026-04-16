@@ -65,6 +65,27 @@ func NodeSpecFromPanel(nc *panel.NodeConfig) *NodeSpec {
 		})
 	}
 
+	customRouteRules := make([]CustomRouteRule, 0, len(nc.CustomRouteRules))
+	for _, rule := range nc.CustomRouteRules {
+		customRouteRules = append(customRouteRules, CustomRouteRule{
+			Name:     rule.Name,
+			Disabled: rule.Disabled,
+			Match: RouteMatch{
+				Domains:        cloneStringSlice(rule.Match.Domains),
+				DomainSuffixes: cloneStringSlice(rule.Match.DomainSuffixes),
+				IPCIDRs:        cloneStringSlice(rule.Match.IPCIDRs),
+				Ports:          cloneStringSlice(rule.Match.Ports),
+				Networks:       cloneStringSlice(rule.Match.Networks),
+				SourceCIDRs:    cloneStringSlice(rule.Match.SourceCIDRs),
+				SourcePorts:    cloneStringSlice(rule.Match.SourcePorts),
+			},
+			Action: RouteAction{
+				Type:   rule.Action.Type,
+				Target: rule.Action.Target,
+			},
+		})
+	}
+
 	return &NodeSpec{
 		Protocol:            nc.Protocol,
 		ListenIP:            nc.ListenIP,
@@ -76,6 +97,7 @@ func NodeSpecFromPanel(nc *panel.NodeConfig) *NodeSpec {
 		KernelLogLevel:      nc.KernelLogLevel,
 		CustomOutbounds:     outbounds,
 		CustomRoutes:        cloneMapSlice(nc.CustomRoutes),
+		CustomRouteRules:    customRouteRules,
 		CertConfig:          certCfg,
 		AutoTLS:             nc.AutoTLS,
 		Domain:              nc.Domain,
@@ -101,6 +123,14 @@ func NodeSpecFromPanel(nc *panel.NodeConfig) *NodeSpec {
 		Multiplex:           multiplex,
 		AcceptProxyProtocol: nc.AcceptProxyProtocol,
 	}
+}
+
+func NodeSpecFromPanelValidated(nc *panel.NodeConfig, kcfg config.KernelConfig) (*NodeSpec, error) {
+	spec := NodeSpecFromPanel(nc)
+	if err := ValidateNodeSpec(spec, kcfg); err != nil {
+		return nil, err
+	}
+	return spec, nil
 }
 
 func UserSpecsFromPanel(users []panel.User) []UserSpec {
@@ -174,6 +204,27 @@ func (n *NodeSpec) ToPanel() *panel.NodeConfig {
 		})
 	}
 
+	customRouteRules := make([]panel.CustomRouteRule, 0, len(n.CustomRouteRules))
+	for _, rule := range n.CustomRouteRules {
+		customRouteRules = append(customRouteRules, panel.CustomRouteRule{
+			Name:     rule.Name,
+			Disabled: rule.Disabled,
+			Match: panel.RouteMatch{
+				Domains:        cloneStringSlice(rule.Match.Domains),
+				DomainSuffixes: cloneStringSlice(rule.Match.DomainSuffixes),
+				IPCIDRs:        cloneStringSlice(rule.Match.IPCIDRs),
+				Ports:          cloneStringSlice(rule.Match.Ports),
+				Networks:       cloneStringSlice(rule.Match.Networks),
+				SourceCIDRs:    cloneStringSlice(rule.Match.SourceCIDRs),
+				SourcePorts:    cloneStringSlice(rule.Match.SourcePorts),
+			},
+			Action: panel.RouteAction{
+				Type:   rule.Action.Type,
+				Target: rule.Action.Target,
+			},
+		})
+	}
+
 	return &panel.NodeConfig{
 		Protocol:            n.Protocol,
 		ListenIP:            n.ListenIP,
@@ -185,6 +236,7 @@ func (n *NodeSpec) ToPanel() *panel.NodeConfig {
 		KernelLogLevel:      n.KernelLogLevel,
 		CustomOutbounds:     outbounds,
 		CustomRoutes:        cloneMapSlice(n.CustomRoutes),
+		CustomRouteRules:    customRouteRules,
 		CertConfig:          certCfg,
 		AutoTLS:             n.AutoTLS,
 		Domain:              n.Domain,

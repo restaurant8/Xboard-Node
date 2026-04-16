@@ -1,0 +1,794 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"sort"
+	"strings"
+	"text/tabwriter"
+	"time"
+
+	"github.com/cedar2025/xboard-node/internal/config"
+	"gopkg.in/yaml.v3"
+)
+
+const (
+	defaultConfigPath      = "/etc/xboard-node/config.yml"
+	defaultMetaPath        = "/etc/xboard-node/install-meta.json"
+	defaultCredentialsPath = "/etc/xboard-node/credentials.env"
+	defaultInstallerPath   = "/etc/xboard-node/install.sh"
+	defaultBinaryPath      = "/usr/local/bin/xboard-node"
+	defaultCLIPath         = "/usr/local/bin/xbctl"
+	defaultHealthURL       = "http://127.0.0.1:65530/healthz"
+	serviceName            = "xboard-node.service"
+)
+
+var (
+	version   = "dev"
+	buildTime = "unknown"
+)
+
+type instanceRow struct {
+	ID      string `json:"id"`
+	Mode    string `json:"mode"`
+	Panel   string `json:"panel"`
+	Target  string `json:"target"`
+	Service string `json:"service"`
+	Health  string `json:"health"`
+}
+
+type fileRootConfig struct {
+	Log       *fileLogConfig     `yaml:"log,omitempty"`
+	Kernel    *fileKernelConfig  `yaml:"kernel,omitempty"`
+	Node      *fileNodeConfig    `yaml:"node,omitempty"`
+	WS        *config.WSConfig   `yaml:"ws,omitempty"`
+	Runtime   *fileRuntimeConfig `yaml:"runtime,omitempty"`
+	Cert      *config.CertConfig `yaml:"cert,omitempty"`
+	Instances []fileInstance      `yaml:"instances,omitempty"`
+}
+
+type fileInstance struct {
+	ID         string             `yaml:"id,omitempty"`
+	Panel      filePanelConfig    `yaml:"panel"`
+	Node       *fileNodeConfig    `yaml:"node,omitempty"`
+	Kernel     fileKernelConfig   `yaml:"kernel"`
+	Log        fileLogConfig      `yaml:"log"`
+	Runtime    *fileRuntimeConfig `yaml:"runtime,omitempty"`
+	HealthPort int                `yaml:"health_port,omitempty"`
+	Machine    *fileMachineConfig `yaml:"machine,omitempty"`
+	Standalone map[string]any     `yaml:"standalone,omitempty"`
+	Cert       *config.CertConfig `yaml:"cert,omitempty"`
+	WS         *config.WSConfig   `yaml:"ws,omitempty"`
+	Nodes      []config.NodeEntry `yaml:"nodes,omitempty"`
+}
+
+type filePanelConfig struct {
+	URL      string `yaml:"url"`
+	TokenEnv string `yaml:"token_env,omitempty"`
+	NodeID   int    `yaml:"node_id,omitempty"`
+	NodeType string `yaml:"node_type,omitempty"`
+}
+
+type fileMachineConfig struct {
+	MachineID int    `yaml:"machine_id"`
+	TokenEnv  string `yaml:"token_env,omitempty"`
+}
+
+type fileNodeConfig struct {
+	PushInterval         int `yaml:"push_interval,omitempty"`
+	PullInterval         int `yaml:"pull_interval,omitempty"`
+	TrackInterval        int `yaml:"track_interval,omitempty"`
+	DeviceReportInterval int `yaml:"device_report_interval,omitempty"`
+}
+
+type fileKernelConfig struct {
+	Type         string           `yaml:"type"`
+	ConfigDir    string           `yaml:"config_dir"`
+	LogLevel     string           `yaml:"log_level,omitempty"`
+	GeoDataDir   string           `yaml:"geo_data_dir,omitempty"`
+	CustomConfig string           `yaml:"custom_config,omitempty"`
+	CustomRoute  []map[string]any `yaml:"custom_route,omitempty"`
+	CustomOut    []map[string]any `yaml:"custom_outbound,omitempty"`
+}
+
+type fileLogConfig struct {
+	Level  string `yaml:"level,omitempty"`
+	Output string `yaml:"output,omitempty"`
+}
+
+type fileRuntimeConfig struct {
+	GoMemLimit  string `yaml:"gomemlimit,omitempty"`
+	GoGCPercent int    `yaml:"gogc,omitempty"`
+}
+
+type instanceSummary struct {
+	ID         string `json:"id"`
+	PanelURL   string `json:"panel_url"`
+	Mode       string `json:"mode"`
+	NodeID     *int   `json:"node_id"`
+	MachineID  *int   `json:"machine_id"`
+	HealthPort int    `json:"health_port"`
+}
+
+type installMeta struct {
+	ConfigMode       string            `json:"config_mode"`
+	Version          string            `json:"version"`
+	LatestInstanceID string            `json:"latest_instance_id"`
+	InstanceCount    int               `json:"instance_count"`
+	Instances        []instanceSummary `json:"instances"`
+	UpdatedAt        string            `json:"updated_at"`
+}
+
+func loadInstallMeta(path string) (*installMeta, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	meta := &installMeta{}
+	if err := json.Unmarshal(data, meta); err != nil {
+		return nil, fmt.Errorf("parse install meta: %w", err)
+	}
+	return meta, nil
+}
+
+func main() {
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func run(args []string) error {
+	if len(args) == 0 {
+		printUsage()
+		return nil
+	}
+	switch args[0] {
+	case "status":
+		return runStatus()
+	case "list":
+		return runList(args[1:])
+	case "instance":
+		return runInstance(args[1:])
+	case "service":
+		return runService(args[1:])
+	case "logs":
+		return runService([]string{"logs"})
+	case "health":
+		return runHealth()
+	case "bind":
+		return runBind(args[1:])
+	case "bind-node":
+		return runBind(append([]string{"add-node"}, args[1:]...))
+	case "bind-machine":
+		return runBind(append([]string{"add-machine"}, args[1:]...))
+	case "unbind-node":
+		return runBind(append([]string{"remove-node"}, args[1:]...))
+	case "unbind-machine":
+		return runBind(append([]string{"remove-machine"}, args[1:]...))
+	case "start", "stop", "restart":
+		return runService(args)
+	case "upgrade":
+		return runInstaller(append([]string{"upgrade"}, args[1:]...))
+	case "uninstall":
+		return runInstaller(append([]string{"uninstall"}, args[1:]...))
+	case "version", "-v", "--version":
+		fmt.Printf("xbctl %s (built %s)\n", version, buildTime)
+		return nil
+	case "help", "-h", "--help":
+		printUsage()
+		return nil
+	default:
+		return fmt.Errorf("unknown command: %s", args[0])
+	}
+}
+
+func printUsage() {
+	fmt.Println(`xbctl commands:
+  xbctl help
+  xbctl status
+  xbctl list [--output text|json]
+  xbctl instance list [--output text|json]
+  xbctl instance get <id> [--output text|json]
+  xbctl service status|start|stop|restart|logs
+  xbctl health
+  xbctl bind add-node --panel URL --token TOKEN --node-id ID [--node-type TYPE] [--kernel singbox|xray]
+  xbctl bind add-machine --panel URL --token TOKEN --machine-id ID [--kernel singbox|xray]
+  xbctl bind remove-node --panel URL --node-id ID
+  xbctl bind remove-machine --panel URL --machine-id ID
+  xbctl bind-node ...
+  xbctl bind-machine ...
+  xbctl unbind-node --panel URL --node-id ID
+  xbctl unbind-machine --panel URL --machine-id ID
+  xbctl upgrade [...]
+  xbctl uninstall [...]`)
+}
+
+func runStatus() error {
+	return runInstaller([]string{"status"})
+}
+
+func runList(args []string) error {
+	output := parseOutput(args)
+	rows, err := collectInstanceRows()
+	if err != nil {
+		return err
+	}
+	return printRows(rows, output)
+}
+
+func runInstance(args []string) error {
+	if len(args) == 0 {
+		return runList(nil)
+	}
+	if args[0] == "list" {
+		return runList(args[1:])
+	}
+	if args[0] != "get" {
+		return fmt.Errorf("unknown instance command: %s", args[0])
+	}
+	if len(args) < 2 {
+		return errors.New("usage: xbctl instance get <id> [--output text|json]")
+	}
+	id := args[1]
+	output := parseOutput(args[2:])
+	rows, err := collectInstanceRows()
+	if err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if row.ID == id {
+			return printRows([]instanceRow{row}, output)
+		}
+	}
+	return fmt.Errorf("instance not found: %s", id)
+}
+
+func runService(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: xbctl service <status|start|stop|restart|logs>")
+	}
+	sub := args[0]
+	rest := args[1:]
+	switch sub {
+	case "status":
+		return runCommand("sudo", append([]string{"systemctl", "status", serviceName, "--no-pager"}, rest...)...)
+	case "start", "stop", "restart":
+		return runCommand("sudo", append([]string{"systemctl", sub, serviceName}, rest...)...)
+	case "logs":
+		if len(rest) == 0 {
+			rest = []string{"-f"}
+		}
+		return runCommand("sudo", append([]string{"journalctl", "-u", serviceName}, rest...)...)
+	default:
+		return fmt.Errorf("unknown service command: %s", sub)
+	}
+}
+
+func runHealth() error {
+	return runCommand("curl", "-fsS", defaultHealthURL)
+}
+
+func runBind(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: xbctl bind <add-node|add-machine|remove-node|remove-machine> ...")
+	}
+	sub := args[0]
+	rest := args[1:]
+	switch sub {
+	case "add-node":
+		return runInstaller(append([]string{"--mode", "node"}, rest...))
+	case "add-machine":
+		return runInstaller(append([]string{"--mode", "machine"}, rest...))
+	case "remove-node":
+		panel, nodeID, err := parseRemoveNodeArgs(rest)
+		if err != nil {
+			return err
+		}
+		return removeBinding(panel, nodeID, 0)
+	case "remove-machine":
+		panel, machineID, err := parseRemoveMachineArgs(rest)
+		if err != nil {
+			return err
+		}
+		return removeBinding(panel, 0, machineID)
+	default:
+		return fmt.Errorf("unknown bind command: %s", sub)
+	}
+}
+
+func runInstaller(args []string) error {
+	installerPath := defaultInstallerPath
+	usingSystemInstaller := false
+	if _, err := os.Stat(installerPath); err == nil {
+		usingSystemInstaller = true
+	} else {
+		installerPath = "./install.sh"
+	}
+	all := append([]string{"bash", installerPath}, args...)
+	if usingSystemInstaller {
+		all = append(all, "--binary", defaultBinaryPath, "--xbctl-binary", defaultCLIPath)
+	}
+	return runCommand("sudo", all...)
+}
+
+func runCommand(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	return cmd.Run()
+}
+
+func parseOutput(args []string) string {
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--output" && i+1 < len(args) {
+			return args[i+1]
+		}
+		if strings.HasPrefix(args[i], "--output=") {
+			return strings.TrimPrefix(args[i], "--output=")
+		}
+	}
+	return "text"
+}
+
+func parseRemoveNodeArgs(args []string) (string, int, error) {
+	var panel string
+	var nodeID int
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--panel", "-a", "--api":
+			if i+1 >= len(args) {
+				return "", 0, errors.New("missing value for --panel")
+			}
+			panel = args[i+1]
+			i++
+		case "--node-id", "-n":
+			if i+1 >= len(args) {
+				return "", 0, errors.New("missing value for --node-id")
+			}
+			var err error
+			nodeID, err = parsePositiveInt(args[i+1], "node-id")
+			if err != nil {
+				return "", 0, err
+			}
+			i++
+		default:
+			return "", 0, fmt.Errorf("unknown remove-node arg: %s", args[i])
+		}
+	}
+	if strings.TrimSpace(panel) == "" || nodeID <= 0 {
+		return "", 0, errors.New("usage: xbctl bind remove-node --panel URL --node-id ID")
+	}
+	return strings.TrimSpace(panel), nodeID, nil
+}
+
+func parseRemoveMachineArgs(args []string) (string, int, error) {
+	var panel string
+	var machineID int
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--panel", "-a", "--api":
+			if i+1 >= len(args) {
+				return "", 0, errors.New("missing value for --panel")
+			}
+			panel = args[i+1]
+			i++
+		case "--machine-id":
+			if i+1 >= len(args) {
+				return "", 0, errors.New("missing value for --machine-id")
+			}
+			var err error
+			machineID, err = parsePositiveInt(args[i+1], "machine-id")
+			if err != nil {
+				return "", 0, err
+			}
+			i++
+		default:
+			return "", 0, fmt.Errorf("unknown remove-machine arg: %s", args[i])
+		}
+	}
+	if strings.TrimSpace(panel) == "" || machineID <= 0 {
+		return "", 0, errors.New("usage: xbctl bind remove-machine --panel URL --machine-id ID")
+	}
+	return strings.TrimSpace(panel), machineID, nil
+}
+
+func parsePositiveInt(raw string, field string) (int, error) {
+	var value int
+	_, err := fmt.Sscanf(raw, "%d", &value)
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("invalid %s: %s", field, raw)
+	}
+	return value, nil
+}
+
+func removeBinding(panelURL string, nodeID int, machineID int) error {
+	root, err := loadWritableRootConfig(defaultConfigPath)
+	if err != nil {
+		return err
+	}
+	instances := normalizeRootInstances(root)
+	if len(instances) == 0 {
+		return errors.New("no instances configured")
+	}
+
+	kept := make([]config.Config, 0, len(instances))
+	removed := make([]config.Config, 0, 1)
+	for _, inst := range instances {
+		matched := strings.TrimSpace(inst.Panel.URL) == strings.TrimSpace(panelURL)
+		if nodeID > 0 {
+			matched = matched && !inst.IsMachineMode() && inst.Panel.NodeID == nodeID
+		}
+		if machineID > 0 {
+			matched = matched && inst.IsMachineMode() && inst.Machine != nil && inst.Machine.MachineID == machineID
+		}
+		if matched {
+			removed = append(removed, inst)
+			continue
+		}
+		kept = append(kept, inst)
+	}
+	if len(removed) == 0 {
+		if nodeID > 0 {
+			return fmt.Errorf("binding not found: panel=%s node_id=%d", panelURL, nodeID)
+		}
+		return fmt.Errorf("binding not found: panel=%s machine_id=%d", panelURL, machineID)
+	}
+	if len(kept) == 0 {
+		return errors.New("refusing to remove the last binding; use xbctl uninstall if you want to remove everything")
+	}
+
+	root.Instances = kept
+	// Preserve top-level shared settings (log, kernel, etc.) — instances inherit from these.
+	if err := writeRootConfig(defaultConfigPath, root); err != nil {
+		return err
+	}
+	if err := pruneCredentialKeys(defaultCredentialsPath, removed); err != nil {
+		return err
+	}
+	if err := writeInstallMeta(defaultMetaPath, root); err != nil {
+		return err
+	}
+	if err := runCommand("sudo", "systemctl", "restart", serviceName); err != nil {
+		return err
+	}
+	fmt.Printf("removed %d binding(s)\n", len(removed))
+	return nil
+}
+
+func loadWritableRootConfig(path string) (*config.RootConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config file: %w", err)
+	}
+	rc := &config.RootConfig{}
+	if err := yaml.Unmarshal(data, rc); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	if len(rc.Instances) == 0 {
+		legacy := &config.Config{}
+		if err := yaml.Unmarshal(data, legacy); err != nil {
+			return nil, fmt.Errorf("parse legacy config: %w", err)
+		}
+		rc.Config = *legacy
+	}
+	return rc, nil
+}
+
+func normalizeRootInstances(root *config.RootConfig) []config.Config {
+	if len(root.Instances) > 0 {
+		return append([]config.Config(nil), root.Instances...)
+	}
+	return []config.Config{root.Config}
+}
+
+func writeRootConfig(path string, root *config.RootConfig) error {
+	instances := normalizeRootInstances(root)
+	out := fileRootConfig{Instances: make([]fileInstance, 0, len(instances))}
+
+	// Preserve top-level shared settings so instances can inherit them.
+	p := &root.Config
+	if p.Log.Level != "" || p.Log.Output != "" {
+		out.Log = &fileLogConfig{Level: p.Log.Level, Output: p.Log.Output}
+	}
+	if p.Kernel.Type != "" || p.Kernel.LogLevel != "" {
+		out.Kernel = &fileKernelConfig{Type: p.Kernel.Type, LogLevel: p.Kernel.LogLevel}
+	}
+	if p.Node.PushInterval != 0 || p.Node.PullInterval != 0 || p.Node.TrackInterval != 0 || p.Node.DeviceReportInterval != 0 {
+		out.Node = &fileNodeConfig{
+			PushInterval:         p.Node.PushInterval,
+			PullInterval:         p.Node.PullInterval,
+			TrackInterval:        p.Node.TrackInterval,
+			DeviceReportInterval: p.Node.DeviceReportInterval,
+		}
+	}
+	if p.Runtime.GoMemLimit != "" || p.Runtime.GoGCPercent != 0 {
+		out.Runtime = &fileRuntimeConfig{GoMemLimit: p.Runtime.GoMemLimit, GoGCPercent: p.Runtime.GoGCPercent}
+	}
+	if p.WS.StatusInterval != 0 || p.WS.HandshakeTimeout != 0 || p.WS.BackoffInitial != 0 {
+		out.WS = &p.WS
+	}
+	if p.Cert.CertMode != "" || p.Cert.Domain != "" || p.Cert.CertFile != "" || p.Cert.AutoTLS {
+		out.Cert = &p.Cert
+	}
+
+	for _, inst := range instances {
+		fi := fileInstance{
+			ID: inst.InstanceID,
+			Panel: filePanelConfig{
+				URL:      inst.Panel.URL,
+				TokenEnv: inst.Panel.TokenEnv,
+				NodeID:   inst.Panel.NodeID,
+				NodeType: inst.Panel.NodeType,
+			},
+			Kernel: fileKernelConfig{
+				Type:         inst.Kernel.Type,
+				ConfigDir:    inst.Kernel.ConfigDir,
+				LogLevel:     inst.Kernel.LogLevel,
+				GeoDataDir:   inst.Kernel.GeoDataDir,
+				CustomConfig: inst.Kernel.CustomConfig,
+				CustomRoute:  inst.Kernel.CustomRoute,
+				CustomOut:    inst.Kernel.CustomOutbound,
+			},
+			Log: fileLogConfig{
+				Level:  inst.Log.Level,
+				Output: inst.Log.Output,
+			},
+			HealthPort: inst.HealthPort,
+		}
+		if !inst.IsMachineMode() && (inst.Node.PushInterval != 0 || inst.Node.PullInterval != 0 || inst.Node.TrackInterval != 0 || inst.Node.DeviceReportInterval != 0) {
+			fi.Node = &fileNodeConfig{
+				PushInterval:         inst.Node.PushInterval,
+				PullInterval:         inst.Node.PullInterval,
+				TrackInterval:        inst.Node.TrackInterval,
+				DeviceReportInterval: inst.Node.DeviceReportInterval,
+			}
+		}
+		if inst.Runtime.GoMemLimit != "" || inst.Runtime.GoGCPercent != 0 {
+			fi.Runtime = &fileRuntimeConfig{
+				GoMemLimit:  inst.Runtime.GoMemLimit,
+				GoGCPercent: inst.Runtime.GoGCPercent,
+			}
+		}
+		if inst.IsMachineMode() && inst.Machine != nil {
+			fi.Machine = &fileMachineConfig{
+				MachineID: inst.Machine.MachineID,
+				TokenEnv:  inst.Machine.TokenEnv,
+			}
+			fi.Panel.NodeID = 0
+			fi.Panel.NodeType = ""
+		}
+		if inst.Cert.CertMode != "" || inst.Cert.Domain != "" || inst.Cert.CertFile != "" || inst.Cert.AutoTLS {
+			fi.Cert = &inst.Cert
+		}
+		if inst.WS.StatusInterval != 0 || inst.WS.HandshakeTimeout != 0 || inst.WS.BackoffInitial != 0 {
+			fi.WS = &inst.WS
+		}
+		if len(inst.Nodes) > 0 {
+			fi.Nodes = inst.Nodes
+		}
+		out.Instances = append(out.Instances, fi)
+	}
+	data, err := yaml.Marshal(&out)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+func pruneCredentialKeys(path string, removed []config.Config) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read credentials: %w", err)
+	}
+	removeKeys := map[string]struct{}{}
+	for _, inst := range removed {
+		if env := strings.TrimSpace(inst.Panel.TokenEnv); env != "" {
+			removeKeys[env] = struct{}{}
+		}
+		if inst.Machine != nil {
+			if env := strings.TrimSpace(inst.Machine.TokenEnv); env != "" {
+				removeKeys[env] = struct{}{}
+			}
+		}
+	}
+	lines := strings.Split(string(data), "\n")
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		key := trimmed
+		if idx := strings.Index(trimmed, "="); idx >= 0 {
+			key = trimmed[:idx]
+		}
+		if _, ok := removeKeys[key]; ok {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	output := strings.Join(kept, "\n")
+	if output != "" {
+		output += "\n"
+	}
+	return os.WriteFile(path, []byte(output), 0o600)
+}
+
+func writeInstallMeta(path string, root *config.RootConfig) error {
+	versionValue := "unknown"
+	if meta, err := loadInstallMeta(path); err == nil && strings.TrimSpace(meta.Version) != "" {
+		versionValue = meta.Version
+	}
+	instances := normalizeRootInstances(root)
+	items := make([]instanceSummary, 0, len(instances))
+	latestID := ""
+	for _, inst := range instances {
+		id, err := inst.AutoInstanceID()
+		if err != nil {
+			return err
+		}
+		latestID = id
+		item := instanceSummary{
+			ID:         id,
+			PanelURL:   inst.Panel.URL,
+			Mode:       instanceMode(inst),
+			NodeID:     intPtr(inst.Panel.NodeID),
+			MachineID:  machineIDPtr(&inst),
+			HealthPort: inst.HealthPort,
+		}
+		if item.Mode == "machine" {
+			item.NodeID = nil
+		}
+		items = append(items, item)
+	}
+	meta := installMeta{
+		ConfigMode:       "instances",
+		Version:          versionValue,
+		LatestInstanceID: latestID,
+		InstanceCount:    len(items),
+		Instances:        items,
+		UpdatedAt:        time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+	}
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal install meta: %w", err)
+	}
+	data = append(data, '\n')
+	return os.WriteFile(path, data, 0o644)
+}
+
+func instanceMode(inst config.Config) string {
+	if inst.IsMachineMode() {
+		return "machine"
+	}
+	return "node"
+}
+
+func collectInstanceRows() ([]instanceRow, error) {
+	rows, err := collectRowsFromMeta()
+	if err == nil && len(rows) > 0 {
+		return rows, nil
+	}
+	return collectRowsFromConfig()
+}
+
+func collectRowsFromMeta() ([]instanceRow, error) {
+	meta, err := loadInstallMeta(defaultMetaPath)
+	if err != nil {
+		return nil, err
+	}
+	serviceStatus := systemctlState()
+	healthStatus := healthStatus()
+	rows := make([]instanceRow, 0, len(meta.Instances))
+	for _, inst := range meta.Instances {
+		rows = append(rows, instanceRow{
+			ID:      inst.ID,
+			Mode:    inst.Mode,
+			Panel:   inst.PanelURL,
+			Target:  formatTarget(inst.NodeID, inst.MachineID),
+			Service: serviceStatus,
+			Health:  healthStatus,
+		})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	return rows, nil
+}
+
+func collectRowsFromConfig() ([]instanceRow, error) {
+	root, err := config.LoadRoot(defaultConfigPath)
+	if err != nil {
+		return nil, err
+	}
+	instances, err := root.NormalizeInstances()
+	if err != nil {
+		return nil, err
+	}
+	serviceStatus := systemctlState()
+	healthStatus := healthStatus()
+	rows := make([]instanceRow, 0, len(instances))
+	for _, inst := range instances {
+		mode := "node"
+		if inst.IsMachineMode() {
+			mode = "machine"
+		}
+		rows = append(rows, instanceRow{
+			ID:      inst.InstanceID,
+			Mode:    mode,
+			Panel:   inst.Panel.URL,
+			Target:  formatTarget(intPtr(inst.Panel.NodeID), machineIDPtr(inst)),
+			Service: serviceStatus,
+			Health:  healthStatus,
+		})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	return rows, nil
+}
+
+func printRows(rows []instanceRow, output string) error {
+	if output == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(rows)
+	}
+	var buf bytes.Buffer
+	tw := tabwriter.NewWriter(&buf, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "ID\tMODE\tPANEL\tTARGET\tSERVICE\tHEALTH")
+	for _, row := range rows {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", row.ID, row.Mode, row.Panel, row.Target, row.Service, row.Health)
+	}
+	tw.Flush()
+	_, err := fmt.Print(buf.String())
+	return err
+}
+
+func systemctlState() string {
+	cmd := exec.Command("systemctl", "is-active", serviceName)
+	out, err := cmd.Output()
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func healthStatus() string {
+	cmd := exec.Command("curl", "-fsS", defaultHealthURL)
+	if err := cmd.Run(); err != nil {
+		return "down"
+	}
+	return "ok"
+}
+
+func formatTarget(nodeID *int, machineID *int) string {
+	if nodeID != nil && *nodeID > 0 {
+		return fmt.Sprintf("node_id=%d", *nodeID)
+	}
+	if machineID != nil && *machineID > 0 {
+		return fmt.Sprintf("machine_id=%d", *machineID)
+	}
+	return ""
+}
+
+func intPtr(v int) *int {
+	if v <= 0 {
+		return nil
+	}
+	vv := v
+	return &vv
+}
+
+func machineIDPtr(cfg *config.Config) *int {
+	if cfg.Machine == nil || cfg.Machine.MachineID <= 0 {
+		return nil
+	}
+	vv := cfg.Machine.MachineID
+	return &vv
+}

@@ -1,88 +1,26 @@
 # Xboard Node Configuration
-# Copy this file to config.yml and modify as needed
+# Top-level settings are inherited by all instances. Instance overrides take precedence.
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PANEL MODE (Default)
-# Connect to an Xboard panel for config / users / reporting.
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Single node (simplest) ──
+# panel:
+#   url: "https://panel.example.com"
+#   token: "your-api-key"
+#   node_id: 1
 
-panel:
-  # Xboard panel URL (required in panel mode)
-  url: "https://panel.example.com"
-  # Server communication token (required in panel mode)
-  token: "your-server-token"
-  # Node ID as configured in the panel
-  node_id: 1
-
-# Kernel settings (used by both panel mode and standalone mode)
-kernel:
-  # Kernel type: "singbox" (default) or "xray"
-  type: "singbox"
-  # Directory to store generated configs (default: /etc/xboard-node)
-  config_dir: "/etc/xboard-node"
-  # Kernel log level: debug/info/warn/error (default: warn)
-  log_level: "warn"
-
-# TLS certificate settings
-# cert_mode: "http" | "dns" | "self" | "file" | "none"
-cert:
-  cert_mode: "none"
-  # domain: "node.example.com"
-  # email: "admin@example.com"
-  # http_port: 80
-  # dns_provider: "cloudflare"
-  # dns_env:
-  #   CF_API_TOKEN: "your-cloudflare-api-token"
-  # cert_file: "/etc/ssl/certs/cert.pem"
-  # key_file: "/etc/ssl/private/key.pem"
-  # cert_dir: "/etc/xboard-node/certs"
-
-log:
-  level: "info"
-  output: "stdout"
-
-# Standalone mode runs the node entirely from local config and never contacts
-# the panel. When enabled, panel.* is ignored.
-#
-# standalone:
-#   enabled: true
-#   node:
-#     protocol: "vless"
-#     listen_ip: "::"
-#     server_port: 8443
-#     network: "ws"
-#     tls: 1
-#     host: "node.example.com"
-#     server_name: "node.example.com"
-#     network_settings:
-#       path: "/app"
-#       host: "node.example.com"
-#     routes:
-#       - match: ["geoip:private"]
-#         action: "direct"
-#   users:
-#     - id: 1
-#       uuid: "11111111-1111-1111-1111-111111111111"
-#       speed_limit: 0
-#       device_limit: 0
-
-# Advanced / multi-node panel mode
-# When `nodes:` is present, the top-level `panel.node_id` is ignored.
-#
-# nodes:
-#   - node_id: 1
-#   - node_id: 2
-#     cert:
-#       auto_tls: true
-#       domain: "node2.example.com"
-#   - node_id: 3
-#     kernel:
-#       config_dir: "/etc/xboard-node/custom-node-3"
-
-# Runtime memory tuning (optional)
-# runtime:
-#   gomemlimit: ""
-#   gogc: 0
-
-# Health check endpoint for Docker/K8s (optional, 0 = disabled)
-# health_port: 65530
+# ── Multiple instances ──
+# kernel:
+#   type: "singbox"
+# log:
+#   level: "info"
+# instances:
+#   - panel:
+#       url: "https://panel.example.com"
+#       token: "api-key-1"
+#       node_id: 1
+#   - panel:
+#       url: "https://panel.example.com"
+#     machine:
+#       machine_id: 2
+#       token: "machine-token-2"
+#     log:
+#       level: "debug"   # override for this instance only

@@ -56,11 +56,17 @@ jobs:
             make build-linux-arm64
           fi
 
-      - name: Upload Artifact
+      - name: Upload xboard-node artifact
         uses: actions/upload-artifact@v4
         with:
           name: xboard-node-${{ matrix.goos }}-${{ matrix.goarch }}
           path: xboard-node-${{ matrix.goos }}-${{ matrix.goarch }}
+
+      - name: Upload xbctl artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xbctl-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: xbctl-${{ matrix.goos }}-${{ matrix.goarch }}
 
   build-docker:
     name: Build & Push Docker Image
@@ -118,3 +124,5 @@ jobs:
           files: |
             dist/xboard-node-linux-amd64
             dist/xboard-node-linux-arm64
+            dist/xbctl-linux-amd64
+            dist/xbctl-linux-arm64

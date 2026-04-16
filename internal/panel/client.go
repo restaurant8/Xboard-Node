@@ -25,12 +25,15 @@ var (
 	onlineMapPool  = sync.Pool{New: func() interface{} { return make(map[string]int) }}
 )
 
-// Client communicates with the Xboard panel API
+// Client communicates with the Xboard panel API.
+// When machineID > 0 the client uses machine-level authentication
+// (machine_id + token) instead of the legacy (token + node_type) scheme.
 type Client struct {
 	baseURL    string
 	token      string
 	nodeID     int
 	nodeType   string
+	machineID  int
 	httpClient *http.Client
 
 	configETag string
@@ -40,13 +43,14 @@ type Client struct {
 	apiFailure atomic.Uint64
 }
 
-// NewClient creates a new panel API client
+// NewClient creates a new panel API client.
 func NewClient(cfg config.PanelConfig) *Client {
 	return &Client{
-		baseURL:  strings.TrimRight(cfg.URL, "/"),
-		token:    cfg.Token,
-		nodeID:   cfg.NodeID,
-		nodeType: cfg.NodeType,
+		baseURL:   strings.TrimRight(cfg.URL, "/"),
+		token:     cfg.Token,
+		nodeID:    cfg.NodeID,
+		nodeType:  cfg.NodeType,
+		machineID: cfg.MachineID,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
@@ -55,6 +59,19 @@ func NewClient(cfg config.PanelConfig) *Client {
 				IdleConnTimeout:     90 * time.Second,
 			},
 		},
+	}
+}
+
+// ForNode returns a new client bound to a specific node_id, sharing the
+// same base URL, auth and HTTP transport. ETags and metric counters start fresh.
+func (c *Client) ForNode(nodeID int) *Client {
+	return &Client{
+		baseURL:    c.baseURL,
+		token:      c.token,
+		nodeID:     nodeID,
+		nodeType:   c.nodeType,
+		machineID:  c.machineID,
+		httpClient: c.httpClient,
 	}
 }
 
@@ -174,9 +191,26 @@ func decodeWeakRaw(input map[string]interface{}, output interface{}) error {
 	return decoder.Decode(input)
 }
 
+// configPath returns the API path for config fetching.
+// Machine mode uses the v2 endpoint; legacy mode uses the v1 UniProxy endpoint.
+func (c *Client) configPath() string {
+	if c.machineID > 0 {
+		return "/api/v2/server/config"
+	}
+	return "/api/v1/server/UniProxy/config"
+}
+
+// userPath returns the API path for user fetching.
+func (c *Client) userPath() string {
+	if c.machineID > 0 {
+		return "/api/v2/server/user"
+	}
+	return "/api/v1/server/UniProxy/user"
+}
+
 // GetConfig fetches node configuration. Returns nil if not modified (304).
 func (c *Client) GetConfig() (*NodeConfig, error) {
-	resp, err := c.doRequest("GET", "/api/v1/server/UniProxy/config", nil, c.configETag)
+	resp, err := c.doRequest("GET", c.configPath(), nil, c.configETag)
 	if err != nil {
 		return nil, fmt.Errorf("get config: %w", err)
 	}
@@ -214,7 +248,7 @@ func (c *Client) GetConfig() (*NodeConfig, error) {
 
 // GetUsers fetches available users. Returns nil if not modified (304).
 func (c *Client) GetUsers() ([]User, error) {
-	resp, err := c.doRequest("GET", "/api/v1/server/UniProxy/user", nil, c.userETag)
+	resp, err := c.doRequest("GET", c.userPath(), nil, c.userETag)
 	if err != nil {
 		return nil, fmt.Errorf("get users: %w", err)
 	}
@@ -280,14 +314,74 @@ func (c *Client) ResetETags() {
 	c.userETag = ""
 }
 
-// postJSON marshals a map payload (with auth fields injected) and POSTs it.
-// Auth fields are injected before marshalling — single marshal pass.
-func (c *Client) postJSON(path string, payload map[string]interface{}) error {
-	payload["token"] = c.token
-	payload["node_id"] = c.nodeID
-	if c.nodeType != "" {
-		payload["node_type"] = c.nodeType
+// GetMachineNodes fetches the list of active nodes bound to this machine.
+func (c *Client) GetMachineNodes() (*MachineNodesResponse, error) {
+	resp, err := c.doRequest("GET", "/api/v2/server/machine/nodes", nil, "")
+	if err != nil {
+		return nil, fmt.Errorf("get machine nodes: %w", err)
 	}
+	defer drainAndClose(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("machine nodes status %d: %s", resp.StatusCode, body)
+	}
+
+	var out MachineNodesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode machine nodes: %w", err)
+	}
+	return &out, nil
+}
+
+// ReportMachineStatus sends machine-level load metrics to the panel.
+func (c *Client) ReportMachineStatus(cpu float64, mem, swap, disk [2]uint64) error {
+	payload := map[string]interface{}{
+		"cpu":  cpu,
+		"mem":  map[string]interface{}{"total": mem[0], "used": mem[1]},
+		"swap": map[string]interface{}{"total": swap[0], "used": swap[1]},
+		"disk": map[string]interface{}{"total": disk[0], "used": disk[1]},
+	}
+	return c.postJSON("/api/v2/server/machine/status", payload)
+}
+
+// injectAuth writes authentication fields into a payload map.
+func (c *Client) injectAuth(m map[string]interface{}) {
+	m["token"] = c.token
+	if c.machineID > 0 {
+		m["machine_id"] = c.machineID
+		if c.nodeID > 0 {
+			m["node_id"] = c.nodeID
+		}
+	} else {
+		m["node_id"] = c.nodeID
+		if c.nodeType != "" {
+			m["node_type"] = c.nodeType
+		}
+	}
+}
+
+// authQuery builds URL query parameters for GET requests.
+func (c *Client) authQuery() url.Values {
+	q := url.Values{}
+	q.Set("token", c.token)
+	if c.machineID > 0 {
+		q.Set("machine_id", strconv.Itoa(c.machineID))
+		if c.nodeID > 0 {
+			q.Set("node_id", strconv.Itoa(c.nodeID))
+		}
+	} else {
+		q.Set("node_id", strconv.Itoa(c.nodeID))
+		if c.nodeType != "" {
+			q.Set("node_type", c.nodeType)
+		}
+	}
+	return q
+}
+
+// postJSON marshals a map payload (with auth fields injected) and POSTs it.
+func (c *Client) postJSON(path string, payload map[string]interface{}) error {
+	c.injectAuth(payload)
 
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -313,23 +407,12 @@ func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string)
 
 	var bodyReader io.Reader
 	if method == "GET" {
-		q := url.Values{}
-		q.Set("token", c.token)
-		q.Set("node_id", strconv.Itoa(c.nodeID))
-		if c.nodeType != "" {
-			q.Set("node_type", c.nodeType)
-		}
-		fullURL += "?" + q.Encode()
+		fullURL += "?" + c.authQuery().Encode()
 	} else if body != nil {
 		bodyReader = bytes.NewReader(body)
 	} else {
-		authOnly := map[string]interface{}{
-			"token":   c.token,
-			"node_id": c.nodeID,
-		}
-		if c.nodeType != "" {
-			authOnly["node_type"] = c.nodeType
-		}
+		authOnly := make(map[string]interface{})
+		c.injectAuth(authOnly)
 		merged, _ := json.Marshal(authOnly)
 		bodyReader = bytes.NewReader(merged)
 	}

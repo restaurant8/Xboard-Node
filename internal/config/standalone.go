@@ -19,17 +19,18 @@ type StandaloneNodeConfig struct {
 	ServerPort int    `yaml:"server_port"`
 	Network    string `yaml:"network,omitempty"`
 
-	NetworkSettings map[string]any       `yaml:"network_settings,omitempty"`
-	Routes          []StandaloneRouteRule `yaml:"routes,omitempty"`
+	NetworkSettings  map[string]any              `yaml:"network_settings,omitempty"`
+	Routes           []StandaloneRouteRule       `yaml:"routes,omitempty"`
+	CustomRouteRules []StandaloneCustomRouteRule `yaml:"custom_route_rules,omitempty"`
 
 	Cipher    string `yaml:"cipher,omitempty"`
 	Plugin    string `yaml:"plugin,omitempty"`
 	PluginOpt string `yaml:"plugin_opts,omitempty"`
 	ServerKey string `yaml:"server_key,omitempty"`
 
-	TLS         int    `yaml:"tls,omitempty"`
-	Flow        string `yaml:"flow,omitempty"`
-	Decryption  string `yaml:"decryption,omitempty"`
+	TLS         int            `yaml:"tls,omitempty"`
+	Flow        string         `yaml:"flow,omitempty"`
+	Decryption  string         `yaml:"decryption,omitempty"`
 	TLSSettings map[string]any `yaml:"tls_settings,omitempty"`
 
 	Host       string `yaml:"host,omitempty"`
@@ -55,6 +56,28 @@ type StandaloneRouteRule struct {
 	Match       []string `yaml:"match,omitempty"`
 	Action      string   `yaml:"action,omitempty"`
 	ActionValue string   `yaml:"action_value,omitempty"`
+}
+
+type StandaloneCustomRouteRule struct {
+	Name     string                `yaml:"name,omitempty"`
+	Disabled bool                  `yaml:"disabled,omitempty"`
+	Match    StandaloneRouteMatch  `yaml:"match,omitempty"`
+	Action   StandaloneRouteAction `yaml:"action,omitempty"`
+}
+
+type StandaloneRouteMatch struct {
+	Domains        []string `yaml:"domains,omitempty"`
+	DomainSuffixes []string `yaml:"domain_suffixes,omitempty"`
+	IPCIDRs        []string `yaml:"ip_cidrs,omitempty"`
+	Ports          []string `yaml:"ports,omitempty"`
+	Networks       []string `yaml:"networks,omitempty"`
+	SourceCIDRs    []string `yaml:"source_cidrs,omitempty"`
+	SourcePorts    []string `yaml:"source_ports,omitempty"`
+}
+
+type StandaloneRouteAction struct {
+	Type   string `yaml:"type,omitempty"`
+	Target string `yaml:"target,omitempty"`
 }
 
 type StandaloneMultiplexConfig struct {

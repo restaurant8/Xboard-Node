@@ -25,7 +25,8 @@ type Event struct {
 }
 
 type StatusChange struct {
-	Connected bool
+	Connected   bool
+	NeedsResync bool
 }
 
 type APIMetrics struct {
@@ -39,6 +40,7 @@ type Bootstrap struct {
 	Push         PushClient
 	Config       *model.NodeSpec
 	Users        []model.UserSpec
+	Mailbox      *NodeMailbox
 }
 
 type Snapshot struct {

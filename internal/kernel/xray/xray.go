@@ -62,8 +62,7 @@ type Xray struct {
 	limitDispatcher *LimitDispatcher
 	users           []model.UserSpec
 	nodeConfig      *model.NodeSpec
-	certFile        string
-	keyFile         string
+	tls             kernel.TLSCert
 	protocol        string
 	inboundTag      string
 	lastKernelHash  string
@@ -98,7 +97,7 @@ func (x *Xray) Capabilities() kernel.Capabilities {
 func (x *Xray) Protocols() []string {
 	return []string{
 		"vmess", "vless", "trojan", "shadowsocks",
-		"hysteria", "socks", "http", "dokodemo-door",
+		"hysteria",
 	}
 }
 
@@ -115,11 +114,11 @@ func (x *Xray) Protocols() []string {
 //	Phase 3 – StartNew:   instance.Start            (no lock, potentially slow)
 //	Phase 4 – Swap:       store new, extract old     (brief kernel lock)
 //	Phase 5 – RecycleOld: close old in background    (non-blocking)
-func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) error {
+func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	// ── Phase 1: Build config (no shared state) ─────────────────────────
 	x.ensureGeoData(nodeConfig)
 
-	data, err := marshalConfig(x.cfg, nodeConfig, users, certFile, keyFile)
+	data, err := marshalConfig(x.cfg, nodeConfig, users, tls)
 	if err != nil {
 		return err
 	}
@@ -152,8 +151,7 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, certFil
 	x.limitDispatcher = ld
 	x.users = users
 	x.nodeConfig = nodeConfig
-	x.certFile = certFile
-	x.keyFile = keyFile
+	x.tls = tls
 	x.protocol = nodeConfig.Protocol
 	x.inboundTag = nodeConfig.Protocol + "-in"
 	x.cumTraffic = make(map[int][2]int64)
@@ -178,14 +176,14 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, certFil
 // Since Xray does not support granular inbound reconstruction without an
 // instance restart for most transport/TLS settings, it triggers a full restart
 // if any kernel-affecting fields (hash mismatch) have changed.
-func (x *Xray) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) error {
+func (x *Xray) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
 
 	newHash := kernel.ComputeHash(nodeConfig, users)
 
 	x.mu.Lock()
-	same := x.lastKernelHash == newHash
+	same := x.lastKernelHash == newHash && tlsEqual(x.tls, tls)
 	if same {
 		x.users = users
 		x.mu.Unlock()
@@ -195,7 +193,7 @@ func (x *Xray) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, certFi
 	x.mu.Unlock()
 
 	nlog.Core().Info("xray: configuration changed, performing full restart")
-	return x.Start(nodeConfig, users, certFile, keyFile)
+	return x.Start(nodeConfig, users, tls)
 }
 
 // Stop gracefully shuts down the kernel, draining active connections first.
@@ -216,6 +214,10 @@ func (x *Xray) Stop() {
 }
 
 func (x *Xray) IsRunning() bool { return x.running.Load() }
+
+func tlsEqual(a, b kernel.TLSCert) bool {
+	return bytes.Equal(a.CertPEM, b.CertPEM) && bytes.Equal(a.KeyPEM, b.KeyPEM)
+}
 
 // ─── Observability ──────────────────────────────────────────────────────────
 
@@ -319,10 +321,10 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 	um, err := x.getUserManager()
 	if err != nil {
 		// Protocol doesn't support UserManager → full restart
-		nc, cf, kf := x.nodeConfig, x.certFile, x.keyFile
+		nc, t := x.nodeConfig, x.tls
 		x.mu.Unlock()
 		nlog.Core().Debug("xray: AddUsers fallback to restart", "reason", err)
-		if err := x.Start(nc, merged, cf, kf); err != nil {
+		if err := x.Start(nc, merged, t); err != nil {
 			return 0, err
 		}
 		return len(toAdd), nil
@@ -392,10 +394,10 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 
 	um, err := x.getUserManager()
 	if err != nil {
-		nc, cf, kf := x.nodeConfig, x.certFile, x.keyFile
+		nc, t := x.nodeConfig, x.tls
 		x.mu.Unlock()
 		nlog.Core().Debug("xray: RemoveUsers fallback to restart", "reason", err)
-		if err := x.Start(nc, kept, cf, kf); err != nil {
+		if err := x.Start(nc, kept, t); err != nil {
 			return 0, err
 		}
 		return removed, nil
@@ -448,10 +450,10 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 	um, umErr := x.getUserManager()
 	if umErr != nil {
 		// Protocol doesn't support UserManager → full restart
-		nc, cf, kf := x.nodeConfig, x.certFile, x.keyFile
+		nc, t := x.nodeConfig, x.tls
 		x.mu.Unlock()
 		nlog.Core().Debug("xray: UpdateUsers fallback to restart", "reason", umErr)
-		if err = x.Start(nc, users, cf, kf); err != nil {
+		if err = x.Start(nc, users, t); err != nil {
 			return 0, 0, err
 		}
 		return
@@ -639,8 +641,8 @@ func (x *Xray) ensureGeoData(nc *model.NodeSpec) {
 }
 
 // marshalConfig builds the xray JSON config and returns the raw bytes.
-func marshalConfig(cfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) ([]byte, error) {
-	cfgMap := buildConfig(cfg, nc, users, certFile, keyFile)
+func marshalConfig(cfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) ([]byte, error) {
+	cfgMap := buildConfig(cfg, nc, users, tls)
 	data, err := json.MarshalIndent(cfgMap, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("marshal config: %w", err)

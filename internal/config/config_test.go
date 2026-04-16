@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -67,8 +68,10 @@ panel:
 	if cfg.Kernel.Type != "singbox" {
 		t.Errorf("default kernel.type: got %q, want singbox", cfg.Kernel.Type)
 	}
-	if cfg.Kernel.ConfigDir != "/etc/xboard-node" {
-		t.Errorf("default config_dir: got %q", cfg.Kernel.ConfigDir)
+	// config_dir should default to the directory containing the config file.
+	expectedDir := filepath.Dir(path)
+	if cfg.Kernel.ConfigDir != expectedDir {
+		t.Errorf("default config_dir: got %q, want %q", cfg.Kernel.ConfigDir, expectedDir)
 	}
 	if cfg.Kernel.LogLevel != "warn" {
 		t.Errorf("default kernel log_level: got %q, want warn", cfg.Kernel.LogLevel)
@@ -82,7 +85,7 @@ panel:
 	if cfg.Cert.HTTPPort != 80 {
 		t.Errorf("default http_port: got %d, want 80", cfg.Cert.HTTPPort)
 	}
-	expectedCertDir := filepath.Join("/etc/xboard-node", "certs")
+	expectedCertDir := filepath.Join(expectedDir, "certs")
 	if cfg.Cert.CertDir != expectedCertDir {
 		t.Errorf("default cert_dir: got %q, want %q", cfg.Cert.CertDir, expectedCertDir)
 	}
@@ -321,5 +324,222 @@ kernel:
 	_, err := Load(path)
 	if err == nil {
 		t.Fatal("expected error for standalone mode without users")
+	}
+}
+
+
+func TestLoadRoot_LegacyConfigNormalizesToSingleInstance(t *testing.T) {
+	path := writeTemp(t, `
+panel:
+  url: "https://panel.example.com"
+  token: "tok"
+  node_id: 1
+`)
+	root, err := LoadRoot(path)
+	if err != nil {
+		t.Fatalf("LoadRoot: %v", err)
+	}
+	instances, err := root.NormalizeInstances()
+	if err != nil {
+		t.Fatalf("NormalizeInstances: %v", err)
+	}
+	if len(instances) != 1 {
+		t.Fatalf("instances: got %d, want 1", len(instances))
+	}
+	if instances[0].Panel.URL != "https://panel.example.com" {
+		t.Errorf("instance url: got %q", instances[0].Panel.URL)
+	}
+	if instances[0].InstanceID == "" {
+		t.Fatal("expected auto instance id")
+	}
+}
+
+func TestLoadRoot_InstancesConfig(t *testing.T) {
+	path := writeTemp(t, `
+instances:
+  - panel:
+      url: "https://panel-a.example.com"
+      token_env: "PANEL_A_TOKEN"
+      node_id: 1
+    kernel:
+      type: singbox
+  - panel:
+      url: "https://panel-b.example.com"
+    machine:
+      machine_id: 2
+      token_env: "PANEL_B_MACHINE_TOKEN"
+    kernel:
+      type: singbox
+`)
+	t.Setenv("PANEL_A_TOKEN", "token-a")
+	t.Setenv("PANEL_B_MACHINE_TOKEN", "token-b")
+	root, err := LoadRoot(path)
+	if err != nil {
+		t.Fatalf("LoadRoot: %v", err)
+	}
+	instances, err := root.NormalizeInstances()
+	if err != nil {
+		t.Fatalf("NormalizeInstances: %v", err)
+	}
+	if len(instances) != 2 {
+		t.Fatalf("instances: got %d, want 2", len(instances))
+	}
+	if instances[0].Panel.Token != "token-a" {
+		t.Errorf("panel a token: got %q", instances[0].Panel.Token)
+	}
+	if instances[1].Machine == nil || instances[1].Machine.Token != "token-b" {
+		t.Fatalf("machine token: got %+v", instances[1].Machine)
+	}
+	if instances[0].InstanceID == instances[1].InstanceID {
+		t.Fatal("expected unique instance ids")
+	}
+}
+
+func TestConfig_AutoInstanceIDStable(t *testing.T) {
+	cfg := &Config{Panel: PanelConfig{URL: "https://Panel.Example.com/", NodeID: 1, Token: "tok"}}
+	cfg.setDefaultsFrom("/etc/xboard-node")
+	id1, err := cfg.AutoInstanceID()
+	if err != nil {
+		t.Fatalf("AutoInstanceID: %v", err)
+	}
+	id2, err := cfg.AutoInstanceID()
+	if err != nil {
+		t.Fatalf("AutoInstanceID second: %v", err)
+	}
+	if id1 != id2 {
+		t.Fatalf("ids differ: %q vs %q", id1, id2)
+	}
+}
+
+func TestLoadRoot_InheritanceFromTopLevel(t *testing.T) {
+	path := writeTemp(t, `
+log:
+  level: "debug"
+  output: "stderr"
+kernel:
+  type: xray
+  log_level: "error"
+node:
+  push_interval: 42
+  pull_interval: 99
+instances:
+  - panel:
+      url: "https://panel.example.com"
+      token: "tok-a"
+      node_id: 1
+  - panel:
+      url: "https://panel.example.com"
+      token: "tok-b"
+      node_id: 2
+    log:
+      level: "warn"
+`)
+	root, err := LoadRoot(path)
+	if err != nil {
+		t.Fatalf("LoadRoot: %v", err)
+	}
+	if len(root.Instances) != 2 {
+		t.Fatalf("instances: got %d, want 2", len(root.Instances))
+	}
+	// Instance 0: inherits everything from top-level.
+	inst0 := root.Instances[0]
+	if inst0.Log.Level != "debug" {
+		t.Errorf("inst0 log.level: got %q, want %q", inst0.Log.Level, "debug")
+	}
+	if inst0.Log.Output != "stderr" {
+		t.Errorf("inst0 log.output: got %q, want %q", inst0.Log.Output, "stderr")
+	}
+	if inst0.Kernel.Type != "xray" {
+		t.Errorf("inst0 kernel.type: got %q, want %q", inst0.Kernel.Type, "xray")
+	}
+	if inst0.Kernel.LogLevel != "error" {
+		t.Errorf("inst0 kernel.log_level: got %q, want %q", inst0.Kernel.LogLevel, "error")
+	}
+	if inst0.Node.PushInterval != 42 {
+		t.Errorf("inst0 push_interval: got %d, want 42", inst0.Node.PushInterval)
+	}
+	if inst0.Node.PullInterval != 99 {
+		t.Errorf("inst0 pull_interval: got %d, want 99", inst0.Node.PullInterval)
+	}
+	// Instance 1: overrides log.level, inherits the rest.
+	inst1 := root.Instances[1]
+	if inst1.Log.Level != "warn" {
+		t.Errorf("inst1 log.level: got %q, want %q", inst1.Log.Level, "warn")
+	}
+	if inst1.Log.Output != "stderr" {
+		t.Errorf("inst1 log.output: got %q, want %q", inst1.Log.Output, "stderr")
+	}
+	if inst1.Kernel.Type != "xray" {
+		t.Errorf("inst1 kernel.type: got %q, want %q", inst1.Kernel.Type, "xray")
+	}
+}
+
+func TestLoadRoot_InstanceOrderDoesNotAffectConfigDir(t *testing.T) {
+	yamlTmpl := func(first, second int) string {
+		return fmt.Sprintf(`
+instances:
+  - panel:
+      url: "https://panel.example.com"
+      token: "tok-a"
+      node_id: %d
+  - panel:
+      url: "https://panel.example.com"
+      token: "tok-b"
+      node_id: %d
+`, first, second)
+	}
+
+	path1 := writeTemp(t, yamlTmpl(1, 2))
+	path2 := writeTemp(t, yamlTmpl(2, 1))
+	root1, err := LoadRoot(path1)
+	if err != nil {
+		t.Fatalf("LoadRoot order1: %v", err)
+	}
+	root2, err := LoadRoot(path2)
+	if err != nil {
+		t.Fatalf("LoadRoot order2: %v", err)
+	}
+
+	// Collect the config_dir suffix (relative to base) by InstanceID.
+	suffix := func(instances []Config) map[string]string {
+		m := map[string]string{}
+		for _, inst := range instances {
+			// The config_dir ends with .../{instanceID}, extract last component.
+			m[inst.InstanceID] = filepath.Base(inst.Kernel.ConfigDir)
+		}
+		return m
+	}
+	dirs1 := suffix(root1.Instances)
+	dirs2 := suffix(root2.Instances)
+
+	for id, s1 := range dirs1 {
+		s2, ok := dirs2[id]
+		if !ok {
+			t.Fatalf("instance %q missing in reversed order", id)
+		}
+		if s1 != s2 {
+			t.Errorf("instance %q config_dir suffix differs: %q vs %q", id, s1, s2)
+		}
+	}
+}
+
+func TestInheritFrom_AutoTLSNotForcedWhenChildHasCertMode(t *testing.T) {
+	parent := &Config{Cert: CertConfig{AutoTLS: true, Domain: "example.com"}}
+	child := &Config{Cert: CertConfig{CertMode: "file", CertFile: "/etc/cert.pem"}}
+	child.inheritFrom(parent)
+	if child.Cert.AutoTLS {
+		t.Error("auto_tls should NOT be inherited when child has explicit cert_mode")
+	}
+	if child.Cert.Domain != "example.com" {
+		t.Errorf("domain: got %q, want %q", child.Cert.Domain, "example.com")
+	}
+}
+
+func TestInheritFrom_AutoTLSInheritedWhenChildHasNoCertConfig(t *testing.T) {
+	parent := &Config{Cert: CertConfig{AutoTLS: true, Domain: "example.com"}}
+	child := &Config{}
+	child.inheritFrom(parent)
+	if !child.Cert.AutoTLS {
+		t.Error("auto_tls should be inherited when child has no cert config")
 	}
 }

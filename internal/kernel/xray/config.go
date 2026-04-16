@@ -2,7 +2,9 @@ package xray
 
 import (
 	"encoding/base64"
+	"encoding/pem"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -14,7 +16,7 @@ import (
 // M is a shorthand for building JSON-like maps
 type M = map[string]interface{}
 
-func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
+func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
 	var outbounds []M
 	tags := make(map[string]bool)
 
@@ -66,7 +68,7 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 		"outbounds": outbounds,
 	}
 
-	inbound := buildInbound(nc, users, certFile, keyFile)
+	inbound := buildInbound(nc, users, tc)
 	if inbound != nil {
 		cfg["inbounds"] = []M{inbound}
 	} else {
@@ -76,7 +78,7 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 	}
 
 	// Merge panel routes and static config routes
-	cfg["routing"] = buildRouting(nc.Routes, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute))
+	cfg["routing"] = buildRouting(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute))
 
 	mergeCustomXray(cfg, kcfg)
 	return cfg
@@ -195,7 +197,7 @@ func xrayLogLevel(singboxLevel string) string {
 	}
 }
 
-func buildInbound(nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
+func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
 	listenAddr := "::"
 	if nc.ListenIP != "" {
 		listenAddr = nc.ListenIP
@@ -214,19 +216,19 @@ func buildInbound(nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile 
 
 	switch nc.Protocol {
 	case "vmess":
-		return buildVMess(base, nc, users, certFile, keyFile)
+		return buildVMess(base, nc, users, tc)
 	case "vless":
-		return buildVLESS(base, nc, users, certFile, keyFile)
+		return buildVLESS(base, nc, users, tc)
 	case "trojan":
-		return buildTrojan(base, nc, users, certFile, keyFile)
+		return buildTrojan(base, nc, users, tc)
 	case "shadowsocks":
 		return buildShadowsocks(base, nc, users)
 	case "socks":
 		return buildSocks(base, users)
 	case "http":
-		return buildHTTP(base, nc, users, certFile, keyFile)
+		return buildHTTP(base, nc, users, tc)
 	case "hysteria":
-		return buildHysteria(base, nc, users, certFile, keyFile)
+		return buildHysteria(base, nc, users, tc)
 	default:
 		return nil
 	}
@@ -238,7 +240,7 @@ func userEmail(userID int) string {
 	return fmt.Sprintf("user@%d", userID)
 }
 
-func buildVMess(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
+func buildVMess(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
 	clients := make([]M, 0, len(users))
 	for _, u := range users {
 		clients = append(clients, M{
@@ -249,11 +251,11 @@ func buildVMess(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, ke
 	}
 	base["settings"] = M{"clients": clients}
 
-	applyStreamSettings(base, nc, certFile, keyFile)
+	applyStreamSettings(base, nc, tc)
 	return base
 }
 
-func buildVLESS(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
+func buildVLESS(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
 	clients := make([]M, 0, len(users))
 	for _, u := range users {
 		client := M{
@@ -274,11 +276,11 @@ func buildVLESS(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, ke
 		"decryption": decryption,
 	}
 
-	applyStreamSettings(base, nc, certFile, keyFile)
+	applyStreamSettings(base, nc, tc)
 	return base
 }
 
-func buildTrojan(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
+func buildTrojan(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
 	clients := make([]M, len(users))
 	for i := range users {
 		u := &users[i]
@@ -289,7 +291,7 @@ func buildTrojan(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, k
 	}
 	base["settings"] = M{"clients": clients}
 
-	applyStreamSettings(base, nc, certFile, keyFile)
+	applyStreamSettings(base, nc, tc)
 
 	// Trojan requires TLS or Reality to be enabled.
 	// If the panel didn't explicitly set TLS=1 or TLS=2, but we have certs,
@@ -297,7 +299,7 @@ func buildTrojan(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, k
 	ss, _ := base["streamSettings"].(M)
 	if security, ok := ss["security"].(string); !ok || (security != "tls" && security != "reality") {
 		nc.TLS = 1 // Force internal state to trigger TLS build in applyStreamSettings
-		applyStreamSettings(base, nc, certFile, keyFile)
+		applyStreamSettings(base, nc, tc)
 	}
 
 	return base
@@ -378,7 +380,7 @@ func buildSocks(base M, users []model.UserSpec) M {
 	return base
 }
 
-func buildHTTP(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
+func buildHTTP(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
 	base["protocol"] = "http"
 	accounts := make([]M, 0, len(users))
 	for _, u := range users {
@@ -393,13 +395,13 @@ func buildHTTP(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, key
 	}
 
 	if nc.TLS == 1 {
-		applyStreamSettings(base, nc, certFile, keyFile)
+		applyStreamSettings(base, nc, tc)
 	}
 	return base
 }
 
 // buildHysteria creates a Hysteria v2 inbound for xray-core.
-func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, certFile, keyFile string) M {
+func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
 	if nc.Version != 2 {
 		nlog.Core().Warn("xray: only supports hysteria v2, skipping v1 inbound")
 		return nil
@@ -435,16 +437,15 @@ func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, certFile,
 		}
 	}
 
-	if certFile != "" && keyFile != "" {
+	if tc.HasCert() {
 		ss["security"] = "tls"
+		tlsCert := M{
+			"certificate": []string{string(tc.CertPEM)},
+			"key":         []string{string(tc.KeyPEM)},
+		}
 		ss["tlsSettings"] = M{
-			"certificates": []M{
-				{
-					"certificateFile": certFile,
-					"keyFile":         keyFile,
-				},
-			},
-			"alpn": []string{"h3"},
+			"certificates": []M{tlsCert},
+			"alpn":         []string{"h3"},
 		}
 	} else {
 		nlog.Core().Warn("hysteria requires TLS certificate files; configure cert_mode (self, file, http, dns, or content)")
@@ -458,7 +459,7 @@ func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, certFile,
 	return base
 }
 
-func applyStreamSettings(base M, nc *model.NodeSpec, certFile, keyFile string) {
+func applyStreamSettings(base M, nc *model.NodeSpec, tc kernel.TLSCert) {
 	ss := M{}
 
 	// Network / transport
@@ -546,14 +547,17 @@ func applyStreamSettings(base M, nc *model.NodeSpec, certFile, keyFile string) {
 			if sn, ok := nc.TLSSettings["server_name"]; ok && sn != "" {
 				tlsSettings["serverName"] = sn
 			}
-		}
-		if certFile != "" && keyFile != "" {
-			tlsSettings["certificates"] = []M{
-				{
-					"certificateFile": certFile,
-					"keyFile":         keyFile,
-				},
+			// ECH server-side: extract key from tls_settings.ech
+			if echKeys := extractECHServerKeys(nc.TLSSettings); echKeys != "" {
+				tlsSettings["echServerKeys"] = echKeys
 			}
+		}
+		if tc.HasCert() {
+			tlsCert := M{
+				"certificate": []string{string(tc.CertPEM)},
+				"key":         []string{string(tc.KeyPEM)},
+			}
+			tlsSettings["certificates"] = []M{tlsCert}
 		} else {
 			// Fallback placeholder for auto-TLS environments.
 			// Xray allows empty certificates array in more cases than sing-box,
@@ -616,10 +620,18 @@ func buildRealitySettings(nc *model.NodeSpec) M {
 	return reality
 }
 
-func buildRouting(rules []model.RouteRule, customRules []map[string]any) M {
+func buildRouting(rules []model.RouteRule, customRouteRules []model.CustomRouteRule, customRules []map[string]any) M {
 	var xrayRules []M
 
-	// Custom route rules (from Panel CustomRoutes or local config) have HIGHEST priority
+	// Structured custom routes now take the highest priority for panel-managed overrides.
+	for _, rule := range customRouteRules {
+		if rule.Disabled {
+			continue
+		}
+		xrayRules = append(xrayRules, compileCustomRouteRule(rule)...)
+	}
+
+	// Raw custom routes remain the escape hatch, but no longer outrank structured rules.
 	for _, cr := range customRules {
 		xrayRules = append(xrayRules, M(cr))
 	}
@@ -643,53 +655,186 @@ func buildRouting(rules []model.RouteRule, customRules []map[string]any) M {
 	})
 
 	for _, rule := range rules {
-		if len(rule.Match) == 0 {
-			continue
-		}
-
-		var ips, domains []string
-		for _, m := range rule.Match {
-			m = strings.TrimSpace(m)
-			if m == "" {
-				continue
-			}
-			if strings.HasPrefix(m, "geoip:") {
-				ips = append(ips, m) // "geoip:cn" → ip field, passed as-is
-			} else if strings.HasPrefix(m, "geosite:") {
-				domains = append(domains, m) // "geosite:google" → domain field, passed as-is
-			} else if strings.Contains(m, "/") {
-				ips = append(ips, m)
-			} else {
-				m = strings.TrimPrefix(m, "*.")
-				domains = append(domains, "domain:"+m)
-			}
-		}
-
-		outbound := "block"
-		if rule.Action == "direct" {
-			outbound = "direct"
-		} else if rule.Action == "proxy" && rule.ActionValue != "" {
-			outbound = rule.ActionValue
-		}
-
-		if len(domains) > 0 {
-			xrayRules = append(xrayRules, M{
-				"type":        "field",
-				"domain":      domains,
-				"outboundTag": outbound,
-			})
-		}
-		if len(ips) > 0 {
-			xrayRules = append(xrayRules, M{
-				"type":        "field",
-				"ip":          ips,
-				"outboundTag": outbound,
-			})
-		}
+		xrayRules = append(xrayRules, compilePanelRouteRule(rule)...)
 	}
 
 	return M{
 		"domainStrategy": "AsIs",
 		"rules":          xrayRules,
 	}
+}
+
+func compilePanelRouteRule(rule model.RouteRule) []M {
+	if len(rule.Match) == 0 {
+		return nil
+	}
+	match := model.RouteMatch{}
+	for _, item := range rule.Match {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if strings.HasPrefix(item, "geoip:") || strings.Contains(item, "/") {
+			match.IPCIDRs = append(match.IPCIDRs, item)
+			continue
+		}
+		if strings.HasPrefix(item, "geosite:") {
+			match.Domains = append(match.Domains, item)
+			continue
+		}
+		match.DomainSuffixes = append(match.DomainSuffixes, strings.TrimPrefix(item, "*."))
+	}
+	action := model.RouteAction{Type: "block"}
+	switch rule.Action {
+	case "direct":
+		action.Type = "direct"
+	case "proxy":
+		action.Type = "route"
+		action.Target = rule.ActionValue
+	}
+	return compileCustomRouteRule(model.CustomRouteRule{Match: match, Action: action})
+}
+
+func compileCustomRouteRule(rule model.CustomRouteRule) []M {
+	outbound := xrayOutboundForAction(rule.Action)
+	var compiled []M
+
+	if len(rule.Match.Domains) > 0 || len(rule.Match.DomainSuffixes) > 0 {
+		domains := make([]string, 0, len(rule.Match.Domains)+len(rule.Match.DomainSuffixes))
+		for _, value := range rule.Match.Domains {
+			value = strings.TrimSpace(value)
+			if value == "" {
+				continue
+			}
+			domains = append(domains, value)
+		}
+		for _, value := range rule.Match.DomainSuffixes {
+			value = strings.TrimSpace(value)
+			if value == "" {
+				continue
+			}
+			domains = append(domains, "domain:"+value)
+		}
+		if len(domains) > 0 {
+			compiled = append(compiled, M{
+				"type":        "field",
+				"domain":      domains,
+				"outboundTag": outbound,
+			})
+		}
+	}
+	if len(rule.Match.IPCIDRs) > 0 {
+		compiled = append(compiled, M{
+			"type":        "field",
+			"ip":          copyStrings(rule.Match.IPCIDRs),
+			"outboundTag": outbound,
+		})
+	}
+	if len(rule.Match.Ports) > 0 {
+		compiled = append(compiled, M{
+			"type":        "field",
+			"port":        strings.Join(rule.Match.Ports, ","),
+			"outboundTag": outbound,
+		})
+	}
+	if len(rule.Match.Networks) > 0 {
+		compiled = append(compiled, M{
+			"type":        "field",
+			"network":     strings.Join(rule.Match.Networks, ","),
+			"outboundTag": outbound,
+		})
+	}
+	if len(rule.Match.SourceCIDRs) > 0 {
+		compiled = append(compiled, M{
+			"type":        "field",
+			"source":      copyStrings(rule.Match.SourceCIDRs),
+			"outboundTag": outbound,
+		})
+	}
+	if len(rule.Match.SourcePorts) > 0 {
+		compiled = append(compiled, M{
+			"type":        "field",
+			"sourcePort":  strings.Join(rule.Match.SourcePorts, ","),
+			"outboundTag": outbound,
+		})
+	}
+	return compiled
+}
+
+func xrayOutboundForAction(action model.RouteAction) string {
+	switch action.Type {
+	case "direct":
+		return "direct"
+	case "route":
+		if action.Target != "" {
+			return action.Target
+		}
+		return "block"
+	default:
+		return "block"
+	}
+}
+
+func copyStrings(src []string) []string {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]string, len(src))
+	copy(out, src)
+	return out
+}
+
+// extractECHServerKeys extracts the ECH private key from tls_settings.ech
+// and converts it from PEM to base64 for xray-core's echServerKeys field.
+func extractECHServerKeys(tlsSettings map[string]interface{}) string {
+	echRaw, ok := tlsSettings["ech"]
+	if !ok {
+		return ""
+	}
+	echMap, ok := echRaw.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	enabled, _ := echMap["enabled"].(bool)
+	if !enabled {
+		return ""
+	}
+
+	// Try inline key first, then key_path
+	var pemData []byte
+	if key, _ := echMap["key"].(string); key != "" {
+		pemData = []byte(key)
+	} else if keyPath, _ := echMap["key_path"].(string); keyPath != "" {
+		data, err := os.ReadFile(keyPath)
+		if err != nil {
+			nlog.Core().Warn("ECH enabled but key_path read failed", "error", err)
+			return ""
+		}
+		pemData = data
+	} else {
+		nlog.Core().Warn("ECH enabled but no key or key_path provided")
+		return ""
+	}
+
+	return echPEMToBase64(pemData)
+}
+
+// echPEMToBase64 parses an "ECH KEYS" PEM block and returns base64 of the raw bytes.
+// If the input is not valid PEM or has the wrong type, it returns empty string.
+func echPEMToBase64(data []byte) string {
+	trimmed := strings.TrimSpace(string(data))
+	if !strings.Contains(trimmed, "-----") {
+		// Assume already raw base64
+		return trimmed
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		nlog.Core().Warn("ECH key: invalid PEM data")
+		return ""
+	}
+	if block.Type != "ECH KEYS" {
+		nlog.Core().Warn("ECH key: unexpected PEM type", "expected", "ECH KEYS", "got", block.Type)
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(block.Bytes)
 }

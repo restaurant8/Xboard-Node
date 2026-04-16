@@ -23,6 +23,17 @@ func TestSingBoxCapabilities(t *testing.T) {
 	if caps.BuiltInTrafficStats || caps.ForceCloseConnection {
 		t.Fatalf("unexpected sing-box capabilities: %+v", caps)
 	}
+	protocols := s.Protocols()
+	found := false
+	for _, protocol := range protocols {
+		if protocol == "hysteria" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Protocols() missing hysteria: %v", protocols)
+	}
 }
 
 
