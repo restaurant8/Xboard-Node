@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,11 +25,12 @@ const (
 	defaultConfigPath      = "/etc/xboard-node/config.yml"
 	defaultMetaPath        = "/etc/xboard-node/install-meta.json"
 	defaultCredentialsPath = "/etc/xboard-node/credentials.env"
-	defaultInstallerPath   = "/etc/xboard-node/install.sh"
 	defaultBinaryPath      = "/usr/local/bin/xboard-node"
 	defaultCLIPath         = "/usr/local/bin/xbctl"
-	defaultHealthURL       = "http://127.0.0.1:65530/healthz"
 	serviceName            = "xboard-node.service"
+	serviceFilePath        = "/etc/systemd/system/xboard-node.service"
+	defaultInstallRoot     = "/etc/xboard-node"
+	downloadBase           = "https://github.com/cedar2025/xboard-node/releases"
 )
 
 var (
@@ -158,7 +162,7 @@ func run(args []string) error {
 		return runInstance(args[1:])
 	case "service":
 		return runService(args[1:])
-	case "logs":
+	case "logs", "log":
 		return runService([]string{"logs"})
 	case "health":
 		return runHealth()
@@ -172,12 +176,12 @@ func run(args []string) error {
 		return runBind(append([]string{"remove-node"}, args[1:]...))
 	case "unbind-machine":
 		return runBind(append([]string{"remove-machine"}, args[1:]...))
-	case "start", "stop", "restart":
+	case "start", "stop", "restart", "enable", "disable":
 		return runService(args)
 	case "upgrade":
-		return runInstaller(append([]string{"upgrade"}, args[1:]...))
+		return runUpgrade(args[1:])
 	case "uninstall":
-		return runInstaller(append([]string{"uninstall"}, args[1:]...))
+		return runUninstall(args[1:])
 	case "version", "-v", "--version":
 		fmt.Printf("xbctl %s (built %s)\n", version, buildTime)
 		return nil
@@ -200,22 +204,53 @@ func printUsage() {
   xbctl instance get <id> [--output text|json]
   xbctl config init --mode node|machine --panel-url URL --token TOKEN [flags]
   xbctl config health-port [--config PATH]
-  xbctl service status|start|stop|restart|logs
+  xbctl service status|start|stop|restart|enable|disable|logs
   xbctl health
-  xbctl bind add-node --panel URL --token TOKEN --node-id ID [--node-type TYPE] [--kernel singbox|xray]
-  xbctl bind add-machine --panel URL --token TOKEN --machine-id ID [--kernel singbox|xray]
+  xbctl bind add-node --panel-url URL --token TOKEN --node-id ID [--node-type TYPE] [--kernel singbox|xray]
+  xbctl bind add-machine --panel-url URL --token TOKEN --machine-id ID [--kernel singbox|xray]
+  xbctl bind remove <instance-id>
   xbctl bind remove-node --panel URL --node-id ID
   xbctl bind remove-machine --panel URL --machine-id ID
-  xbctl bind-node ...
-  xbctl bind-machine ...
-  xbctl unbind-node --panel URL --node-id ID
-  xbctl unbind-machine --panel URL --machine-id ID
-  xbctl upgrade [...]
-  xbctl uninstall [...]`)
+  xbctl upgrade [--version VERSION]
+  xbctl uninstall [--purge] [--yes]
+  xbctl version
+
+shortcuts:
+  xbctl start|stop|restart        = xbctl service start|stop|restart
+  xbctl log|logs                  = xbctl service logs
+  xbctl bind-node ...             = xbctl bind add-node ...
+  xbctl bind-machine ...          = xbctl bind add-machine ...
+  xbctl unbind-node ...           = xbctl bind remove-node ...
+  xbctl unbind-machine ...        = xbctl bind remove-machine ...`)
 }
 
 func runStatus() error {
-	return runInstaller([]string{"status"})
+	fmt.Println("xboard-node status")
+	fmt.Println()
+
+	// Version from install-meta.json
+	ver := "unknown"
+	if meta, err := loadInstallMeta(defaultMetaPath); err == nil {
+		ver = meta.Version
+	}
+	fmt.Printf("  version:  %s\n", ver)
+
+	// Service status
+	svc := systemctlState()
+	fmt.Printf("  service:  %s\n", svc)
+
+	// Health
+	health := instanceAwareHealth()
+	fmt.Printf("  health:   %s\n", health)
+	fmt.Println()
+
+	// Instance list
+	rows, err := collectInstanceRows()
+	if err != nil {
+		fmt.Printf("  (no instances found: %v)\n", err)
+		return nil
+	}
+	return printRows(rows, "text")
 }
 
 func runList(args []string) error {
@@ -256,14 +291,14 @@ func runInstance(args []string) error {
 
 func runService(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: xbctl service <status|start|stop|restart|logs>")
+		return errors.New("usage: xbctl service <status|start|stop|restart|enable|disable|logs>")
 	}
 	sub := args[0]
 	rest := args[1:]
 	switch sub {
 	case "status":
 		return runCommand("sudo", append([]string{"systemctl", "status", serviceName, "--no-pager"}, rest...)...)
-	case "start", "stop", "restart":
+	case "start", "stop", "restart", "enable", "disable":
 		return runCommand("sudo", append([]string{"systemctl", sub, serviceName}, rest...)...)
 	case "logs":
 		if len(rest) == 0 {
@@ -276,50 +311,330 @@ func runService(args []string) error {
 }
 
 func runHealth() error {
-	return runCommand("curl", "-fsS", defaultHealthURL)
+	h := instanceAwareHealth()
+	fmt.Println(h)
+	if h == "down" {
+		return errors.New("health check failed")
+	}
+	return nil
 }
 
 func runBind(args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: xbctl bind <add-node|add-machine|remove-node|remove-machine> ...")
 	}
+	if err := ensureRoot("bind"); err != nil {
+		return err
+	}
 	sub := args[0]
 	rest := args[1:]
 	switch sub {
 	case "add-node":
-		return runInstaller(append([]string{"--mode", "node"}, rest...))
+		return runBindAdd("node", rest)
 	case "add-machine":
-		return runInstaller(append([]string{"--mode", "machine"}, rest...))
+		return runBindAdd("machine", rest)
 	case "remove-node":
 		panel, nodeID, err := parseRemoveNodeArgs(rest)
 		if err != nil {
 			return err
 		}
-		return removeBinding(panel, nodeID, 0)
+		return removeBinding(panel, nodeID, 0, "")
 	case "remove-machine":
 		panel, machineID, err := parseRemoveMachineArgs(rest)
 		if err != nil {
 			return err
 		}
-		return removeBinding(panel, 0, machineID)
+		return removeBinding(panel, 0, machineID, "")
+	case "remove":
+		if len(rest) == 0 {
+			return errors.New("usage: xbctl bind remove <instance-id>")
+		}
+		return removeBinding("", 0, 0, rest[0])
 	default:
 		return fmt.Errorf("unknown bind command: %s", sub)
 	}
 }
 
-func runInstaller(args []string) error {
-	installerPath := defaultInstallerPath
-	usingSystemInstaller := false
-	if _, err := os.Stat(installerPath); err == nil {
-		usingSystemInstaller = true
+func runBindAdd(mode string, args []string) error {
+	// Build configInit args from bind args
+	initArgs := []string{
+		"--mode", mode,
+		"--config", defaultConfigPath,
+		"--output", defaultConfigPath,
+		"--credentials-in", defaultCredentialsPath,
+		"--credentials-out", defaultCredentialsPath,
+		"--meta", defaultMetaPath,
+		"--install-root", defaultInstallRoot,
+	}
+	// Pass through remaining args (--panel-url, --token, --node-id, --machine-id, --kernel, etc.)
+	initArgs = append(initArgs, args...)
+
+	if err := runConfigInit(initArgs); err != nil {
+		return fmt.Errorf("bind failed: %w", err)
+	}
+	// Restart service to pick up new config
+	fmt.Println("Restarting service...")
+	if err := runCommand("systemctl", "restart", serviceName); err != nil {
+		return fmt.Errorf("service restart failed: %w", err)
+	}
+	fmt.Println("Binding added successfully")
+	return nil
+}
+
+func runUpgrade(args []string) error {
+	if err := ensureRoot("upgrade"); err != nil {
+		return err
+	}
+
+	version := "latest"
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--version" && i+1 < len(args) {
+			version = args[i+1]
+			i++
+		}
+	}
+
+	arch := runtime.GOARCH
+	if arch != "amd64" && arch != "arm64" {
+		return fmt.Errorf("unsupported architecture: %s", arch)
+	}
+
+	fmt.Println("Starting upgrade...")
+
+	binaryDir := filepath.Dir(defaultBinaryPath)
+	cliDir := filepath.Dir(defaultCLIPath)
+	newBinary := filepath.Join(binaryDir, ".xboard-node.new")
+	newCLI := filepath.Join(cliDir, ".xbctl.new")
+
+	binaryURL := resolveDownloadURL(fmt.Sprintf("xboard-node-linux-%s", arch), version)
+	cliURL := resolveDownloadURL(fmt.Sprintf("xbctl-linux-%s", arch), version)
+
+	fmt.Printf("Downloading %s...\n", binaryURL)
+	if err := downloadFile(binaryURL, newBinary); err != nil {
+		return fmt.Errorf("download binary: %w", err)
+	}
+
+	fmt.Printf("Downloading %s...\n", cliURL)
+	if err := downloadFile(cliURL, newCLI); err != nil {
+		os.Remove(newBinary)
+		return fmt.Errorf("download xbctl: %w", err)
+	}
+
+	if err := os.Chmod(newBinary, 0o755); err != nil {
+		return cleanupFiles(newBinary, newCLI, fmt.Errorf("chmod binary: %w", err))
+	}
+	if err := os.Chmod(newCLI, 0o755); err != nil {
+		return cleanupFiles(newBinary, newCLI, fmt.Errorf("chmod xbctl: %w", err))
+	}
+
+	// Validate downloaded binaries
+	if out, err := exec.Command(newBinary, "-v").CombinedOutput(); err != nil {
+		return cleanupFiles(newBinary, newCLI, fmt.Errorf("binary version check failed: %s", string(out)))
+	}
+	if out, err := exec.Command(newCLI, "version").CombinedOutput(); err != nil {
+		return cleanupFiles(newBinary, newCLI, fmt.Errorf("xbctl version check failed: %s", string(out)))
+	}
+
+	// Backup existing binaries
+	backupBinary := defaultBinaryPath + ".bak"
+	backupCLI := defaultCLIPath + ".bak"
+	// Backup existing binaries
+	if fileExists(defaultBinaryPath) {
+		if err := copyFile(defaultBinaryPath, backupBinary); err != nil {
+			return cleanupFiles(newBinary, newCLI, fmt.Errorf("backup binary: %w", err))
+		}
+	}
+	if fileExists(defaultCLIPath) {
+		if err := copyFile(defaultCLIPath, backupCLI); err != nil {
+			return cleanupFiles(newBinary, newCLI, fmt.Errorf("backup xbctl: %w", err))
+		}
+	}
+
+	// Atomic rename
+	if err := os.Rename(newBinary, defaultBinaryPath); err != nil {
+		return cleanupFiles(newBinary, newCLI, fmt.Errorf("replace binary: %w", err))
+	}
+	if err := os.Rename(newCLI, defaultCLIPath); err != nil {
+		if fileExists(backupBinary) {
+			os.Rename(backupBinary, defaultBinaryPath)
+		}
+		os.Remove(newCLI)
+		return fmt.Errorf("replace xbctl: %w", err)
+	}
+
+	// Recreate /usr/bin/xbctl symlink
+	os.Remove("/usr/bin/xbctl")
+	os.Symlink(defaultCLIPath, "/usr/bin/xbctl")
+
+	// Restart service
+	fmt.Println("Restarting service...")
+	runCommand("systemctl", "daemon-reload")
+	if err := runCommand("systemctl", "restart", serviceName); err != nil {
+		fmt.Println("Restart failed, rolling back...")
+		rollbackOK := true
+		if fileExists(backupBinary) {
+			if e := os.Rename(backupBinary, defaultBinaryPath); e != nil {
+				fmt.Printf("Warning: rollback binary failed: %v\n", e)
+				rollbackOK = false
+			}
+		}
+		if fileExists(backupCLI) {
+			if e := os.Rename(backupCLI, defaultCLIPath); e != nil {
+				fmt.Printf("Warning: rollback xbctl failed: %v\n", e)
+				rollbackOK = false
+			}
+		}
+		runCommand("systemctl", "daemon-reload")
+		if e := runCommand("systemctl", "restart", serviceName); e != nil {
+			return fmt.Errorf("upgrade and rollback restart both failed: %w", e)
+		}
+		if rollbackOK {
+			return errors.New("upgrade failed: service restart failed, rolled back successfully")
+		}
+		return errors.New("upgrade failed: partial rollback, check binary state manually")
+	}
+
+	// Clean up backups
+	os.Remove(backupBinary)
+	os.Remove(backupCLI)
+
+	// Update install-meta.json
+	newVer := "unknown"
+	if out, err := exec.Command(defaultBinaryPath, "-v").CombinedOutput(); err == nil {
+		newVer = strings.TrimSpace(string(out))
+	}
+	if root, err := loadWritableRootConfig(defaultConfigPath); err == nil {
+		instances, _ := root.NormalizeInstances()
+		writeInstallMetaVersioned(defaultMetaPath, root, newVer, latestInstanceID(instances))
+	}
+
+	fmt.Printf("Upgrade complete (version: %s)\n", newVer)
+	return nil
+}
+
+func runUninstall(args []string) error {
+	if err := ensureRoot("uninstall"); err != nil {
+		return err
+	}
+
+	purge := false
+	yes := false
+	for _, a := range args {
+		switch a {
+		case "--purge":
+			purge = true
+		case "--yes", "-y":
+			yes = true
+		}
+	}
+
+	if !yes {
+		fmt.Print("Proceed with uninstall? [y/N]: ")
+		var answer string
+		fmt.Scanln(&answer)
+		if answer != "y" && answer != "Y" {
+			fmt.Println("Uninstall cancelled")
+			return nil
+		}
+	}
+
+	var warnings []string
+
+	// Stop and disable service
+	if fileExists(serviceFilePath) {
+		if err := runCommand("systemctl", "stop", serviceName); err != nil {
+			warnings = append(warnings, fmt.Sprintf("stop service: %v", err))
+		}
+		if err := runCommand("systemctl", "disable", serviceName); err != nil {
+			warnings = append(warnings, fmt.Sprintf("disable service: %v", err))
+		}
+		if err := os.Remove(serviceFilePath); err != nil {
+			warnings = append(warnings, fmt.Sprintf("remove service file: %v", err))
+		}
+		runCommand("systemctl", "daemon-reload")
+	}
+
+	// Remove binaries
+	// Remove binaries and symlinks
+	for _, p := range []string{defaultBinaryPath, defaultCLIPath, "/usr/bin/xbctl"} {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			warnings = append(warnings, fmt.Sprintf("remove %s: %v", p, err))
+		}
+	}
+
+	if purge {
+		if err := os.RemoveAll(defaultInstallRoot); err != nil {
+			warnings = append(warnings, fmt.Sprintf("remove %s: %v", defaultInstallRoot, err))
+		} else {
+			fmt.Printf("Removed %s\n", defaultInstallRoot)
+		}
 	} else {
-		installerPath = "./install.sh"
+		os.Remove(defaultMetaPath)
+		fmt.Printf("Config preserved under %s\n", defaultInstallRoot)
 	}
-	all := append([]string{"bash", installerPath}, args...)
-	if usingSystemInstaller {
-		all = append(all, "--binary", defaultBinaryPath, "--xbctl-binary", defaultCLIPath)
+
+	if len(warnings) > 0 {
+		fmt.Println("Uninstall completed with warnings:")
+		for _, w := range warnings {
+			fmt.Printf("  - %s\n", w)
+		}
+		return nil
 	}
-	return runCommand("sudo", all...)
+
+	fmt.Println("Uninstall complete")
+	return nil
+}
+
+func ensureRoot(cmd string) error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("%s requires root privileges; run with sudo", cmd)
+	}
+	return nil
+}
+
+func resolveDownloadURL(artifact, version string) string {
+	if version == "latest" {
+		return downloadBase + "/latest/download/" + artifact
+	}
+	return downloadBase + "/download/" + version + "/" + artifact
+}
+
+func downloadFile(url, dest string) error {
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
+	}
+	f, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = io.Copy(f, resp.Body)
+	return err
+}
+
+func cleanupFiles(a, b string, err error) error {
+	os.Remove(a)
+	os.Remove(b)
+	return err
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func copyFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0o755)
 }
 
 func runCommand(name string, args ...string) error {
@@ -413,7 +728,7 @@ func parsePositiveInt(raw string, field string) (int, error) {
 	return value, nil
 }
 
-func removeBinding(panelURL string, nodeID int, machineID int) error {
+func removeBinding(panelURL string, nodeID int, machineID int, instanceID string) error {
 	root, err := loadWritableRootConfig(defaultConfigPath)
 	if err != nil {
 		return err
@@ -426,12 +741,19 @@ func removeBinding(panelURL string, nodeID int, machineID int) error {
 	kept := make([]config.Config, 0, len(instances))
 	removed := make([]config.Config, 0, 1)
 	for _, inst := range instances {
-		matched := strings.TrimSpace(inst.Panel.URL) == strings.TrimSpace(panelURL)
-		if nodeID > 0 {
-			matched = matched && !inst.IsMachineMode() && inst.Panel.NodeID == nodeID
-		}
-		if machineID > 0 {
-			matched = matched && inst.IsMachineMode() && inst.Machine != nil && inst.Machine.MachineID == machineID
+		var matched bool
+		if instanceID != "" {
+			// Match by instance ID
+			id, _ := inst.AutoInstanceID()
+			matched = id == instanceID || inst.InstanceID == instanceID
+		} else {
+			matched = strings.TrimSpace(inst.Panel.URL) == strings.TrimSpace(panelURL)
+			if nodeID > 0 {
+				matched = matched && !inst.IsMachineMode() && inst.Panel.NodeID == nodeID
+			}
+			if machineID > 0 {
+				matched = matched && inst.IsMachineMode() && inst.Machine != nil && inst.Machine.MachineID == machineID
+			}
 		}
 		if matched {
 			removed = append(removed, inst)
@@ -440,13 +762,31 @@ func removeBinding(panelURL string, nodeID int, machineID int) error {
 		kept = append(kept, inst)
 	}
 	if len(removed) == 0 {
+		if instanceID != "" {
+			return fmt.Errorf("binding not found: id=%s", instanceID)
+		}
 		if nodeID > 0 {
 			return fmt.Errorf("binding not found: panel=%s node_id=%d", panelURL, nodeID)
 		}
 		return fmt.Errorf("binding not found: panel=%s machine_id=%d", panelURL, machineID)
 	}
 	if len(kept) == 0 {
-		return errors.New("refusing to remove the last binding; use xbctl uninstall if you want to remove everything")
+		// Last binding removed — stop the service to prevent crash-loop
+		root.Instances = nil
+		if err := writeRootConfig(defaultConfigPath, root); err != nil {
+			return err
+		}
+		if err := pruneCredentialKeys(defaultCredentialsPath, removed); err != nil {
+			return err
+		}
+		if err := writeInstallMeta(defaultMetaPath, root); err != nil {
+			return err
+		}
+		runCommand("systemctl", "stop", serviceName)
+		fmt.Printf("removed %d binding(s)\n", len(removed))
+		fmt.Println("All bindings removed. Service stopped.")
+		fmt.Println("Use 'xbctl bind add-node/add-machine' to add a new binding, or 'xbctl uninstall' to fully uninstall.")
+		return nil
 	}
 
 	root.Instances = kept
@@ -460,7 +800,7 @@ func removeBinding(panelURL string, nodeID int, machineID int) error {
 	if err := writeInstallMeta(defaultMetaPath, root); err != nil {
 		return err
 	}
-	if err := runCommand("sudo", "systemctl", "restart", serviceName); err != nil {
+	if err := runCommand("systemctl", "restart", serviceName); err != nil {
 		return err
 	}
 	fmt.Printf("removed %d binding(s)\n", len(removed))
@@ -490,11 +830,18 @@ func normalizeRootInstances(root *config.RootConfig) []config.Config {
 	if len(root.Instances) > 0 {
 		return append([]config.Config(nil), root.Instances...)
 	}
-	return []config.Config{root.Config}
+	// Only treat legacy single-config mode if the embedded Config is valid
+	if root.Config.Panel.URL != "" {
+		return []config.Config{root.Config}
+	}
+	return nil
 }
 
 func writeRootConfig(path string, root *config.RootConfig) error {
-	instances := normalizeRootInstances(root)
+	instances := root.Instances
+	if len(instances) == 0 && root.Config.Panel.URL != "" {
+		instances = []config.Config{root.Config}
+	}
 	out := fileRootConfig{Instances: make([]fileInstance, 0, len(instances))}
 
 	// Preserve top-level shared settings so instances can inherit them.
@@ -723,19 +1070,62 @@ func printRows(rows []instanceRow, output string) error {
 
 func systemctlState() string {
 	cmd := exec.Command("systemctl", "is-active", serviceName)
-	out, err := cmd.Output()
+	out, err := cmd.CombinedOutput()
+	state := strings.TrimSpace(string(out))
+	if state != "" {
+		return state
+	}
 	if err != nil {
 		return "unknown"
 	}
-	return strings.TrimSpace(string(out))
+	return state
 }
 
 func healthStatus() string {
-	cmd := exec.Command("curl", "-fsS", defaultHealthURL)
-	if err := cmd.Run(); err != nil {
+	return instanceAwareHealth()
+}
+
+func instanceAwareHealth() string {
+	port := 0
+	if meta, err := loadInstallMeta(defaultMetaPath); err == nil {
+		for _, inst := range meta.Instances {
+			if inst.HealthPort > 0 {
+				port = inst.HealthPort
+				break
+			}
+		}
+	}
+	if port == 0 {
+		if root, err := loadWritableRootConfig(defaultConfigPath); err == nil {
+			// Check top-level health_port first (inherited by all instances)
+			if root.HealthPort > 0 {
+				port = root.HealthPort
+			}
+			if port == 0 {
+				instances, _ := root.NormalizeInstances()
+				for _, inst := range instances {
+					if inst.HealthPort > 0 {
+						port = inst.HealthPort
+						break
+					}
+				}
+			}
+		}
+	}
+	if port == 0 {
+		return "disabled"
+	}
+	url := fmt.Sprintf("http://127.0.0.1:%d/healthz", port)
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
 		return "down"
 	}
-	return "ok"
+	resp.Body.Close()
+	if resp.StatusCode == 200 {
+		return "ok"
+	}
+	return "down"
 }
 
 func formatTarget(nodeID *int, machineID *int) string {
@@ -754,6 +1144,39 @@ func intPtr(v int) *int {
 	}
 	vv := v
 	return &vv
+}
+
+func latestInstanceID(instances []*config.Config) string {
+	if len(instances) > 0 {
+		id, _ := instances[len(instances)-1].AutoInstanceID()
+		return id
+	}
+	return ""
+}
+
+func regenerateServiceFile() error {
+	unit := fmt.Sprintf(`[Unit]
+Description=Xboard Node Backend
+Documentation=https://github.com/cedar2025/xboard-node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%s
+EnvironmentFile=-%s
+ExecStart=%s -c %s
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+`, defaultInstallRoot, defaultCredentialsPath, defaultBinaryPath, defaultConfigPath)
+	return os.WriteFile(serviceFilePath, []byte(unit), 0o644)
 }
 
 func machineIDPtr(cfg *config.Config) *int {
