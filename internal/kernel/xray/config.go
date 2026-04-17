@@ -529,6 +529,31 @@ func applyStreamSettings(base M, nc *model.NodeSpec, tc kernel.TLSCert) {
 		}
 		ss["httpSettings"] = h2Settings
 
+	case "xhttp", "splithttp":
+		ss["network"] = "xhttp"
+		xhttpSettings := M{}
+		if nc.NetworkSettings != nil {
+			if v, ok := nc.NetworkSettings["path"]; ok {
+				xhttpSettings["path"] = v
+			}
+			if v, ok := nc.NetworkSettings["host"]; ok {
+				xhttpSettings["host"] = v
+			}
+			if v, ok := nc.NetworkSettings["mode"]; ok {
+				xhttpSettings["mode"] = v
+			}
+			if v, ok := nc.NetworkSettings["extra"]; ok {
+				// PHP sends empty arrays [] instead of {} for empty objects;
+				// xray rejects [] for fields that expect objects (e.g. sockopt, tlsSettings).
+				// Recursively strip empty arrays from the extra map before passing to xray.
+				if m, ok := v.(map[string]interface{}); ok && len(m) > 0 {
+					sanitizeEmptyArrays(m)
+					xhttpSettings["extra"] = m
+				}
+			}
+		}
+		ss["xhttpSettings"] = xhttpSettings
+
 	case "tcp":
 		// default, no extra settings
 	}
@@ -782,6 +807,22 @@ func copyStrings(src []string) []string {
 	out := make([]string, len(src))
 	copy(out, src)
 	return out
+}
+
+// sanitizeEmptyArrays recursively removes empty slices from a map.
+// PHP encodes empty objects as [] instead of {}; xray-core rejects []
+// for fields that expect struct types (e.g. sockopt, tlsSettings).
+func sanitizeEmptyArrays(m map[string]interface{}) {
+	for k, v := range m {
+		switch val := v.(type) {
+		case []interface{}:
+			if len(val) == 0 {
+				delete(m, k)
+			}
+		case map[string]interface{}:
+			sanitizeEmptyArrays(val)
+		}
+	}
 }
 
 // extractECHServerKeys extracts the ECH private key from tls_settings.ech

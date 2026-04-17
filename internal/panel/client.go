@@ -75,6 +75,13 @@ func (c *Client) ForNode(nodeID int) *Client {
 	}
 }
 
+// ResetConfigETag clears the cached config ETag so the next GetConfig call
+// returns a full response instead of 304. Used by machine mode after a
+// pre-fetch to probe the transport type.
+func (c *Client) ResetConfigETag() {
+	c.configETag = ""
+}
+
 // Handshake calls the new v2 API to get WS config + initial data in one shot.
 func (c *Client) Handshake() (*HandshakeResponse, error) {
 	resp, err := c.doRequest("POST", "/api/v2/server/handshake", nil, "")
@@ -335,12 +342,16 @@ func (c *Client) GetMachineNodes() (*MachineNodesResponse, error) {
 }
 
 // ReportMachineStatus sends machine-level load metrics to the panel.
-func (c *Client) ReportMachineStatus(cpu float64, mem, swap, disk [2]uint64) error {
+// netIn/netOut are bytes/sec; negative values mean "unavailable" (first sample).
+func (c *Client) ReportMachineStatus(cpu float64, mem, swap, disk [2]uint64, netIn, netOut float64) error {
 	payload := map[string]interface{}{
 		"cpu":  cpu,
 		"mem":  map[string]interface{}{"total": mem[0], "used": mem[1]},
 		"swap": map[string]interface{}{"total": swap[0], "used": swap[1]},
 		"disk": map[string]interface{}{"total": disk[0], "used": disk[1]},
+	}
+	if netIn >= 0 && netOut >= 0 {
+		payload["net"] = map[string]interface{}{"in_speed": netIn, "out_speed": netOut}
 	}
 	return c.postJSON("/api/v2/server/machine/status", payload)
 }
