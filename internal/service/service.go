@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/cert"
+	"github.com/cedar2025/xboard-node/internal/cert/dnsproviders"
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/controlplane"
 	"github.com/cedar2025/xboard-node/internal/kernel"
@@ -1219,15 +1220,14 @@ func validateRuntimeCertConfig(spec *model.NodeSpec) error {
 	if mode != "dns" {
 		return nil
 	}
-	provider := strings.ToLower(strings.TrimSpace(spec.CertConfig.DNSProvider))
-	switch provider {
-	case "cloudflare", "cf", "alidns", "aliyun":
-		return nil
-	case "":
+	provider := strings.TrimSpace(spec.CertConfig.DNSProvider)
+	if provider == "" {
 		return fmt.Errorf("dns cert mode requires cert_config.dns_provider")
-	default:
-		return fmt.Errorf("unsupported cert_config.dns_provider %q (supported: cloudflare, alidns)", spec.CertConfig.DNSProvider)
 	}
+	if _, ok := dnsproviders.Get(provider); !ok {
+		return fmt.Errorf("unsupported cert_config.dns_provider %q (supported: %s)", provider, strings.Join(dnsproviders.CanonicalNames(), ", "))
+	}
+	return nil
 }
 
 func validateRealityRequirements(spec *model.NodeSpec, _ string) error {

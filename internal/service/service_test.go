@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/cert"
@@ -214,7 +215,7 @@ func TestValidateNodeRuntimeRejectsUnsupportedDNSProvider(t *testing.T) {
 	if err.Error() == "" {
 		t.Fatal("expected non-empty error")
 	}
-	if got := err.Error(); got != "unsupported cert_config.dns_provider \"3123123\" (supported: cloudflare, alidns)" {
+	if got := err.Error(); !strings.HasPrefix(got, `unsupported cert_config.dns_provider "3123123" (supported: `) {
 		t.Fatalf("unexpected error: %v", got)
 	}
 }
