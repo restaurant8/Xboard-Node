@@ -1,6 +1,6 @@
 # xboard-node
 
-Node backend for [Xboard](https://github.com/cedar2025/Xboard). Supports `sing-box` / `xray-core` dual kernels.
+Node backend for [restaurant8/Xboard](https://github.com/restaurant8/Xboard). Supports `sing-box` / `xray-core` dual kernels.
 
 > **Disclaimer**: This project is for educational and learning purposes only.
 
@@ -12,7 +12,7 @@ Node backend for [Xboard](https://github.com/cedar2025/Xboard). Supports `sing-b
 - Deploy modes: node mode, machine mode, standalone mode
 - Multi-instance: single process binding multiple panels / nodes
 
-## Install
+## Install / Upgrade
 
 ### Docker
 
@@ -33,6 +33,8 @@ docker compose up -d
 
 ### Installer (Linux systemd)
 
+New node:
+
 ```bash
 # Node mode
 curl -fsSL https://raw.githubusercontent.com/restaurant8/Xboard-Node/main/install.sh | \
@@ -41,6 +43,27 @@ curl -fsSL https://raw.githubusercontent.com/restaurant8/Xboard-Node/main/instal
 # Machine mode
 curl -fsSL https://raw.githubusercontent.com/restaurant8/Xboard-Node/main/install.sh | \
   sudo bash -s -- --mode machine --panel https://panel.example.com --token TOKEN --machine-id 1
+```
+
+Pin a specific release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/restaurant8/Xboard-Node/main/install.sh | \
+  sudo bash -s -- --mode node --panel https://panel.example.com --token TOKEN --node-id 1 --version v1.0.1
+```
+
+Existing installation:
+
+```bash
+# Recommended: keep config and only replace binaries/service file
+sudo xbctl upgrade --version v1.0.1
+
+# Or use the installer upgrade action
+curl -fsSL https://raw.githubusercontent.com/restaurant8/Xboard-Node/main/install.sh | \
+  sudo bash -s -- upgrade --version v1.0.1
+```
+
+The installer backs up the current binary/config/service before upgrading. Do not uninstall or purge an existing node unless you intentionally want to remove its local configuration.
 
 ## xbctl
 
@@ -49,6 +72,7 @@ Run `xbctl` after installation for help. Common commands:
 ```bash
 xbctl list                          # list all instances
 xbctl status                        # running status
+xbctl upgrade --version v1.0.1       # upgrade installed node
 xbctl bind add-node --panel URL --token TOKEN --node-id 1
 xbctl bind add-machine --panel URL --token TOKEN --machine-id 1
 xbctl bind remove-node --panel URL --node-id 1
