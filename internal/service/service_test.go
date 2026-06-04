@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cedar2025/xboard-node/internal/cert"
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -151,6 +152,62 @@ func TestTrafficReportRetryKeepsSameReportIDAndDoesNotMergeFreshTraffic(t *testi
 	}
 	if freshTraffic[1] != [2]int64{50, 60} || freshTraffic[2] != [2]int64{30, 40} {
 		t.Fatalf("fresh traffic = %#v, want pending deltas only", freshTraffic)
+	}
+}
+
+func TestBuildTrafficStatsUsesPrivacyAggregate(t *testing.T) {
+	s := newTestService(&fakeKernel{})
+	s.trafficStatsMode = "privacy"
+	recordAt := time.Unix(1780560000, 0)
+
+	stats := s.buildTrafficStats(map[int][2]int64{
+		1: {100, 200},
+		2: {30, 40},
+	}, recordAt)
+	if len(stats) != 1 {
+		t.Fatalf("stats len = %d, want 1", len(stats))
+	}
+
+	stat := stats[0]
+	if stat.Category != "total" {
+		t.Fatalf("category = %q, want total", stat.Category)
+	}
+	if stat.MainDomain != nil {
+		t.Fatalf("main_domain = %q, want omitted in privacy mode", *stat.MainDomain)
+	}
+	if stat.U != 130 || stat.D != 240 {
+		t.Fatalf("traffic = %d/%d, want 130/240", stat.U, stat.D)
+	}
+	if stat.RecordAt != recordAt.Unix() {
+		t.Fatalf("record_at = %d, want %d", stat.RecordAt, recordAt.Unix())
+	}
+}
+
+func TestBuildTrafficStatsDiagnosticCarriesDomainField(t *testing.T) {
+	s := newTestService(&fakeKernel{})
+	s.trafficStatsMode = "diagnostic"
+
+	stats := s.buildTrafficStats(map[int][2]int64{1: {0, 55}}, time.Unix(1780560000, 0))
+	if len(stats) != 1 {
+		t.Fatalf("stats len = %d, want 1", len(stats))
+	}
+	if stats[0].MainDomain == nil {
+		t.Fatal("main_domain should be present in diagnostic mode")
+	}
+	if *stats[0].MainDomain != "" {
+		t.Fatalf("main_domain = %q, want empty until kernel exposes domain counters", *stats[0].MainDomain)
+	}
+	if stats[0].U != 0 || stats[0].D != 55 {
+		t.Fatalf("traffic = %d/%d, want 0/55", stats[0].U, stats[0].D)
+	}
+}
+
+func TestBuildTrafficStatsDisabled(t *testing.T) {
+	s := newTestService(&fakeKernel{})
+	s.trafficStatsMode = "off"
+
+	if stats := s.buildTrafficStats(map[int][2]int64{1: {100, 200}}, time.Unix(1780560000, 0)); stats != nil {
+		t.Fatalf("stats = %#v, want nil when disabled", stats)
 	}
 }
 

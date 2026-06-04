@@ -91,7 +91,12 @@ func (p *PanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("poll config normalize: %w", err)
 	}
-	return Snapshot{Config: nodeSpec, Users: model.UserSpecsFromPanel(users)}, nil
+	return Snapshot{
+		Config:               nodeSpec,
+		Users:                model.UserSpecsFromPanel(users),
+		TrafficStatsMode:     configSnapshot.BaseConfig.TrafficStatsMode,
+		TrafficStatsInterval: configSnapshot.BaseConfig.TrafficStatsInterval,
+	}, nil
 }
 
 func (p *PanelControlPlane) Discover(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- Event, statuses chan<- StatusChange) (PushClient, error) {
@@ -111,7 +116,11 @@ func (p *PanelControlPlane) Discover(ctx context.Context, metricsFn func() map[s
 }
 
 func (p *PanelControlPlane) Report(payload ReportPayload) error {
-	return p.client.Report(payload.ReportID, payload.Traffic, payload.Alive, payload.Online, payload.CPU, payload.Mem, payload.Swap, payload.Disk, payload.Metrics)
+	return p.client.Report(
+		payload.ReportID, payload.Traffic, payload.TrafficStats, payload.Alive, payload.Online,
+		payload.CPU, payload.Mem, payload.Swap, payload.Disk,
+		payload.Metrics,
+	)
 }
 
 func (p *PanelControlPlane) ReportDevices(push PushClient, devices map[int][]string) {
@@ -172,6 +181,8 @@ func TranslateWSEvent(event panel.WSEvent, kcfg config.KernelConfig) (Event, err
 		if err != nil {
 			return Event{}, fmt.Errorf("translate node config: %w", err)
 		}
+		translated.TrafficStatsMode = event.Config.BaseConfig.TrafficStatsMode
+		translated.TrafficStatsInterval = event.Config.BaseConfig.TrafficStatsInterval
 	}
 	if event.Users != nil {
 		translated.Users = model.UserSpecsFromPanel(event.Users)

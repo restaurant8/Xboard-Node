@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/cedar2025/xboard-node/internal/model"
+	"github.com/cedar2025/xboard-node/internal/report"
 )
 
 type EventType string
@@ -16,12 +17,14 @@ const (
 )
 
 type Event struct {
-	Type        EventType
-	Config      *model.NodeSpec
-	Users       []model.UserSpec
-	DeltaAction string
-	DeltaUsers  []model.UserSpec
-	DeviceUsers map[int][]string
+	Type                 EventType
+	Config               *model.NodeSpec
+	Users                []model.UserSpec
+	DeltaAction          string
+	DeltaUsers           []model.UserSpec
+	DeviceUsers          map[int][]string
+	TrafficStatsMode     string
+	TrafficStatsInterval int
 }
 
 type StatusChange struct {
@@ -46,20 +49,23 @@ type Bootstrap struct {
 }
 
 type Snapshot struct {
-	Config *model.NodeSpec
-	Users  []model.UserSpec
+	Config               *model.NodeSpec
+	Users                []model.UserSpec
+	TrafficStatsMode     string
+	TrafficStatsInterval int
 }
 
 type ReportPayload struct {
-	ReportID string
-	Traffic  map[int][2]int64
-	Alive    map[int][]string
-	Online   map[int]int
-	CPU      float64
-	Mem      [2]uint64
-	Swap     [2]uint64
-	Disk     [2]uint64
-	Metrics  map[string]interface{}
+	ReportID     string
+	Traffic      map[int][2]int64
+	TrafficStats []report.TrafficStat
+	Alive        map[int][]string
+	Online       map[int]int
+	CPU          float64
+	Mem          [2]uint64
+	Swap         [2]uint64
+	Disk         [2]uint64
+	Metrics      map[string]interface{}
 }
 
 type PushClient interface {

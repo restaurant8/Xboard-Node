@@ -8,30 +8,36 @@ import (
 
 // MailboxState is the coalesced snapshot drained from a NodeMailbox.
 type MailboxState struct {
-	Config         *model.NodeSpec
-	Users          []model.UserSpec
-	DeviceUsers    map[int][]string
-	HasConfig      bool
-	HasUsers       bool
-	HasDevices     bool
-	NeedsReconcile bool
+	Config                  *model.NodeSpec
+	Users                   []model.UserSpec
+	DeviceUsers             map[int][]string
+	TrafficStatsMode        string
+	TrafficStatsInterval    int
+	HasConfig               bool
+	HasUsers                bool
+	HasDevices              bool
+	HasTrafficStatsSettings bool
+	NeedsReconcile          bool
 }
 
 // NodeMailbox buffers WS events for a machine-mode node service that is not
 // yet ready to process them. Events are coalesced (latest-wins) and drained
 // as a single snapshot once the service marks the mailbox as ready.
 type NodeMailbox struct {
-	mu               sync.Mutex
-	ready            bool
-	config           *model.NodeSpec
-	users            []model.UserSpec
-	deviceUsers      map[int][]string
-	dirtyConfig      bool
-	dirtyUsers       bool
-	dirtyDevices     bool
-	needsReconcile   bool
-	hasFullUserState bool
-	notifyCh         chan struct{}
+	mu                        sync.Mutex
+	ready                     bool
+	config                    *model.NodeSpec
+	users                     []model.UserSpec
+	deviceUsers               map[int][]string
+	trafficStatsMode          string
+	trafficStatsInterval      int
+	dirtyConfig               bool
+	dirtyUsers                bool
+	dirtyDevices              bool
+	dirtyTrafficStatsSettings bool
+	needsReconcile            bool
+	hasFullUserState          bool
+	notifyCh                  chan struct{}
 }
 
 func NewNodeMailbox() *NodeMailbox {
@@ -69,6 +75,12 @@ func (m *NodeMailbox) Apply(event Event) {
 		if event.Config != nil {
 			m.config = cloneNodeSpec(event.Config)
 			m.dirtyConfig = true
+			changed = true
+		}
+		if event.TrafficStatsMode != "" {
+			m.trafficStatsMode = event.TrafficStatsMode
+			m.trafficStatsInterval = event.TrafficStatsInterval
+			m.dirtyTrafficStatsSettings = true
 			changed = true
 		}
 	case EventSyncUsers:
@@ -135,6 +147,12 @@ func (m *NodeMailbox) DrainIfReady() MailboxState {
 		state.DeviceUsers = cloneDeviceUsers(m.deviceUsers)
 		state.HasDevices = true
 		m.dirtyDevices = false
+	}
+	if m.dirtyTrafficStatsSettings {
+		state.TrafficStatsMode = m.trafficStatsMode
+		state.TrafficStatsInterval = m.trafficStatsInterval
+		state.HasTrafficStatsSettings = true
+		m.dirtyTrafficStatsSettings = false
 	}
 	m.needsReconcile = false
 	return state

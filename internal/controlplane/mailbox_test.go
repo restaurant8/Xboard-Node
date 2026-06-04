@@ -68,6 +68,21 @@ func TestNodeMailboxDevicesLatestWins(t *testing.T) {
 	}
 }
 
+func TestNodeMailboxTrafficStatsSettingsLatestWins(t *testing.T) {
+	mb := NewNodeMailbox()
+	mb.Apply(Event{Type: EventSyncConfig, TrafficStatsMode: "privacy", TrafficStatsInterval: 30})
+	mb.Apply(Event{Type: EventSyncConfig, TrafficStatsMode: "diagnostic", TrafficStatsInterval: 5})
+	mb.MarkReady()
+
+	state := mb.DrainIfReady()
+	if !state.HasTrafficStatsSettings {
+		t.Fatal("expected traffic stats settings state")
+	}
+	if state.TrafficStatsMode != "diagnostic" || state.TrafficStatsInterval != 5 {
+		t.Fatalf("unexpected traffic stats settings: %+v", state)
+	}
+}
+
 func TestNodeMailboxReconcileNotifies(t *testing.T) {
 	mb := NewNodeMailbox()
 	mb.MarkReady()

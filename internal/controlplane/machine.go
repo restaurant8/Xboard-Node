@@ -83,6 +83,10 @@ func (p *MachinePanelControlPlane) Initial(
 		return Bootstrap{}, fmt.Errorf("machine initial config normalize: %w", err)
 	}
 	bootstrap.Users = model.UserSpecsFromPanel(users)
+	if bootstrap.TrafficStatsMode == "" {
+		bootstrap.TrafficStatsMode = configSnapshot.BaseConfig.TrafficStatsMode
+		bootstrap.TrafficStatsInterval = configSnapshot.BaseConfig.TrafficStatsInterval
+	}
 
 	// Register mailbox access after the initial snapshot is prepared, so the
 	// Service can start the kernel immediately and only then drain coalesced WS
@@ -115,7 +119,12 @@ func (p *MachinePanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("machine poll normalize: %w", err)
 	}
-	return Snapshot{Config: nodeSpec, Users: model.UserSpecsFromPanel(users)}, nil
+	return Snapshot{
+		Config:               nodeSpec,
+		Users:                model.UserSpecsFromPanel(users),
+		TrafficStatsMode:     configSnapshot.BaseConfig.TrafficStatsMode,
+		TrafficStatsInterval: configSnapshot.BaseConfig.TrafficStatsInterval,
+	}, nil
 }
 
 func (p *MachinePanelControlPlane) Discover(
@@ -129,7 +138,7 @@ func (p *MachinePanelControlPlane) Discover(
 
 func (p *MachinePanelControlPlane) Report(payload ReportPayload) error {
 	return p.client.Report(
-		payload.ReportID, payload.Traffic, payload.Alive, payload.Online,
+		payload.ReportID, payload.Traffic, payload.TrafficStats, payload.Alive, payload.Online,
 		payload.CPU, payload.Mem, payload.Swap, payload.Disk,
 		payload.Metrics,
 	)

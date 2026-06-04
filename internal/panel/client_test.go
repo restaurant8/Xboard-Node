@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/config"
+	"github.com/cedar2025/xboard-node/internal/report"
 )
 
 func newTestServer(handler http.HandlerFunc) (*httptest.Server, *Client) {
@@ -195,6 +196,59 @@ func TestPushTraffic_Empty(t *testing.T) {
 	}
 	if called {
 		t.Error("should not call server for empty traffic")
+	}
+}
+
+func TestReportIncludesTrafficStats(t *testing.T) {
+	var received map[string]interface{}
+	ts, client := newTestServer(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v2/server/report" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	defer ts.Close()
+
+	mainDomain := "example.com"
+	stats := []report.TrafficStat{{
+		Category:   "total",
+		MainDomain: &mainDomain,
+		U:          1024,
+		D:          2048,
+		RecordAt:   1780560000,
+	}}
+	err := client.Report(
+		"report-1",
+		map[int][2]int64{1: {1024, 2048}},
+		stats,
+		nil,
+		nil,
+		0,
+		[2]uint64{},
+		[2]uint64{},
+		[2]uint64{},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+
+	if received["report_id"] != "report-1" {
+		t.Fatalf("report_id = %v", received["report_id"])
+	}
+	rawStats, ok := received["traffic_stats"].([]interface{})
+	if !ok || len(rawStats) != 1 {
+		t.Fatalf("traffic_stats = %#v", received["traffic_stats"])
+	}
+	first := rawStats[0].(map[string]interface{})
+	if first["category"] != "total" || first["main_domain"] != "example.com" {
+		t.Fatalf("traffic_stats[0] = %#v", first)
+	}
+	if first["u"].(float64) != 1024 || first["d"].(float64) != 2048 {
+		t.Fatalf("traffic stats bytes = %#v", first)
 	}
 }
 

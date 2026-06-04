@@ -25,6 +25,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/monitor"
 	"github.com/cedar2025/xboard-node/internal/nlog"
+	"github.com/cedar2025/xboard-node/internal/report"
 	"github.com/cedar2025/xboard-node/internal/tracker"
 )
 
@@ -51,8 +52,9 @@ type Service struct {
 		Users  []model.UserSpec
 	}
 
-	pushInterval int // seconds
-	pullInterval int // seconds
+	pushInterval     int // seconds
+	pullInterval     int // seconds
+	trafficStatsMode string
 
 	lastUserHash   string     // hash of user list for change detection
 	lastConfigHash string     // hash of full config for change detection
@@ -84,11 +86,13 @@ type Service struct {
 
 // pullResult carries the outcome of an async pullViaAPI back to the main goroutine.
 type pullResult struct {
-	config      *model.NodeSpec
-	users       []model.UserSpec
-	configHash  string
-	userHash    string
-	certChanged bool
+	config               *model.NodeSpec
+	users                []model.UserSpec
+	configHash           string
+	userHash             string
+	certChanged          bool
+	trafficStatsMode     string
+	trafficStatsInterval int
 }
 
 // apiBackoff implements simple exponential backoff for API failures.
@@ -248,6 +252,68 @@ func cloneTraffic(src map[int][2]int64) map[int][2]int64 {
 	return dst
 }
 
+const (
+	trafficStatsModeOff        = "off"
+	trafficStatsModePrivacy    = "privacy"
+	trafficStatsModeDiagnostic = "diagnostic"
+	trafficStatsCategoryTotal  = "total"
+)
+
+func normalizeTrafficStatsMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case trafficStatsModePrivacy:
+		return trafficStatsModePrivacy
+	case trafficStatsModeDiagnostic:
+		return trafficStatsModeDiagnostic
+	default:
+		return trafficStatsModeOff
+	}
+}
+
+func (s *Service) buildTrafficStats(traffic map[int][2]int64, recordAt time.Time) []report.TrafficStat {
+	mode := normalizeTrafficStatsMode(s.trafficStatsMode)
+	if mode == trafficStatsModeOff || len(traffic) == 0 {
+		return nil
+	}
+
+	var upload, download int64
+	for _, item := range traffic {
+		if item[0] > 0 {
+			upload += item[0]
+		}
+		if item[1] > 0 {
+			download += item[1]
+		}
+	}
+	if upload <= 0 && download <= 0 {
+		return nil
+	}
+
+	stat := report.TrafficStat{
+		Category: trafficStatsCategoryTotal,
+		U:        upload,
+		D:        download,
+		RecordAt: recordAt.Unix(),
+	}
+	if mode == trafficStatsModeDiagnostic {
+		mainDomain := ""
+		stat.MainDomain = &mainDomain
+	}
+	return []report.TrafficStat{stat}
+}
+
+func (s *Service) applyTrafficStatsSettings(mode string) {
+	if strings.TrimSpace(mode) == "" {
+		return
+	}
+	next := normalizeTrafficStatsMode(mode)
+	if next == s.trafficStatsMode {
+		return
+	}
+	s.trafficStatsMode = next
+	nlog.Core().Info("traffic stats mode updated", "mode", next)
+}
+
 func (s *Service) Run(ctx context.Context) error {
 	// Start cert manager (handles auto-TLS or manual cert verification)
 	if err := s.cert.Start(ctx); err != nil {
@@ -342,6 +408,8 @@ func (s *Service) initialSetup(ctx context.Context) error {
 	if s.pushInterval == 0 {
 		s.pushInterval = 60
 	}
+
+	s.trafficStatsMode = normalizeTrafficStatsMode(bootstrap.TrafficStatsMode)
 
 	if s.cfg.Node.PullInterval == 0 && bootstrap.PullInterval > 0 {
 		s.pullInterval = bootstrap.PullInterval
@@ -485,7 +553,9 @@ func (s *Service) drainMachineMailbox(ctx context.Context) {
 	}
 	state := s.machineMailbox.DrainIfReady()
 	if state.HasConfig {
-		s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncConfig, Config: state.Config})
+		s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncConfig, Config: state.Config, TrafficStatsMode: state.TrafficStatsMode, TrafficStatsInterval: state.TrafficStatsInterval})
+	} else if state.HasTrafficStatsSettings {
+		s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncConfig, TrafficStatsMode: state.TrafficStatsMode, TrafficStatsInterval: state.TrafficStatsInterval})
 	}
 	if state.HasUsers {
 		s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncUsers, Users: state.Users})
@@ -616,6 +686,7 @@ func (s *Service) wsDiscovery(ctx context.Context) {
 func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 	switch event.Type {
 	case controlplane.EventSyncConfig:
+		s.applyTrafficStatsSettings(event.TrafficStatsMode)
 		if event.Config == nil {
 			return
 		}
@@ -703,6 +774,8 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 
 		result := pullResult{certChanged: certChanged}
 		if snapshot.Config != nil {
+			result.trafficStatsMode = snapshot.TrafficStatsMode
+			result.trafficStatsInterval = snapshot.TrafficStatsInterval
 			result.config = snapshot.Config
 			result.configHash = computeConfigHash(snapshot.Config)
 			if result.configHash == currentConfigHash && !certChanged {
@@ -725,6 +798,8 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 	s.wsResyncPending.Store(false)
 	configChanged := false
+
+	s.applyTrafficStatsSettings(result.trafficStatsMode)
 
 	if result.certChanged {
 		nlog.Core().Info("certificate renewed, kernel restart needed")
@@ -1061,10 +1136,11 @@ func (s *Service) pushReportAsync() {
 	status := monitor.Collect()
 	metrics := s.buildMetrics(status)
 	metrics["kernel_status"] = s.kernel.IsRunning()
+	trafficStats := s.buildTrafficStats(traffic, time.Now())
 
 	go func() {
 		defer s.pushActive.Store(false)
-		if err := s.sink.Report(controlplane.ReportPayload{ReportID: reportID, Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
+		if err := s.sink.Report(controlplane.ReportPayload{ReportID: reportID, Traffic: traffic, TrafficStats: trafficStats, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
 			nlog.Core().Warn("failed to push report", "error", err)
 			if len(traffic) > 0 {
 				s.rememberFailedTraffic(reportID, traffic, retrying)
@@ -1094,12 +1170,13 @@ func (s *Service) pushReportSync() {
 		status := monitor.Collect()
 		metrics := s.buildMetrics(status)
 		metrics["kernel_status"] = s.kernel.IsRunning()
+		trafficStats := s.buildTrafficStats(traffic, time.Now())
 
 		if len(traffic) == 0 && len(aliveIPs) == 0 && len(online) == 0 && len(metrics) == 0 {
 			return
 		}
 
-		if err := s.sink.Report(controlplane.ReportPayload{ReportID: reportID, Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
+		if err := s.sink.Report(controlplane.ReportPayload{ReportID: reportID, Traffic: traffic, TrafficStats: trafficStats, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
 			nlog.Core().Warn("failed to push final report", "error", err)
 			if len(traffic) > 0 {
 				s.rememberFailedTraffic(reportID, traffic, retrying)
