@@ -35,12 +35,14 @@ type APIMetrics struct {
 }
 
 type Bootstrap struct {
-	PushInterval int
-	PullInterval int
-	Push         PushClient
-	Config       *model.NodeSpec
-	Users        []model.UserSpec
-	Mailbox      *NodeMailbox
+	PushInterval         int
+	PullInterval         int
+	TrafficStatsMode     string
+	TrafficStatsInterval int
+	Push                 PushClient
+	Config               *model.NodeSpec
+	Users                []model.UserSpec
+	Mailbox              *NodeMailbox
 }
 
 type Snapshot struct {
@@ -49,14 +51,15 @@ type Snapshot struct {
 }
 
 type ReportPayload struct {
-	Traffic map[int][2]int64
-	Alive   map[int][]string
-	Online  map[int]int
-	CPU     float64
-	Mem     [2]uint64
-	Swap    [2]uint64
-	Disk    [2]uint64
-	Metrics map[string]interface{}
+	ReportID string
+	Traffic  map[int][2]int64
+	Alive    map[int][]string
+	Online   map[int]int
+	CPU      float64
+	Mem      [2]uint64
+	Swap     [2]uint64
+	Disk     [2]uint64
+	Metrics  map[string]interface{}
 }
 
 type PushClient interface {

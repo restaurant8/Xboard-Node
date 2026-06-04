@@ -60,8 +60,12 @@ type Service struct {
 	pushBackoff    apiBackoff // backoff for panel push failures
 
 	// pushActive prevents overlapping push/pull goroutines.
-	pushActive atomic.Bool
-	pullActive atomic.Bool
+	pushActive    atomic.Bool
+	pullActive    atomic.Bool
+	reportMu      sync.Mutex
+	reportSeq     uint64
+	retryTraffic  map[int][2]int64
+	retryReportID string
 	// pullResults delivers async pullViaAPI results back to the main goroutine.
 	pullResults chan pullResult
 
@@ -166,6 +170,82 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 		wsStatusCh:   make(chan controlplane.StatusChange, 4),
 		pullResults:  make(chan pullResult, 1),
 	}
+}
+
+func (s *Service) nextReportIDLocked() string {
+	s.reportSeq++
+	nodeID := 0
+	if s.cfg != nil {
+		nodeID = s.cfg.Panel.NodeID
+	}
+	return fmt.Sprintf("node-%d-%d-%d", nodeID, time.Now().UnixNano(), s.reportSeq)
+}
+
+func (s *Service) takeTrafficReport() (map[int][2]int64, string, bool) {
+	s.reportMu.Lock()
+	if len(s.retryTraffic) > 0 {
+		traffic := cloneTraffic(s.retryTraffic)
+		reportID := s.retryReportID
+		s.reportMu.Unlock()
+		return traffic, reportID, true
+	}
+	s.reportMu.Unlock()
+
+	traffic := s.tracker.FlushTraffic()
+	if len(traffic) == 0 {
+		return traffic, "", false
+	}
+
+	s.reportMu.Lock()
+	reportID := s.nextReportIDLocked()
+	s.reportMu.Unlock()
+
+	return traffic, reportID, false
+}
+
+func (s *Service) rememberFailedTraffic(reportID string, traffic map[int][2]int64, retrying bool) {
+	if len(traffic) == 0 {
+		return
+	}
+
+	if reportID == "" {
+		s.tracker.RestoreTraffic(traffic)
+		return
+	}
+
+	s.reportMu.Lock()
+	defer s.reportMu.Unlock()
+	if retrying {
+		return
+	}
+
+	s.retryTraffic = cloneTraffic(traffic)
+	s.retryReportID = reportID
+}
+
+func (s *Service) clearRetryTraffic(reportID string, retrying bool) {
+	if !retrying || reportID == "" {
+		return
+	}
+
+	s.reportMu.Lock()
+	defer s.reportMu.Unlock()
+	if s.retryReportID == reportID {
+		s.retryTraffic = nil
+		s.retryReportID = ""
+	}
+}
+
+func cloneTraffic(src map[int][2]int64) map[int][2]int64 {
+	if len(src) == 0 {
+		return nil
+	}
+
+	dst := make(map[int][2]int64, len(src))
+	for uid, traffic := range src {
+		dst[uid] = traffic
+	}
+	return dst
 }
 
 func (s *Service) Run(ctx context.Context) error {
@@ -975,7 +1055,7 @@ func (s *Service) pushReportAsync() {
 		return
 	}
 
-	traffic := s.tracker.FlushTraffic()
+	traffic, reportID, retrying := s.takeTrafficReport()
 	aliveIPs := s.tracker.FlushAliveIPs()
 	online := s.tracker.CurrentOnline()
 	status := monitor.Collect()
@@ -984,10 +1064,10 @@ func (s *Service) pushReportAsync() {
 
 	go func() {
 		defer s.pushActive.Store(false)
-		if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
+		if err := s.sink.Report(controlplane.ReportPayload{ReportID: reportID, Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
 			nlog.Core().Warn("failed to push report", "error", err)
 			if len(traffic) > 0 {
-				s.tracker.RestoreTraffic(traffic)
+				s.rememberFailedTraffic(reportID, traffic, retrying)
 			}
 			if len(aliveIPs) > 0 {
 				s.tracker.RestoreAliveIPs(aliveIPs)
@@ -995,6 +1075,7 @@ func (s *Service) pushReportAsync() {
 			s.pushBackoff.onFailure()
 			return
 		}
+		s.clearRetryTraffic(reportID, retrying)
 		s.pushBackoff.onSuccess()
 		nlog.ReportPushed(len(traffic), len(online))
 	}()
@@ -1005,15 +1086,34 @@ func (s *Service) pushReportSync() {
 	if !s.sink.SupportsReporting() {
 		return
 	}
-	traffic := s.tracker.FlushTraffic()
-	aliveIPs := s.tracker.FlushAliveIPs()
-	online := s.tracker.CurrentOnline()
-	status := monitor.Collect()
-	metrics := s.buildMetrics(status)
-	metrics["kernel_status"] = s.kernel.IsRunning()
 
-	if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
-		nlog.Core().Warn("failed to push final report", "error", err)
+	for attempt := 0; attempt < 2; attempt++ {
+		traffic, reportID, retrying := s.takeTrafficReport()
+		aliveIPs := s.tracker.FlushAliveIPs()
+		online := s.tracker.CurrentOnline()
+		status := monitor.Collect()
+		metrics := s.buildMetrics(status)
+		metrics["kernel_status"] = s.kernel.IsRunning()
+
+		if len(traffic) == 0 && len(aliveIPs) == 0 && len(online) == 0 && len(metrics) == 0 {
+			return
+		}
+
+		if err := s.sink.Report(controlplane.ReportPayload{ReportID: reportID, Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
+			nlog.Core().Warn("failed to push final report", "error", err)
+			if len(traffic) > 0 {
+				s.rememberFailedTraffic(reportID, traffic, retrying)
+			}
+			if len(aliveIPs) > 0 {
+				s.tracker.RestoreAliveIPs(aliveIPs)
+			}
+			return
+		}
+
+		s.clearRetryTraffic(reportID, retrying)
+		if !retrying {
+			return
+		}
 	}
 }
 

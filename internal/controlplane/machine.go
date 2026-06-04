@@ -63,6 +63,8 @@ func (p *MachinePanelControlPlane) Initial(
 	if hs != nil {
 		bootstrap.PushInterval = hs.Settings.PushInterval
 		bootstrap.PullInterval = hs.Settings.PullInterval
+		bootstrap.TrafficStatsMode = hs.Settings.TrafficStatsMode
+		bootstrap.TrafficStatsInterval = hs.Settings.TrafficStatsInterval
 	}
 
 	configSnapshot, err := p.client.GetConfig()
@@ -127,7 +129,7 @@ func (p *MachinePanelControlPlane) Discover(
 
 func (p *MachinePanelControlPlane) Report(payload ReportPayload) error {
 	return p.client.Report(
-		payload.Traffic, payload.Alive, payload.Online,
+		payload.ReportID, payload.Traffic, payload.Alive, payload.Online,
 		payload.CPU, payload.Mem, payload.Swap, payload.Disk,
 		payload.Metrics,
 	)

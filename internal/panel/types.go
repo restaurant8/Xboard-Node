@@ -58,8 +58,10 @@ type WSConfig struct {
 
 // Settings holds panel-defined intervals
 type Settings struct {
-	PushInterval int `json:"push_interval"`
-	PullInterval int `json:"pull_interval"`
+	PushInterval         int    `json:"push_interval"`
+	PullInterval         int    `json:"pull_interval"`
+	TrafficStatsMode     string `json:"traffic_stats_mode"`
+	TrafficStatsInterval int    `json:"traffic_stats_interval"`
 }
 
 // MachineNode is a single entry returned by GET /api/v2/server/machine/nodes.
@@ -71,14 +73,16 @@ type MachineNode struct {
 
 // MachineNodesResponse is the response from GET /api/v2/server/machine/nodes.
 type MachineNodesResponse struct {
-	Nodes      []MachineNode      `json:"nodes"`
-	BaseConfig MachineBaseConfig  `json:"base_config"`
+	Nodes      []MachineNode     `json:"nodes"`
+	BaseConfig MachineBaseConfig `json:"base_config"`
 }
 
 // MachineBaseConfig holds polling intervals for machine mode.
 type MachineBaseConfig struct {
-	PushInterval int `json:"push_interval"`
-	PullInterval int `json:"pull_interval"`
+	PushInterval         int    `json:"push_interval"`
+	PullInterval         int    `json:"pull_interval"`
+	TrafficStatsMode     string `json:"traffic_stats_mode"`
+	TrafficStatsInterval int    `json:"traffic_stats_interval"`
 }
 
 // NodeConfig is the response from GET /api/v1/server/UniProxy/config
@@ -218,8 +222,10 @@ type OutboundConfig struct {
 }
 
 type BaseConfig struct {
-	PushInterval int `json:"push_interval"`
-	PullInterval int `json:"pull_interval"`
+	PushInterval         int    `json:"push_interval"`
+	PullInterval         int    `json:"pull_interval"`
+	TrafficStatsMode     string `json:"traffic_stats_mode"`
+	TrafficStatsInterval int    `json:"traffic_stats_interval"`
 }
 
 type RouteRule struct {

@@ -11,6 +11,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/limiter"
 	"github.com/cedar2025/xboard-node/internal/model"
+	"github.com/cedar2025/xboard-node/internal/tracker"
 	"golang.org/x/time/rate"
 )
 
@@ -34,8 +35,8 @@ type fakeKernel struct {
 	deviceLimitFunc func(string) (int, bool)
 }
 
-func (f *fakeKernel) Name() string { return "fake" }
-func (f *fakeKernel) Protocols() []string { return []string{"vless"} }
+func (f *fakeKernel) Name() string                      { return "fake" }
+func (f *fakeKernel) Protocols() []string               { return []string{"vless"} }
 func (f *fakeKernel) Capabilities() kernel.Capabilities { return kernel.Capabilities{} }
 func (f *fakeKernel) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	_, _, _ = nodeConfig, users, tls
@@ -46,7 +47,7 @@ func (f *fakeKernel) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, t
 	f.running = true
 	return nil
 }
-func (f *fakeKernel) Stop() { f.running = false }
+func (f *fakeKernel) Stop()           { f.running = false }
 func (f *fakeKernel) IsRunning() bool { return f.running }
 func (f *fakeKernel) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	_, _, _ = nodeConfig, users, tls
@@ -92,9 +93,9 @@ func (f *fakeKernel) CloseUserConnections(ctx context.Context, uuid string) erro
 	return nil
 }
 func (f *fakeKernel) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) { f.speedLimitFunc = fn }
-func (f *fakeKernel) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) { f.deviceLimitFunc = fn }
-func (f *fakeKernel) UpdateGlobalDevices(users map[int][]string) { _ = users }
-func (f *fakeKernel) ClearGlobalDevices() {}
+func (f *fakeKernel) SetDeviceLimitFunc(fn func(uuid string) (int, bool))  { f.deviceLimitFunc = fn }
+func (f *fakeKernel) UpdateGlobalDevices(users map[int][]string)           { _ = users }
+func (f *fakeKernel) ClearGlobalDevices()                                  {}
 
 func newTestService(k *fakeKernel) *Service {
 	sharedLimiter := limiter.New()
@@ -107,6 +108,50 @@ func newTestService(k *fakeKernel) *Service {
 	k.SetSpeedLimitFunc(s.speedTracker.GetLimiter)
 	k.SetDeviceLimitFunc(s.limiter.GetDeviceLimitByUUID)
 	return s
+}
+
+func TestTrafficReportRetryKeepsSameReportIDAndDoesNotMergeFreshTraffic(t *testing.T) {
+	s := newTestService(&fakeKernel{})
+	s.cfg = &config.Config{Panel: config.PanelConfig{NodeID: 7}}
+	s.tracker = tracker.New()
+
+	s.tracker.Process(map[int][2]int64{1: {100, 200}}, nil, 1)
+	traffic, reportID, retrying := s.takeTrafficReport()
+	if retrying {
+		t.Fatal("first report should not be marked as retry")
+	}
+	if reportID == "" {
+		t.Fatal("expected report id for non-empty traffic")
+	}
+	if traffic[1] != [2]int64{100, 200} {
+		t.Fatalf("first traffic = %v", traffic[1])
+	}
+
+	s.rememberFailedTraffic(reportID, traffic, retrying)
+	s.tracker.Process(map[int][2]int64{1: {150, 260}, 2: {30, 40}}, nil, 2)
+
+	retryTraffic, retryReportID, retrying := s.takeTrafficReport()
+	if !retrying {
+		t.Fatal("expected retry report")
+	}
+	if retryReportID != reportID {
+		t.Fatalf("retry report id = %q, want %q", retryReportID, reportID)
+	}
+	if len(retryTraffic) != 1 || retryTraffic[1] != [2]int64{100, 200} {
+		t.Fatalf("retry traffic = %#v, want original packet only", retryTraffic)
+	}
+
+	s.clearRetryTraffic(retryReportID, retrying)
+	freshTraffic, freshReportID, retrying := s.takeTrafficReport()
+	if retrying {
+		t.Fatal("fresh report should not be marked as retry after clearing")
+	}
+	if freshReportID == "" || freshReportID == reportID {
+		t.Fatalf("fresh report id = %q, old %q", freshReportID, reportID)
+	}
+	if freshTraffic[1] != [2]int64{50, 60} || freshTraffic[2] != [2]int64{30, 40} {
+		t.Fatalf("fresh traffic = %#v, want pending deltas only", freshTraffic)
+	}
 }
 
 func TestApplyUserUpdatePreparesLimiterBeforeKernelUpdate(t *testing.T) {
@@ -197,7 +242,6 @@ func TestApplyUserDeltaAddPreparesLimiterBeforeKernelUpdate(t *testing.T) {
 		t.Fatal("expected limiter for delta-added user after successful update")
 	}
 }
-
 
 func TestValidateNodeRuntimeRejectsUnsupportedDNSProvider(t *testing.T) {
 	cfg := &config.Config{Kernel: config.KernelConfig{Type: "singbox"}}
