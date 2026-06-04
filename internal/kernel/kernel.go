@@ -8,6 +8,7 @@ import (
 	"sort"
 
 	"github.com/cedar2025/xboard-node/internal/model"
+	"github.com/cedar2025/xboard-node/internal/report"
 	"golang.org/x/time/rate"
 )
 
@@ -86,6 +87,10 @@ type Kernel interface {
 	// traffic maps userID → [upload, download] cumulative bytes.
 	// connCount is the total number of active connections (for metrics).
 	GetUserTraffic(ctx context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error)
+	// FlushTrafficStats returns per-user diagnostic traffic details accumulated
+	// since the previous flush. Kernels that cannot expose destination metadata
+	// may return nil.
+	FlushTrafficStats() []report.TrafficStat
 	// CloseConnection terminates a specific connection by ID.
 	CloseConnection(ctx context.Context, connID string) error
 	// CloseUserConnections terminates all connections for the given user UUID.
@@ -97,6 +102,8 @@ type Kernel interface {
 	// The function resolves a user UUID to (limit, hasLimit).
 	// Kernels that already gate-keep internally (e.g. xray) may no-op.
 	SetDeviceLimitFunc(fn func(uuid string) (int, bool))
+	// SetTrafficStatsEnabled toggles diagnostic destination accounting.
+	SetTrafficStatsEnabled(enabled bool)
 	// UpdateGlobalDevices updates the global device state from panel (for multi-node).
 	UpdateGlobalDevices(users map[int][]string)
 	// ClearGlobalDevices clears the global device state (on WS disconnect).

@@ -22,6 +22,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/nlog"
+	"github.com/cedar2025/xboard-node/internal/report"
 )
 
 // drainTimeout is how long stop() waits for in-flight connections to finish
@@ -57,6 +58,8 @@ type SingBox struct {
 	// deviceLimitFunc resolves a user UUID to (limit, hasLimit) for gate-keeping.
 	// Set once by SetDeviceLimitFunc and forwarded to every new ConnTracker.
 	deviceLimitFunc func(string) (int, bool)
+
+	trafficStatsEnabled bool
 
 	// trackerRegistered prevents duplicate AppendTracker calls on the same
 	// Router instance during Reload. Reset to false on full restart.
@@ -142,6 +145,7 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	// Fresh tracker on full restart.
 	s.connTracker = NewConnTracker(0)
 	s.connTracker.SetUserMap(buildUserMap(users))
+	s.connTracker.SetTrafficStatsEnabled(s.trafficStatsEnabled)
 	if s.speedLimitFunc != nil {
 		s.connTracker.SetSpeedLimitFunc(s.speedLimitFunc)
 	}
@@ -406,6 +410,15 @@ func (s *SingBox) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) {
 	}
 }
 
+func (s *SingBox) SetTrafficStatsEnabled(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.trafficStatsEnabled = enabled
+	if s.connTracker != nil {
+		s.connTracker.SetTrafficStatsEnabled(enabled)
+	}
+}
+
 // UpdateGlobalDevices updates the global device state from panel (for multi-node).
 func (s *SingBox) UpdateGlobalDevices(users map[int][]string) {
 	s.mu.RLock()
@@ -621,6 +634,14 @@ func (s *SingBox) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, a
 	}
 	traffic, aliveIPs, connCount = ct.GetUserTraffic()
 	return traffic, aliveIPs, connCount, nil
+}
+
+func (s *SingBox) FlushTrafficStats() []report.TrafficStat {
+	ct := s.connTrackerSafe()
+	if ct == nil {
+		return nil
+	}
+	return ct.FlushTrafficStats()
 }
 
 // CloseConnection force-closes a specific connection by its ID.

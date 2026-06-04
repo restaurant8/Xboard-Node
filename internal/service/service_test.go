@@ -12,6 +12,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/limiter"
 	"github.com/cedar2025/xboard-node/internal/model"
+	"github.com/cedar2025/xboard-node/internal/report"
 	"github.com/cedar2025/xboard-node/internal/tracker"
 	"golang.org/x/time/rate"
 )
@@ -34,6 +35,9 @@ type fakeKernel struct {
 
 	speedLimitFunc  func(string) *rate.Limiter
 	deviceLimitFunc func(string) (int, bool)
+
+	trafficStats        []report.TrafficStat
+	trafficStatsEnabled bool
 }
 
 func (f *fakeKernel) Name() string                      { return "fake" }
@@ -85,6 +89,11 @@ func (f *fakeKernel) GetUserTraffic(ctx context.Context) (map[int][2]int64, map[
 	_ = ctx
 	return nil, nil, 0, nil
 }
+func (f *fakeKernel) FlushTrafficStats() []report.TrafficStat {
+	stats := f.trafficStats
+	f.trafficStats = nil
+	return stats
+}
 func (f *fakeKernel) CloseConnection(ctx context.Context, connID string) error {
 	_, _ = ctx, connID
 	return nil
@@ -95,6 +104,7 @@ func (f *fakeKernel) CloseUserConnections(ctx context.Context, uuid string) erro
 }
 func (f *fakeKernel) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) { f.speedLimitFunc = fn }
 func (f *fakeKernel) SetDeviceLimitFunc(fn func(uuid string) (int, bool))  { f.deviceLimitFunc = fn }
+func (f *fakeKernel) SetTrafficStatsEnabled(enabled bool)                  { f.trafficStatsEnabled = enabled }
 func (f *fakeKernel) UpdateGlobalDevices(users map[int][]string)           { _ = users }
 func (f *fakeKernel) ClearGlobalDevices()                                  {}
 
@@ -128,7 +138,7 @@ func TestTrafficReportRetryKeepsSameReportIDAndDoesNotMergeFreshTraffic(t *testi
 		t.Fatalf("first traffic = %v", traffic[1])
 	}
 
-	s.rememberFailedTraffic(reportID, traffic, retrying)
+	s.rememberFailedTraffic(reportID, traffic, nil, retrying)
 	s.tracker.Process(map[int][2]int64{1: {150, 260}, 2: {30, 40}}, nil, 2)
 
 	retryTraffic, retryReportID, retrying := s.takeTrafficReport()
@@ -163,7 +173,7 @@ func TestBuildTrafficStatsUsesPrivacyAggregate(t *testing.T) {
 	stats := s.buildTrafficStats(map[int][2]int64{
 		1: {100, 200},
 		2: {30, 40},
-	}, recordAt)
+	}, nil, recordAt)
 	if len(stats) != 1 {
 		t.Fatalf("stats len = %d, want 1", len(stats))
 	}
@@ -187,7 +197,7 @@ func TestBuildTrafficStatsDiagnosticCarriesDomainField(t *testing.T) {
 	s := newTestService(&fakeKernel{})
 	s.trafficStatsMode = "diagnostic"
 
-	stats := s.buildTrafficStats(map[int][2]int64{1: {0, 55}}, time.Unix(1780560000, 0))
+	stats := s.buildTrafficStats(map[int][2]int64{1: {0, 55}}, nil, time.Unix(1780560000, 0))
 	if len(stats) != 1 {
 		t.Fatalf("stats len = %d, want 1", len(stats))
 	}
@@ -206,8 +216,67 @@ func TestBuildTrafficStatsDisabled(t *testing.T) {
 	s := newTestService(&fakeKernel{})
 	s.trafficStatsMode = "off"
 
-	if stats := s.buildTrafficStats(map[int][2]int64{1: {100, 200}}, time.Unix(1780560000, 0)); stats != nil {
+	if stats := s.buildTrafficStats(map[int][2]int64{1: {100, 200}}, nil, time.Unix(1780560000, 0)); stats != nil {
 		t.Fatalf("stats = %#v, want nil when disabled", stats)
+	}
+}
+
+func TestBuildTrafficStatsDiagnosticUsesDetailedStats(t *testing.T) {
+	s := newTestService(&fakeKernel{})
+	s.trafficStatsMode = "diagnostic"
+	mainDomain := "example.com"
+	recordAt := time.Unix(1780560000, 0)
+
+	stats := s.buildTrafficStats(map[int][2]int64{1: {1000, 2000}}, []report.TrafficStat{{
+		UserID:          1,
+		SourceIP:        "203.0.113.10",
+		DestinationIP:   "93.184.216.34",
+		Destination:     "example.com",
+		DestinationPort: 443,
+		Network:         "tcp",
+		Category:        "domain",
+		MainDomain:      &mainDomain,
+		U:               120,
+		D:               340,
+	}}, recordAt)
+
+	if len(stats) != 1 {
+		t.Fatalf("stats len = %d, want 1", len(stats))
+	}
+	if stats[0].UserID != 1 || stats[0].SourceIP != "203.0.113.10" || stats[0].Destination != "example.com" {
+		t.Fatalf("unexpected detailed stat: %#v", stats[0])
+	}
+	if stats[0].U != 120 || stats[0].D != 340 {
+		t.Fatalf("traffic = %d/%d, want detailed 120/340", stats[0].U, stats[0].D)
+	}
+	if stats[0].RecordAt != recordAt.Unix() {
+		t.Fatalf("record_at = %d, want %d", stats[0].RecordAt, recordAt.Unix())
+	}
+}
+
+func TestTrafficStatsRetryKeepsOriginalPayload(t *testing.T) {
+	k := &fakeKernel{}
+	s := newTestService(k)
+	s.trafficStatsMode = "diagnostic"
+	mainDomain := "example.com"
+	recordAt := time.Unix(1780560000, 0)
+
+	stats := s.buildTrafficStats(map[int][2]int64{1: {100, 200}}, []report.TrafficStat{{
+		UserID:     1,
+		Category:   "domain",
+		MainDomain: &mainDomain,
+		U:          100,
+		D:          200,
+	}}, recordAt)
+	s.rememberFailedTraffic("rid-1", map[int][2]int64{1: {100, 200}}, stats, false)
+
+	s.trafficStatsMode = "off"
+	retryStats := s.takeTrafficStats(true, map[int][2]int64{1: {100, 200}}, time.Unix(1780560600, 0))
+	if len(retryStats) != 1 {
+		t.Fatalf("retry stats len = %d, want 1", len(retryStats))
+	}
+	if retryStats[0].RecordAt != recordAt.Unix() || retryStats[0].MainDomain == nil || *retryStats[0].MainDomain != "example.com" {
+		t.Fatalf("retry stats changed: %#v", retryStats[0])
 	}
 }
 

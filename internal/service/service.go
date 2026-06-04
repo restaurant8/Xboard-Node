@@ -67,6 +67,7 @@ type Service struct {
 	reportMu      sync.Mutex
 	reportSeq     uint64
 	retryTraffic  map[int][2]int64
+	retryStats    []report.TrafficStat
 	retryReportID string
 	// pullResults delivers async pullViaAPI results back to the main goroutine.
 	pullResults chan pullResult
@@ -207,8 +208,8 @@ func (s *Service) takeTrafficReport() (map[int][2]int64, string, bool) {
 	return traffic, reportID, false
 }
 
-func (s *Service) rememberFailedTraffic(reportID string, traffic map[int][2]int64, retrying bool) {
-	if len(traffic) == 0 {
+func (s *Service) rememberFailedTraffic(reportID string, traffic map[int][2]int64, stats []report.TrafficStat, retrying bool) {
+	if len(traffic) == 0 && len(stats) == 0 {
 		return
 	}
 
@@ -224,6 +225,7 @@ func (s *Service) rememberFailedTraffic(reportID string, traffic map[int][2]int6
 	}
 
 	s.retryTraffic = cloneTraffic(traffic)
+	s.retryStats = cloneTrafficStats(stats)
 	s.retryReportID = reportID
 }
 
@@ -236,6 +238,7 @@ func (s *Service) clearRetryTraffic(reportID string, retrying bool) {
 	defer s.reportMu.Unlock()
 	if s.retryReportID == reportID {
 		s.retryTraffic = nil
+		s.retryStats = nil
 		s.retryReportID = ""
 	}
 }
@@ -249,6 +252,16 @@ func cloneTraffic(src map[int][2]int64) map[int][2]int64 {
 	for uid, traffic := range src {
 		dst[uid] = traffic
 	}
+	return dst
+}
+
+func cloneTrafficStats(src []report.TrafficStat) []report.TrafficStat {
+	if len(src) == 0 {
+		return nil
+	}
+
+	dst := make([]report.TrafficStat, len(src))
+	copy(dst, src)
 	return dst
 }
 
@@ -270,9 +283,47 @@ func normalizeTrafficStatsMode(mode string) string {
 	}
 }
 
-func (s *Service) buildTrafficStats(traffic map[int][2]int64, recordAt time.Time) []report.TrafficStat {
+func (s *Service) takeTrafficStats(retrying bool, traffic map[int][2]int64, recordAt time.Time) []report.TrafficStat {
+	if retrying {
+		s.reportMu.Lock()
+		stats := cloneTrafficStats(s.retryStats)
+		s.reportMu.Unlock()
+		return stats
+	}
+
+	var detailed []report.TrafficStat
+	if normalizeTrafficStatsMode(s.trafficStatsMode) == trafficStatsModeDiagnostic {
+		detailed = s.kernel.FlushTrafficStats()
+	}
+	return s.buildTrafficStats(traffic, detailed, recordAt)
+}
+
+func (s *Service) buildTrafficStats(traffic map[int][2]int64, detailed []report.TrafficStat, recordAt time.Time) []report.TrafficStat {
 	mode := normalizeTrafficStatsMode(s.trafficStatsMode)
-	if mode == trafficStatsModeOff || len(traffic) == 0 {
+	if mode == trafficStatsModeOff {
+		return nil
+	}
+
+	if mode == trafficStatsModeDiagnostic && len(detailed) > 0 {
+		stats := make([]report.TrafficStat, 0, len(detailed))
+		for _, stat := range detailed {
+			if stat.U <= 0 && stat.D <= 0 {
+				continue
+			}
+			if stat.Category == "" {
+				stat.Category = "unknown"
+			}
+			if stat.RecordAt == 0 {
+				stat.RecordAt = recordAt.Unix()
+			}
+			stats = append(stats, stat)
+		}
+		if len(stats) > 0 {
+			return stats
+		}
+	}
+
+	if len(traffic) == 0 {
 		return nil
 	}
 
@@ -311,6 +362,7 @@ func (s *Service) applyTrafficStatsSettings(mode string) {
 		return
 	}
 	s.trafficStatsMode = next
+	s.kernel.SetTrafficStatsEnabled(next == trafficStatsModeDiagnostic)
 	nlog.Core().Info("traffic stats mode updated", "mode", next)
 }
 
@@ -410,6 +462,7 @@ func (s *Service) initialSetup(ctx context.Context) error {
 	}
 
 	s.trafficStatsMode = normalizeTrafficStatsMode(bootstrap.TrafficStatsMode)
+	s.kernel.SetTrafficStatsEnabled(s.trafficStatsMode == trafficStatsModeDiagnostic)
 
 	if s.cfg.Node.PullInterval == 0 && bootstrap.PullInterval > 0 {
 		s.pullInterval = bootstrap.PullInterval
@@ -1136,14 +1189,19 @@ func (s *Service) pushReportAsync() {
 	status := monitor.Collect()
 	metrics := s.buildMetrics(status)
 	metrics["kernel_status"] = s.kernel.IsRunning()
-	trafficStats := s.buildTrafficStats(traffic, time.Now())
+	trafficStats := s.takeTrafficStats(retrying, traffic, time.Now())
+	if reportID == "" && len(trafficStats) > 0 {
+		s.reportMu.Lock()
+		reportID = s.nextReportIDLocked()
+		s.reportMu.Unlock()
+	}
 
 	go func() {
 		defer s.pushActive.Store(false)
 		if err := s.sink.Report(controlplane.ReportPayload{ReportID: reportID, Traffic: traffic, TrafficStats: trafficStats, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
 			nlog.Core().Warn("failed to push report", "error", err)
-			if len(traffic) > 0 {
-				s.rememberFailedTraffic(reportID, traffic, retrying)
+			if len(traffic) > 0 || len(trafficStats) > 0 {
+				s.rememberFailedTraffic(reportID, traffic, trafficStats, retrying)
 			}
 			if len(aliveIPs) > 0 {
 				s.tracker.RestoreAliveIPs(aliveIPs)
@@ -1170,7 +1228,12 @@ func (s *Service) pushReportSync() {
 		status := monitor.Collect()
 		metrics := s.buildMetrics(status)
 		metrics["kernel_status"] = s.kernel.IsRunning()
-		trafficStats := s.buildTrafficStats(traffic, time.Now())
+		trafficStats := s.takeTrafficStats(retrying, traffic, time.Now())
+		if reportID == "" && len(trafficStats) > 0 {
+			s.reportMu.Lock()
+			reportID = s.nextReportIDLocked()
+			s.reportMu.Unlock()
+		}
 
 		if len(traffic) == 0 && len(aliveIPs) == 0 && len(online) == 0 && len(metrics) == 0 {
 			return
@@ -1178,8 +1241,8 @@ func (s *Service) pushReportSync() {
 
 		if err := s.sink.Report(controlplane.ReportPayload{ReportID: reportID, Traffic: traffic, TrafficStats: trafficStats, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
 			nlog.Core().Warn("failed to push final report", "error", err)
-			if len(traffic) > 0 {
-				s.rememberFailedTraffic(reportID, traffic, retrying)
+			if len(traffic) > 0 || len(trafficStats) > 0 {
+				s.rememberFailedTraffic(reportID, traffic, trafficStats, retrying)
 			}
 			if len(aliveIPs) > 0 {
 				s.tracker.RestoreAliveIPs(aliveIPs)

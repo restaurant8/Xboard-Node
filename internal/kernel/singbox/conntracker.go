@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/cedar2025/xboard-node/internal/nlog"
+	"github.com/cedar2025/xboard-node/internal/report"
 )
 
 // ipPool caches ipSnapshot maps to reduce allocations.
@@ -23,6 +25,24 @@ var ipPool = sync.Pool{
 	New: func() interface{} {
 		return make(map[string]struct{}, 16)
 	},
+}
+
+const trafficStatShardCount = 64
+
+type trafficStatKey struct {
+	userID          int
+	sourceIP        string
+	mainDomain      string
+	destinationIP   string
+	destination     string
+	destinationPort uint16
+	network         string
+	category        string
+}
+
+type trafficStatShard struct {
+	mu    sync.Mutex
+	items map[trafficStatKey][2]int64
 }
 
 // ─── Per-user statistics ────────────────────────────────────────────────────
@@ -139,16 +159,23 @@ type ConnTracker struct {
 	globalDevices    map[int]map[string]bool // userID → IP → exists
 	globalMu         sync.RWMutex
 	globalLastUpdate time.Time
+
+	trafficStatsEnabled atomic.Bool
+	trafficStatShards   [trafficStatShardCount]trafficStatShard
 }
 
 // NewConnTracker creates a tracker.
 func NewConnTracker(_ int) *ConnTracker {
-	return &ConnTracker{
+	tracker := &ConnTracker{
 		users:         make(map[int]*userStats),
 		uuidMap:       make(map[string]int),
 		connMap:       make(map[string]net.Conn),
 		globalDevices: make(map[int]map[string]bool),
 	}
+	for i := range tracker.trafficStatShards {
+		tracker.trafficStatShards[i].items = make(map[trafficStatKey][2]int64)
+	}
+	return tracker
 }
 
 // SetSpeedLimitFunc configures the per-user speed limit lookup.
@@ -159,6 +186,13 @@ func (t *ConnTracker) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) {
 // SetDeviceLimitFunc configures the per-user device limit lookup for gate-keeping.
 func (t *ConnTracker) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) {
 	t.deviceLimitFunc.Store(&fn)
+}
+
+func (t *ConnTracker) SetTrafficStatsEnabled(enabled bool) {
+	t.trafficStatsEnabled.Store(enabled)
+	if !enabled {
+		t.clearTrafficStats()
+	}
 }
 
 // SetUserMap replaces the UUID→userID mapping and ensures per-user stats
@@ -253,6 +287,7 @@ func (t *ConnTracker) RoutedConnection(
 		userID:   uid,
 		connID:   connID,
 		sourceIP: sourceIP,
+		statKey:  buildTrafficStatKey(uid, sourceIP, metadata),
 		limiter:  lim,
 		ctx:      ctx,
 	}
@@ -305,9 +340,149 @@ func (t *ConnTracker) RoutedPacketConnection(
 		userID:     uid,
 		connID:     connID,
 		sourceIP:   sourceIP,
+		statKey:    buildTrafficStatKey(uid, sourceIP, metadata),
 		limiter:    lim,
 		ctx:        ctx,
 	}
+}
+
+func buildTrafficStatKey(userID int, sourceIP string, metadata adapter.InboundContext) trafficStatKey {
+	destination := metadata.Destination
+	mainDomain := normalizeDomain(metadata.Domain)
+	if mainDomain == "" {
+		mainDomain = normalizeDomain(destination.Fqdn)
+	}
+
+	destinationIP := ""
+	if destination.Addr.IsValid() {
+		destinationIP = destination.Addr.String()
+	}
+
+	destinationValue := mainDomain
+	if destinationValue == "" {
+		destinationValue = destinationIP
+	}
+	if destinationValue == "" {
+		destinationValue = destination.AddrString()
+	}
+
+	category := strings.ToLower(strings.TrimSpace(metadata.Protocol))
+	if category == "" {
+		if mainDomain != "" {
+			category = "domain"
+		} else if destinationIP != "" {
+			category = "ip"
+		} else {
+			category = "unknown"
+		}
+	}
+
+	return trafficStatKey{
+		userID:          userID,
+		sourceIP:        sourceIP,
+		mainDomain:      mainDomain,
+		destinationIP:   destinationIP,
+		destination:     destinationValue,
+		destinationPort: destination.Port,
+		network:         strings.ToLower(strings.TrimSpace(metadata.Network)),
+		category:        category,
+	}
+}
+
+func normalizeDomain(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.TrimSuffix(value, ".")
+	return value
+}
+
+func (t *ConnTracker) addTrafficStat(key trafficStatKey, upload, download int64) {
+	if !t.trafficStatsEnabled.Load() || key.userID <= 0 || (upload <= 0 && download <= 0) {
+		return
+	}
+
+	shard := &t.trafficStatShards[trafficStatShardIndex(key)]
+	shard.mu.Lock()
+	current := shard.items[key]
+	if upload > 0 {
+		current[0] += upload
+	}
+	if download > 0 {
+		current[1] += download
+	}
+	shard.items[key] = current
+	shard.mu.Unlock()
+}
+
+func (t *ConnTracker) FlushTrafficStats() []report.TrafficStat {
+	if !t.trafficStatsEnabled.Load() {
+		return nil
+	}
+
+	var stats []report.TrafficStat
+	for i := range t.trafficStatShards {
+		shard := &t.trafficStatShards[i]
+		shard.mu.Lock()
+		if len(shard.items) == 0 {
+			shard.mu.Unlock()
+			continue
+		}
+		for key, traffic := range shard.items {
+			if traffic[0] <= 0 && traffic[1] <= 0 {
+				continue
+			}
+			mainDomain := key.mainDomain
+			stats = append(stats, report.TrafficStat{
+				UserID:          key.userID,
+				SourceIP:        key.sourceIP,
+				DestinationIP:   key.destinationIP,
+				Destination:     key.destination,
+				DestinationPort: key.destinationPort,
+				Network:         key.network,
+				Category:        key.category,
+				MainDomain:      &mainDomain,
+				U:               traffic[0],
+				D:               traffic[1],
+			})
+			delete(shard.items, key)
+		}
+		shard.mu.Unlock()
+	}
+	return stats
+}
+
+func (t *ConnTracker) clearTrafficStats() {
+	for i := range t.trafficStatShards {
+		shard := &t.trafficStatShards[i]
+		shard.mu.Lock()
+		for key := range shard.items {
+			delete(shard.items, key)
+		}
+		shard.mu.Unlock()
+	}
+}
+
+func trafficStatShardIndex(key trafficStatKey) uint32 {
+	hash := uint32(2166136261)
+	hash = hashInt(hash, key.userID)
+	hash = hashString(hash, key.sourceIP)
+	hash = hashString(hash, key.mainDomain)
+	hash = hashString(hash, key.destinationIP)
+	hash = hashString(hash, key.destination)
+	hash = hashInt(hash, int(key.destinationPort))
+	hash = hashString(hash, key.network)
+	hash = hashString(hash, key.category)
+	return hash % trafficStatShardCount
+}
+
+func hashInt(hash uint32, value int) uint32 {
+	return (hash ^ uint32(value)) * 16777619
+}
+
+func hashString(hash uint32, value string) uint32 {
+	for i := 0; i < len(value); i++ {
+		hash = (hash ^ uint32(value[i])) * 16777619
+	}
+	return hash
 }
 
 // checkDeviceGate rejects connections exceeding device limit.
@@ -564,6 +739,7 @@ type trackedConn struct {
 	userID   int        // user ID for device tracking
 	connID   string
 	sourceIP string
+	statKey  trafficStatKey
 	limiter  *rate.Limiter
 	ctx      context.Context
 	closed   atomic.Bool
@@ -578,6 +754,7 @@ func (c *trackedConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
 	if n > 0 {
 		if c.us != nil {
+			c.tracker.addTrafficStat(c.statKey, int64(n), 0)
 			c.us.upload.Add(int64(n)) // 从入站读取 = 用户上传
 		}
 		if c.limiter != nil {
@@ -626,6 +803,7 @@ func (c *trackedConn) Write(b []byte) (int, error) {
 
 	n, err := c.Conn.Write(b)
 	if n > 0 && c.us != nil {
+		c.tracker.addTrafficStat(c.statKey, 0, int64(n))
 		c.us.download.Add(int64(n)) // 向入站写入 = 用户下载
 	}
 	return n, err
@@ -644,11 +822,24 @@ func (c *trackedConn) Close() error {
 // makeCountFunc builds a CountFunc for zero-copy byte counting via sing's
 // ReadCounter/WriteCounter unwrap interfaces.
 func (c *trackedConn) makeCountFunc(counter *atomic.Int64) N.CountFunc {
+	upload := c.us != nil && counter == &c.us.upload
 	if c.limiter == nil {
-		return func(n int64) { counter.Add(n) }
+		return func(n int64) {
+			counter.Add(n)
+			if upload {
+				c.tracker.addTrafficStat(c.statKey, n, 0)
+			} else {
+				c.tracker.addTrafficStat(c.statKey, 0, n)
+			}
+		}
 	}
 	return func(n int64) {
 		counter.Add(n)
+		if upload {
+			c.tracker.addTrafficStat(c.statKey, n, 0)
+		} else {
+			c.tracker.addTrafficStat(c.statKey, 0, n)
+		}
 		// Non-blocking rate limiting with context cancellation
 		if !c.limiter.AllowN(time.Now(), int(n)) {
 			resv := c.limiter.ReserveN(time.Now(), int(n))
@@ -693,6 +884,7 @@ type trackedPacketConn struct {
 	userID   int
 	connID   string
 	sourceIP string
+	statKey  trafficStatKey
 	limiter  *rate.Limiter
 	ctx      context.Context
 	closed   atomic.Bool
@@ -703,6 +895,7 @@ func (c *trackedPacketConn) ReadPacket(buffer *buf.Buffer) (singM.Socksaddr, err
 	if err == nil {
 		n := int64(buffer.Len())
 		if c.us != nil {
+			c.tracker.addTrafficStat(c.statKey, n, 0)
 			c.us.upload.Add(n) // 从入站读取 = 用户上传
 		}
 		if c.limiter != nil {
@@ -749,6 +942,7 @@ func (c *trackedPacketConn) WritePacket(buffer *buf.Buffer, dest singM.Socksaddr
 
 	err := c.PacketConn.WritePacket(buffer, dest)
 	if err == nil && c.us != nil {
+		c.tracker.addTrafficStat(c.statKey, 0, n)
 		c.us.download.Add(n) // 向入站写入 = 用户下载
 	}
 	return err
@@ -765,11 +959,24 @@ func (c *trackedPacketConn) Close() error {
 }
 
 func (c *trackedPacketConn) makeCountFunc(counter *atomic.Int64) N.CountFunc {
+	upload := c.us != nil && counter == &c.us.upload
 	if c.limiter == nil {
-		return func(n int64) { counter.Add(n) }
+		return func(n int64) {
+			counter.Add(n)
+			if upload {
+				c.tracker.addTrafficStat(c.statKey, n, 0)
+			} else {
+				c.tracker.addTrafficStat(c.statKey, 0, n)
+			}
+		}
 	}
 	return func(n int64) {
 		counter.Add(n)
+		if upload {
+			c.tracker.addTrafficStat(c.statKey, n, 0)
+		} else {
+			c.tracker.addTrafficStat(c.statKey, 0, n)
+		}
 		// Non-blocking rate limiting with context cancellation
 		if !c.limiter.AllowN(time.Now(), int(n)) {
 			resv := c.limiter.ReserveN(time.Now(), int(n))
