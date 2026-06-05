@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -39,6 +40,37 @@ func TestPanelControlPlanePollRejectsInvalidCustomOutbounds(t *testing.T) {
 	}
 }
 
+func TestPanelControlPlanePollHandlesNotModifiedSnapshots(t *testing.T) {
+	var configCalls atomic.Int32
+	var userCalls atomic.Int32
+	server := newPanelNotModifiedTestServer(&configCalls, &userCalls)
+	defer server.Close()
+
+	cp := NewPanelControlPlane(config.PanelConfig{URL: server.URL, Token: "token", NodeID: 1}, config.WSConfig{}, config.KernelConfig{Type: "singbox"})
+
+	first, err := cp.Poll(context.Background())
+	if err != nil {
+		t.Fatalf("first poll error: %v", err)
+	}
+	if first.Config == nil {
+		t.Fatal("expected config on first poll")
+	}
+	if first.Users == nil || len(first.Users) != 1 {
+		t.Fatalf("expected one user on first poll, got %#v", first.Users)
+	}
+
+	second, err := cp.Poll(context.Background())
+	if err != nil {
+		t.Fatalf("second poll error: %v", err)
+	}
+	if second.Config != nil {
+		t.Fatalf("expected nil config for 304, got %#v", second.Config)
+	}
+	if second.Users != nil {
+		t.Fatalf("expected nil users for 304, got %#v", second.Users)
+	}
+}
+
 func TestTranslateWSEventRejectsInvalidCustomOutbounds(t *testing.T) {
 	_, err := TranslateWSEvent(panelapi.WSEvent{
 		Type: panelapi.WSEventSyncConfig,
@@ -70,6 +102,33 @@ func newPanelTestServer(configBody string) *httptest.Server {
 	})
 	mux.HandleFunc("/api/v1/server/UniProxy/user", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"users":[{"id":1,"uuid":"11111111-1111-1111-1111-111111111111"}]}`))
+	})
+	return httptest.NewServer(mux)
+}
+
+func newPanelNotModifiedTestServer(configCalls *atomic.Int32, userCalls *atomic.Int32) *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v2/server/handshake", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"websocket":{"enabled":false},"settings":{"push_interval":60,"pull_interval":60}}`))
+	})
+	mux.HandleFunc("/api/v1/server/UniProxy/config", func(w http.ResponseWriter, r *http.Request) {
+		if configCalls.Add(1) > 1 {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", `"config-v1"`)
+		_, _ = w.Write([]byte(`{"protocol":"vmess","server_port":443}`))
+	})
+	mux.HandleFunc("/api/v1/server/UniProxy/user", func(w http.ResponseWriter, r *http.Request) {
+		if userCalls.Add(1) > 1 {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", `"users-v1"`)
 		_, _ = w.Write([]byte(`{"users":[{"id":1,"uuid":"11111111-1111-1111-1111-111111111111"}]}`))
 	})
 	return httptest.NewServer(mux)

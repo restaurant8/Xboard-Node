@@ -87,16 +87,20 @@ func (p *PanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 		return Snapshot{}, ctx.Err()
 	default:
 	}
-	nodeSpec, err := model.NodeSpecFromPanelValidated(configSnapshot, p.kcfg)
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("poll config normalize: %w", err)
+	snapshot := Snapshot{}
+	if configSnapshot != nil {
+		nodeSpec, err := model.NodeSpecFromPanelValidated(configSnapshot, p.kcfg)
+		if err != nil {
+			return Snapshot{}, fmt.Errorf("poll config normalize: %w", err)
+		}
+		snapshot.Config = nodeSpec
+		snapshot.TrafficStatsMode = configSnapshot.BaseConfig.TrafficStatsMode
+		snapshot.TrafficStatsInterval = configSnapshot.BaseConfig.TrafficStatsInterval
 	}
-	return Snapshot{
-		Config:               nodeSpec,
-		Users:                model.UserSpecsFromPanel(users),
-		TrafficStatsMode:     configSnapshot.BaseConfig.TrafficStatsMode,
-		TrafficStatsInterval: configSnapshot.BaseConfig.TrafficStatsInterval,
-	}, nil
+	if users != nil {
+		snapshot.Users = model.UserSpecsFromPanel(users)
+	}
+	return snapshot, nil
 }
 
 func (p *PanelControlPlane) Discover(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- Event, statuses chan<- StatusChange) (PushClient, error) {

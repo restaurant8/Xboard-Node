@@ -49,18 +49,18 @@ Pin a specific release:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/restaurant8/Xboard-Node/main/install.sh | \
-  sudo bash -s -- --mode node --panel https://panel.example.com --token TOKEN --node-id 1 --version v1.0.2
+  sudo bash -s -- --mode node --panel https://panel.example.com --token TOKEN --node-id 1 --version v1.0.3
 ```
 
 Existing installation:
 
 ```bash
 # Recommended: keep config and only replace binaries/service file
-sudo xbctl upgrade --version v1.0.2
+sudo xbctl upgrade --version v1.0.3
 
 # Or use the installer upgrade action
 curl -fsSL https://raw.githubusercontent.com/restaurant8/Xboard-Node/main/install.sh | \
-  sudo bash -s -- upgrade --version v1.0.2
+  sudo bash -s -- upgrade --version v1.0.3
 ```
 
 The installer backs up the current binary/config/service before upgrading. Do not uninstall or purge an existing node unless you intentionally want to remove its local configuration.
@@ -83,7 +83,7 @@ Run `xbctl` after installation for help. Common commands:
 xbctl list                          # list all instances
 xbctl status                        # running status
 xbctl upgrade                        # upgrade to latest GitHub Release
-xbctl upgrade --version v1.0.2       # upgrade installed node to a specific release
+xbctl upgrade --version v1.0.3       # upgrade installed node to a specific release
 xbctl bind add-node --panel URL --token TOKEN --node-id 1
 xbctl bind add-machine --panel URL --token TOKEN --machine-id 1
 xbctl bind remove-node --panel URL --node-id 1
@@ -98,7 +98,7 @@ Use Docker if the local machine does not have the required Go toolchain.
 
 ```powershell
 cd D:\Xboard-Node
-docker run --rm -v D:\Xboard-Node:/work -w /work golang:1.26 make build-all VERSION=v1.0.2
+docker run --rm -v D:\Xboard-Node:/work -w /work golang:1.26 make build-all VERSION=v1.0.3
 ```
 
 Expected output files:
@@ -129,7 +129,7 @@ Get-Content SHA256SUMS
 
 ### Manual GitHub Release Upload
 
-Create or open the target release, for example `v1.0.2`, and upload these
+Create or open the target release, for example `v1.0.3`, and upload these
 files as release assets. Do not rename them and do not compress them:
 
 ```text
@@ -152,8 +152,8 @@ The workflow publishes a release when a version tag is pushed:
 
 ```powershell
 cd D:\Xboard-Node
-git tag -a v1.0.3 -m "v1.0.3"
-git push origin v1.0.3
+git tag -a v1.0.4 -m "v1.0.4"
+git push origin v1.0.4
 ```
 
 Push to `main` runs checks/builds, but release publishing should be driven by
