@@ -65,6 +65,64 @@ curl -fsSL https://raw.githubusercontent.com/restaurant8/Xboard-Node/main/instal
 
 The installer backs up the current binary/config/service before upgrading. Do not uninstall or purge an existing node unless you intentionally want to remove its local configuration.
 
+## Uninstall / Purge
+
+Choose the uninstall method that matches how the node was installed.
+
+### Linux systemd installer
+
+Keep local config under `/etc/xboard-node`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/restaurant8/Xboard-Node/main/install.sh | \
+  sudo bash -s -- uninstall --yes
+```
+
+Completely remove the systemd service, binaries, `xbctl`, and `/etc/xboard-node`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/restaurant8/Xboard-Node/main/install.sh | \
+  sudo bash -s -- uninstall --purge --yes
+```
+
+If you already have `install.sh` locally, this is equivalent:
+
+```bash
+sudo bash install.sh uninstall --purge --yes
+```
+
+The purge flow stops and disables `xboard-node.service`, removes
+`/etc/systemd/system/xboard-node.service`, `/usr/local/bin/xboard-node`,
+`/usr/local/bin/xbctl`, `/usr/bin/xbctl`, and deletes `/etc/xboard-node`.
+
+Verify removal:
+
+```bash
+systemctl status xboard-node --no-pager || true
+command -v xboard-node || true
+command -v xbctl || true
+test ! -d /etc/xboard-node && echo "config removed"
+```
+
+### Docker
+
+Find the container created from the image, then remove it:
+
+```bash
+docker ps -a --filter ancestor=ghcr.io/restaurant8/xboard-node:latest
+docker rm -f <container_id_or_name>
+docker image rm ghcr.io/restaurant8/xboard-node:latest
+```
+
+### Docker Compose
+
+From the compose project directory:
+
+```bash
+docker compose down --volumes --remove-orphans
+docker image rm ghcr.io/restaurant8/xboard-node:latest
+```
+
 ### Verify Installed Version
 
 ```bash
