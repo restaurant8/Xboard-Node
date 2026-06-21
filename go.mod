@@ -261,6 +261,6 @@ require (
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
 
-replace github.com/sagernet/sing-box => github.com/restaurant8/sing-box v0.0.0-20260621155843-7d28653a91ed
+replace github.com/sagernet/sing-box => github.com/restaurant8/sing-box v0.0.0-20260621172509-080b7dc08059
 
 replace github.com/xtls/xray-core => github.com/cedar2025/Xray-core v0.0.0-20260409213332-f47935539965
