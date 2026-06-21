@@ -729,6 +729,8 @@ func buildAnyTLS(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.T
 	}
 	base["users"] = userList
 
+	applyProxyProtocol(base, nc)
+
 	if nc.PaddingScheme != "" {
 		base["padding_scheme"] = nc.PaddingScheme
 	}
@@ -981,10 +983,11 @@ func applyMultiplex(base M, nc *model.NodeSpec) {
 }
 
 func applyProxyProtocol(base M, nc *model.NodeSpec) {
-	// if !nc.GetProxyProtocol() {
-	// 	return
-	// }
-	// base["proxy_protocol"] = true
+	// soga 风格的兼容模式：默认接受 PROXY 头但不强制。中转发了 PROXY v1/v2 头，
+	// 就用真实客户端 IP（在线 IP / 设备数限制都按真实 IP 算）；没发头（或客户端
+	// 直连）也照常放行。这样面板无需任何开关，只在中转那侧决定是否发 PROXY 头。
+	// 依赖 restaurant8/sing-box 重新加入的入站 Proxy Protocol 支持。
+	base["proxy_protocol_accept_no_header"] = true
 }
 
 // extractECHInbound extracts ECH config for sing-box server (inbound).
