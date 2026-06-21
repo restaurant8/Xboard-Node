@@ -1,6 +1,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-LDFLAGS := -s -w -X main.version=$(VERSION) -X main.buildTime=$(BUILD_TIME) -X main.commit=$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+BUILDINFO := github.com/cedar2025/xboard-node/internal/buildinfo
+LDFLAGS := -s -w -X $(BUILDINFO).Version=$(VERSION) -X $(BUILDINFO).BuildTime=$(BUILD_TIME) -X $(BUILDINFO).Commit=$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 
 .PHONY: build clean test docker install build-linux build-linux-arm64 build-all
 

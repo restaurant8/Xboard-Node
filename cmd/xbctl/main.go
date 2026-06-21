@@ -17,6 +17,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/cedar2025/xboard-node/internal/buildinfo"
 	"github.com/cedar2025/xboard-node/internal/config"
 	"gopkg.in/yaml.v3"
 )
@@ -31,11 +32,6 @@ const (
 	serviceFilePath        = "/etc/systemd/system/xboard-node.service"
 	defaultInstallRoot     = "/etc/xboard-node"
 	downloadBase           = "https://github.com/restaurant8/Xboard-Node/releases"
-)
-
-var (
-	version   = "dev"
-	buildTime = "unknown"
 )
 
 type instanceRow struct {
@@ -183,7 +179,7 @@ func run(args []string) error {
 	case "uninstall":
 		return runUninstall(args[1:])
 	case "version", "-v", "--version":
-		fmt.Printf("xbctl %s (built %s)\n", version, buildTime)
+		fmt.Printf("xbctl %s (built %s)\n", buildinfo.Version, buildinfo.BuildTime)
 		return nil
 	case "config":
 		return runConfig(args[1:])

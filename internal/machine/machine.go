@@ -6,9 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"sync"
 	"time"
 
+	"github.com/cedar2025/xboard-node/internal/buildinfo"
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/controlplane"
 	"github.com/cedar2025/xboard-node/internal/model"
@@ -256,12 +258,20 @@ func (o *Orchestrator) rediscover(ctx context.Context) {
 
 func (o *Orchestrator) reportMachineStatus() {
 	s := monitor.Collect()
+	meta := map[string]interface{}{
+		"version":    buildinfo.Version,
+		"build_time": buildinfo.BuildTime,
+		"commit":     buildinfo.Commit,
+		"kernel":     o.cfg.Kernel.Type,
+		"arch":       runtime.GOARCH,
+	}
 	if err := o.client.ReportMachineStatus(
 		s.CPU,
 		[2]uint64{s.MemTotal, s.MemUsed},
 		[2]uint64{s.SwapTotal, s.SwapUsed},
 		[2]uint64{s.DiskTotal, s.DiskUsed},
 		s.NetInSpeed, s.NetOutSpeed,
+		meta,
 	); err != nil {
 		nlog.Core().Warn("machine status report failed", "error", err)
 	}

@@ -14,15 +14,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cedar2025/xboard-node/internal/buildinfo"
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/machine"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/service"
-)
-
-var (
-	version   = "dev"
-	buildTime = "unknown"
 )
 
 func main() {
@@ -31,7 +27,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("xboard-node %s (built %s)\n", version, buildTime)
+		fmt.Printf("xboard-node %s (built %s)\n", buildinfo.Version, buildinfo.BuildTime)
 		os.Exit(0)
 	}
 

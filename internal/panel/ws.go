@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/nlog"
+	"github.com/cedar2025/xboard-node/internal/selfupdate"
 	"github.com/gorilla/websocket"
 )
 
@@ -22,6 +23,7 @@ const (
 	WSEventSyncDevices   = "sync.devices"   // panel → node: global device state
 	WSEventSyncNodes     = "sync.nodes"     // panel → machine: node list changed
 	WSEventReportDevices = "report.devices" // node → panel: report device snapshot
+	WSEventNodeUpgrade   = "node.upgrade"   // panel → node/machine: self-update command
 )
 
 // WSEvent is a parsed data event delivered to the service layer.
@@ -349,9 +351,28 @@ func (w *WSClient) handleMessage(msg wsMessage) {
 	case WSEventSyncNodes:
 		w.handleDataEvent(msg)
 
+	case WSEventNodeUpgrade:
+		w.handleUpgrade(msg)
+
 	default:
 		nlog.Core().Debug("ws unknown event", "event", msg.Event)
 	}
+}
+
+// handleUpgrade processes a panel-issued node.upgrade command. The upgrade is a
+// host/process-level operation (it replaces the binary and restarts the systemd
+// service), so it is handled here at the single WS choke point rather than per
+// node. selfupdate.Apply guards against concurrent upgrades within the process.
+func (w *WSClient) handleUpgrade(msg wsMessage) {
+	var cmd selfupdate.Command
+	if len(msg.Data) > 0 {
+		if err := json.Unmarshal(msg.Data, &cmd); err != nil {
+			nlog.Core().Warn("ws: cannot decode upgrade payload", "error", err)
+			return
+		}
+	}
+	nlog.Core().Info("ws received node.upgrade command", "version", cmd.Version, "request_id", cmd.RequestID)
+	go selfupdate.Apply(w, cmd)
 }
 
 func (w *WSClient) handleDataEvent(msg wsMessage) {

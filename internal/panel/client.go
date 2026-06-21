@@ -352,7 +352,7 @@ func (c *Client) GetMachineNodes() (*MachineNodesResponse, error) {
 
 // ReportMachineStatus sends machine-level load metrics to the panel.
 // netIn/netOut are bytes/sec; negative values mean "unavailable" (first sample).
-func (c *Client) ReportMachineStatus(cpu float64, mem, swap, disk [2]uint64, netIn, netOut float64) error {
+func (c *Client) ReportMachineStatus(cpu float64, mem, swap, disk [2]uint64, netIn, netOut float64, meta map[string]interface{}) error {
 	payload := map[string]interface{}{
 		"cpu":  cpu,
 		"mem":  map[string]interface{}{"total": mem[0], "used": mem[1]},
@@ -361,6 +361,11 @@ func (c *Client) ReportMachineStatus(cpu float64, mem, swap, disk [2]uint64, net
 	}
 	if netIn >= 0 && netOut >= 0 {
 		payload["net"] = map[string]interface{}{"in_speed": netIn, "out_speed": netOut}
+	}
+	// Build identity for the panel's backend-management UI. Version is a
+	// process-level fact, so it rides on the machine (one process) status.
+	if len(meta) > 0 {
+		payload["meta"] = meta
 	}
 	return c.postJSON("/api/v2/server/machine/status", payload)
 }

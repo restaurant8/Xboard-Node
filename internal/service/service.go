@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/cedar2025/xboard-node/internal/buildinfo"
 	"github.com/cedar2025/xboard-node/internal/cert"
 	"github.com/cedar2025/xboard-node/internal/cert/dnsproviders"
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -1271,6 +1273,14 @@ func (s *Service) buildMetrics(status monitor.Status) map[string]interface{} {
 
 	m["uptime"] = status.Uptime
 	m["goroutines"] = status.Goroutines
+
+	// Build/runtime identity — surfaced in the panel's backend-management UI so
+	// operators can see each backend's version and decide whether to upgrade.
+	m["version"] = buildinfo.Version
+	m["build_time"] = buildinfo.BuildTime
+	m["commit"] = buildinfo.Commit
+	m["kernel"] = s.cfg.Kernel.Type
+	m["arch"] = runtime.GOARCH
 
 	// Active connections (last measured during tracker.Process()).
 	m["active_connections"] = s.tracker.ActiveConnections()

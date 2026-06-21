@@ -11,8 +11,8 @@ RUN go mod download
 COPY . .
 
 RUN CGO_ENABLED=0 go build -ldflags "-s -w \
-    -X main.version=$(git describe --tags --always --dirty 2>/dev/null || echo dev) \
-    -X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    -X github.com/cedar2025/xboard-node/internal/buildinfo.Version=$(git describe --tags --always --dirty 2>/dev/null || echo dev) \
+    -X github.com/cedar2025/xboard-node/internal/buildinfo.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     -tags "with_quic with_utls with_wireguard with_clash_api" \
     -o xboard-node ./cmd/xboard-node
 
