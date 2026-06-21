@@ -44,8 +44,9 @@ const (
 	DefaultDownloadBase = "https://github.com/restaurant8/Xboard-Node/releases"
 
 	// WS event names used to report progress back to the panel.
-	EventAck    = "upgrade.ack"
-	EventResult = "upgrade.result"
+	EventAck     = "upgrade.ack"
+	EventResult  = "upgrade.result"
+	EventRestart = "restart.result"
 )
 
 // Install paths — vars (not consts) so tests can redirect them to a temp dir.
@@ -130,6 +131,22 @@ func Apply(sender Sender, cmd Command) {
 
 	// Give the WS write loop a moment to flush the success message before the
 	// process exits; the panel confirms the upgrade on reconnect via version.
+	time.Sleep(1500 * time.Millisecond)
+	exitFn()
+}
+
+// Restart triggers a graceful process restart (systemd relaunches the service
+// via Restart=always/RestartSec=5). It reports a "restarting" status to the
+// panel before exiting. Shares the inProgress guard with Apply so a restart and
+// an upgrade can't run at the same time.
+func Restart(sender Sender, requestID string) {
+	if !inProgress.CompareAndSwap(false, true) {
+		nlog.Core().Warn("upgrade/restart already in progress, ignoring restart command", "request_id", requestID)
+		return
+	}
+	nlog.Core().Info("node.restart received, restarting process", "request_id", requestID)
+	sendStatus(sender, statusPayload{RequestID: requestID, Status: "restarting", FromVersion: buildinfo.Version}, EventRestart)
+	// Give the WS write loop a moment to flush before we exit.
 	time.Sleep(1500 * time.Millisecond)
 	exitFn()
 }

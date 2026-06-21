@@ -24,6 +24,7 @@ const (
 	WSEventSyncNodes     = "sync.nodes"     // panel → machine: node list changed
 	WSEventReportDevices = "report.devices" // node → panel: report device snapshot
 	WSEventNodeUpgrade   = "node.upgrade"   // panel → node/machine: self-update command
+	WSEventNodeRestart   = "node.restart"   // panel → node/machine: restart process
 )
 
 // WSEvent is a parsed data event delivered to the service layer.
@@ -354,6 +355,9 @@ func (w *WSClient) handleMessage(msg wsMessage) {
 	case WSEventNodeUpgrade:
 		w.handleUpgrade(msg)
 
+	case WSEventNodeRestart:
+		w.handleRestart(msg)
+
 	default:
 		nlog.Core().Debug("ws unknown event", "event", msg.Event)
 	}
@@ -373,6 +377,23 @@ func (w *WSClient) handleUpgrade(msg wsMessage) {
 	}
 	nlog.Core().Info("ws received node.upgrade command", "version", cmd.Version, "request_id", cmd.RequestID)
 	go selfupdate.Apply(w, cmd)
+}
+
+// handleRestart processes a panel-issued node.restart command: it restarts the
+// host process (systemd relaunches it). Like the upgrade, this is a
+// process-level action handled once here at the WS choke point.
+func (w *WSClient) handleRestart(msg wsMessage) {
+	var cmd struct {
+		RequestID string `json:"request_id"`
+	}
+	if len(msg.Data) > 0 {
+		if err := json.Unmarshal(msg.Data, &cmd); err != nil {
+			nlog.Core().Warn("ws: cannot decode restart payload", "error", err)
+			return
+		}
+	}
+	nlog.Core().Info("ws received node.restart command", "request_id", cmd.RequestID)
+	go selfupdate.Restart(w, cmd.RequestID)
 }
 
 func (w *WSClient) handleDataEvent(msg wsMessage) {
