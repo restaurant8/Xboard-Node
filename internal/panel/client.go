@@ -423,7 +423,8 @@ func (c *Client) postJSON(path string, payload map[string]interface{}) error {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("status %d: %s", resp.StatusCode, respBody)
 	}
-	c.apiSuccess.Add(1)
+	// Note: success/failure is already counted in doRequest based on the HTTP
+	// status, so we must not increment apiSuccess again here (would double-count).
 	return nil
 }
 
@@ -471,10 +472,13 @@ func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string)
 	return resp, nil
 }
 
-// drainAndClose reads any remaining bytes (up to 512B) and closes the body.
-// This allows the HTTP transport to reuse the underlying TCP connection.
+// drainAndClose reads any remaining bytes and closes the body. Fully draining
+// the body (not just the first 512B) is what lets the HTTP transport reuse the
+// underlying TCP connection; a partial drain leaves larger responses unreusable.
+// Panel responses are small and from a trusted endpoint, so an unbounded drain
+// is safe here.
 func drainAndClose(body io.ReadCloser) {
-	io.CopyN(io.Discard, body, 512)
+	io.Copy(io.Discard, body)
 	body.Close()
 }
 

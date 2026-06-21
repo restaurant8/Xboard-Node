@@ -165,12 +165,15 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 	l := limiter.New()
 	st := limiter.NewSpeedTracker(l)
 
+	trk := tracker.New()
+	trk.SetIntervalSeconds(cfg.Node.TrackInterval)
+
 	return &Service{
 		cfg:          cfg,
 		source:       cp,
 		sink:         cp,
 		kernel:       k,
-		tracker:      tracker.New(),
+		tracker:      trk,
 		limiter:      l,
 		speedTracker: st,
 		cert:         certMgr,

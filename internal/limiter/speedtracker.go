@@ -122,14 +122,12 @@ func (t *SpeedTracker) GetLimiter(user string) *rate.Limiter {
 		return nil
 	}
 
-	// Create limiter on-demand
+	// Create limiter on-demand. Burst matches the per-second rate (min 64KiB),
+	// identical to the update path in UpdateBuckets.
 	bytesPerSec := int(u.SpeedLimit) * 1_000_000 / 8
 	burst := bytesPerSec
 	if burst < 64*1024 {
 		burst = 64 * 1024
-	}
-	if cap4s := bytesPerSec * 4; cap4s > 64*1024 && burst > cap4s {
-		burst = cap4s
 	}
 
 	lim := rate.NewLimiter(rate.Limit(bytesPerSec), burst)
