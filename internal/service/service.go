@@ -27,6 +27,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/monitor"
 	"github.com/cedar2025/xboard-node/internal/nlog"
+	"github.com/cedar2025/xboard-node/internal/publicip"
 	"github.com/cedar2025/xboard-node/internal/report"
 	"github.com/cedar2025/xboard-node/internal/tracker"
 )
@@ -1281,6 +1282,10 @@ func (s *Service) buildMetrics(status monitor.Status) map[string]interface{} {
 	m["commit"] = buildinfo.Commit
 	m["kernel"] = s.cfg.Kernel.Type
 	m["arch"] = runtime.GOARCH
+	// Detected public IPs (dual-stack: IPv4 + IPv6) for the panel's IP display.
+	if ips := publicip.Get(); len(ips) > 0 {
+		m["public_ips"] = ips
+	}
 
 	// Active connections (last measured during tracker.Process()).
 	m["active_connections"] = s.tracker.ActiveConnections()
