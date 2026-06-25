@@ -56,8 +56,10 @@ jobs:
             echo "release=true" >> "$GITHUB_OUTPUT"
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           elif [[ "${{ github.ref }}" == "refs/heads/dev" ]]; then
-            # Push to dev: rolling pre-release.
-            echo "version=dev" >> "$GITHUB_OUTPUT"
+            # Push to dev: rolling pre-release. Uses the "nightly" tag (not "dev")
+            # so the tag name never collides with the dev branch — a same-named
+            # tag+branch makes git refs ambiguous (e.g. `merge --ff-only dev`).
+            echo "version=nightly" >> "$GITHUB_OUTPUT"
             echo "release=true" >> "$GITHUB_OUTPUT"
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
           else
