@@ -64,6 +64,12 @@ type Service struct {
 	pullBackoff    apiBackoff // backoff for panel pull failures
 	pushBackoff    apiBackoff // backoff for panel push failures
 
+	// emptyUserSyncStreak counts consecutive full-sync responses that carried
+	// zero users while a non-empty set was applied. Used to ride out transient
+	// panel/DB/cache hiccups instead of wiping every inbound user on a single
+	// bad response. Only mutated from the main service goroutine.
+	emptyUserSyncStreak int
+
 	// pushActive prevents overlapping push/pull goroutines.
 	pushActive    atomic.Bool
 	pullActive    atomic.Bool
@@ -979,9 +985,61 @@ func (s *Service) ensureRunning() bool {
 
 // ─── User update entry points ───────────────────────────────────────────────
 
+// emptyUserSyncThreshold is how many consecutive empty full-sync responses must
+// be observed before the node accepts a full user wipe. This protects against a
+// single transient empty response from the panel (DB/cache hiccup, brief
+// redeploy, group reassignment) clearing every inbound user — which otherwise
+// surfaces as mass "invalid request user id" until the node is restarted — while
+// still converging to an intentional "all users removed" within a few cycles.
+const emptyUserSyncThreshold = 3
+
+// ignoreEmptyUserSync guards a full user-set replacement against a transient
+// empty response. It returns true when the caller should drop this update and
+// keep the current snapshot. A genuine "all users removed" still takes effect
+// once emptyUserSyncThreshold consecutive empty responses have been observed.
+// Only called from the main service goroutine, so the streak needs no locking.
+func (s *Service) ignoreEmptyUserSync(users []model.UserSpec) bool {
+	if len(users) > 0 {
+		s.emptyUserSyncStreak = 0
+		return false
+	}
+
+	s.metricsMu.RLock()
+	had := len(s.lastUsers)
+	s.metricsMu.RUnlock()
+	if had == 0 {
+		// Already empty — nothing to protect, let it pass through normally.
+		return false
+	}
+
+	s.emptyUserSyncStreak++
+	if s.emptyUserSyncStreak < emptyUserSyncThreshold {
+		msg := fmt.Sprintf("ignoring empty user sync (had %d users, %d/%d), keeping previous snapshot",
+			had, s.emptyUserSyncStreak, emptyUserSyncThreshold)
+		if s.nodeLog != nil {
+			s.nodeLog.Warn(msg)
+		} else {
+			nlog.Core().Warn(msg)
+		}
+		return true
+	}
+
+	msg := fmt.Sprintf("accepting empty user sync after %d consecutive confirmations", s.emptyUserSyncStreak)
+	if s.nodeLog != nil {
+		s.nodeLog.Warn(msg)
+	} else {
+		nlog.Core().Warn(msg)
+	}
+	s.emptyUserSyncStreak = 0
+	return false
+}
+
 // applyUserUpdate replaces the full user set and hot-swaps the kernel.
 // Called from WS sync.users and REST polling.
 func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, newHash string) {
+	if s.ignoreEmptyUserSync(users) {
+		return
+	}
 	if !s.ensureRunning() {
 		return
 	}

@@ -280,6 +280,84 @@ func TestTrafficStatsRetryKeepsOriginalPayload(t *testing.T) {
 	}
 }
 
+func TestApplyUserUpdateIgnoresTransientEmptySync(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	users := []model.UserSpec{
+		{ID: 1, UUID: "uuid-1"},
+		{ID: 2, UUID: "uuid-2"},
+		{ID: 3, UUID: "uuid-3"},
+	}
+	s.updateUserState(users)
+
+	wipedLen := -1
+	k.onUpdateUsers = func(u []model.UserSpec) { wipedLen = len(u) }
+
+	// Panel/DB/cache hiccups and returns an empty user list at runtime.
+	empty := []model.UserSpec{}
+	s.applyUserUpdate(context.Background(), empty, computeUserHash(empty))
+
+	// The kernel inbound must NOT be wiped on a single empty response, and the
+	// in-memory snapshot must be preserved (otherwise every user gets rejected
+	// with "invalid request user id" until the node is restarted).
+	if k.updateCalls != 0 {
+		t.Fatalf("kernel UpdateUsers called %d times on empty sync (wiped %d users); want 0", k.updateCalls, wipedLen)
+	}
+	if len(s.lastUsers) != 3 {
+		t.Fatalf("lastUsers = %d after empty sync, want 3 preserved", len(s.lastUsers))
+	}
+}
+
+func TestApplyUserUpdateAcceptsEmptyAfterThreshold(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	s.updateUserState([]model.UserSpec{{ID: 1, UUID: "u1"}})
+
+	empty := []model.UserSpec{}
+	h := computeUserHash(empty)
+	for i := 0; i < emptyUserSyncThreshold; i++ {
+		s.applyUserUpdate(context.Background(), empty, h)
+	}
+
+	// A genuine "all users removed" must still converge once we have seen
+	// emptyUserSyncThreshold consecutive empty responses.
+	if len(s.lastUsers) != 0 {
+		t.Fatalf("lastUsers = %d after %d empty syncs, want 0 (genuine removal must converge)", len(s.lastUsers), emptyUserSyncThreshold)
+	}
+	if k.updateCalls != 1 {
+		t.Fatalf("kernel UpdateUsers called %d times, want exactly 1 (only the confirmed wipe)", k.updateCalls)
+	}
+}
+
+func TestApplyUserUpdateNonEmptyResetsEmptyStreak(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	full := []model.UserSpec{{ID: 1, UUID: "u1"}, {ID: 2, UUID: "u2"}}
+	s.updateUserState(full)
+
+	empty := []model.UserSpec{}
+	// Two transient empties (below threshold) — must be ignored.
+	s.applyUserUpdate(context.Background(), empty, computeUserHash(empty))
+	s.applyUserUpdate(context.Background(), empty, computeUserHash(empty))
+	// Panel recovers with the real list — streak must reset.
+	recovered := []model.UserSpec{{ID: 1, UUID: "u1"}, {ID: 2, UUID: "u2"}, {ID: 3, UUID: "u3"}}
+	s.applyUserUpdate(context.Background(), recovered, computeUserHash(recovered))
+	if len(s.lastUsers) != 3 {
+		t.Fatalf("lastUsers = %d after recovery, want 3", len(s.lastUsers))
+	}
+	if s.emptyUserSyncStreak != 0 {
+		t.Fatalf("emptyUserSyncStreak = %d after non-empty sync, want 0", s.emptyUserSyncStreak)
+	}
+	// A single fresh empty after recovery must again be ignored, not wiped.
+	s.applyUserUpdate(context.Background(), empty, computeUserHash(empty))
+	if len(s.lastUsers) != 3 {
+		t.Fatalf("lastUsers = %d after post-recovery empty, want 3 preserved", len(s.lastUsers))
+	}
+}
+
 func TestApplyUserUpdatePreparesLimiterBeforeKernelUpdate(t *testing.T) {
 	k := &fakeKernel{running: true}
 	s := newTestService(k)
