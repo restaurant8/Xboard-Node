@@ -75,11 +75,42 @@ type syncUserDeltaPayload struct {
 	NodeID    int    `json:"node_id"`
 }
 
+// deviceIPList is a user's device IP list that tolerates both JSON encodings
+// the panel may emit:
+//   - array form:  ["1.2.3.4", "5.6.7.8"]
+//   - object form: {"0":"1.2.3.4","2":"5.6.7.8"}
+//
+// The object form appears in multi-node setups: when the same client IP is seen
+// through several nodes, the panel's array_unique() leaves non-sequential keys,
+// which PHP's json_encode renders as an object instead of an array. Plain
+// decoding into []string would fail on those users.
+type deviceIPList []string
+
+func (d *deviceIPList) UnmarshalJSON(data []byte) error {
+	// Fast path: proper array.
+	var arr []string
+	if err := json.Unmarshal(data, &arr); err == nil {
+		*d = arr
+		return nil
+	}
+	// Fallback: object keyed by index; keep the values, drop the keys.
+	var obj map[string]string
+	if err := json.Unmarshal(data, &obj); err != nil {
+		return err
+	}
+	out := make([]string, 0, len(obj))
+	for _, ip := range obj {
+		out = append(out, ip)
+	}
+	*d = out
+	return nil
+}
+
 // syncDevicesPayload carries global device state from panel.
 type syncDevicesPayload struct {
-	Users     map[int][]string `json:"users"`
-	Timestamp int64            `json:"timestamp"`
-	NodeID    int              `json:"node_id"`
+	Users     map[int]deviceIPList `json:"users"`
+	Timestamp int64                `json:"timestamp"`
+	NodeID    int                  `json:"node_id"`
 }
 
 // syncNodesPayload carries the updated node list for a machine.
@@ -464,11 +495,19 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 	case WSEventSyncDevices:
 		nlog.Core().Debug("ws sync devices event received")
 		var p syncDevicesPayload
-		if err := decodeData(msg.Data, &p); err != nil {
+		// Decode with the standard library (not decodeData/mapstructure): only
+		// encoding/json invokes deviceIPList.UnmarshalJSON, which tolerates the
+		// object-form IP lists the panel emits in multi-node setups. mapstructure's
+		// weak typing would instead wrap such an object into a single-element slice
+		// and fail with "expected string, got map".
+		if err := json.Unmarshal(msg.Data, &p); err != nil {
 			nlog.Core().Warn("ws: cannot decode devices payload", "error", err)
 			return
 		}
-		event.DeviceUsers = p.Users
+		event.DeviceUsers = make(map[int][]string, len(p.Users))
+		for uid, ips := range p.Users {
+			event.DeviceUsers[uid] = ips
+		}
 		event.NodeID = p.NodeID
 
 	case WSEventSyncNodes:
