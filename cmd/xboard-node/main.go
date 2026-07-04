@@ -19,6 +19,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/machine"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/service"
+	"github.com/cedar2025/xboard-node/internal/systune"
 )
 
 func main() {
@@ -46,6 +47,10 @@ func main() {
 
 	// Apply runtime memory tuning before anything else allocates.
 	applyRuntimeConfig(instances[0].Runtime)
+
+	// Kernel network tuning (BBR, buffers). Runs once at startup so nodes pick
+	// it up right after a self-update relaunch; never blocks startup.
+	systune.Apply(instances[0].Runtime.SysctlTuneEnabled())
 
 	runWithReload(rootCfg, *configPath)
 }

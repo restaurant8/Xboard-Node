@@ -19,6 +19,7 @@ import (
 
 	"github.com/cedar2025/xboard-node/internal/buildinfo"
 	"github.com/cedar2025/xboard-node/internal/config"
+	"github.com/cedar2025/xboard-node/internal/systune"
 	"gopkg.in/yaml.v3"
 )
 
@@ -556,6 +557,14 @@ func runUninstall(args []string) error {
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 			warnings = append(warnings, fmt.Sprintf("remove %s: %v", p, err))
 		}
+	}
+
+	// Remove the kernel tuning profile written by the node at startup. The live
+	// sysctl values stay until reboot; removing the file stops them persisting.
+	if err := os.Remove(systune.ConfPath); err == nil {
+		fmt.Printf("Removed %s (kernel tuning reverts on next reboot)\n", systune.ConfPath)
+	} else if !os.IsNotExist(err) {
+		warnings = append(warnings, fmt.Sprintf("remove %s: %v", systune.ConfPath, err))
 	}
 
 	if purge {

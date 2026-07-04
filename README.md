@@ -232,6 +232,26 @@ report. Legacy nodes that do not send `traffic_stats` remain compatible.
 
 Legacy single-panel config is fully compatible. Appending bindings auto-migrates to `instances` format. See `config.yml.example`.
 
+### Kernel Network Tuning (automatic)
+
+On startup the node applies kernel network tuning automatically: BBR congestion
+control with the fq qdisc (when the kernel supports it), 16MB TCP/UDP socket
+buffer ceilings (needed for QUIC protocols like Hysteria2/TUIC on fat links),
+and TCP Fast Open. The profile is persisted to
+`/etc/sysctl.d/99-xboard-node.conf` so it survives reboots, and is re-checked
+idempotently on every start — so existing nodes pick it up right after a
+panel-issued self-update.
+
+It only runs on Linux, as root, outside containers. To opt out:
+
+```yaml
+runtime:
+  sysctl_tune: false
+```
+
+Deleting `/etc/sysctl.d/99-xboard-node.conf` (or `xbctl uninstall`) reverts the
+tuning at the next reboot.
+
 ## Extensions
 
 - Custom routes: [docs-custom-routes.md](docs-custom-routes.md)

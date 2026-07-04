@@ -90,6 +90,18 @@ type RuntimeConfig struct {
 	// Lower values (e.g. 50) trigger GC more often → lower memory, slightly higher CPU.
 	// 0 means "use the default (100)".
 	GoGCPercent int `yaml:"gogc"`
+
+	// SysctlTune controls automatic kernel network tuning at startup (BBR + fq
+	// qdisc when available, 16MB TCP/UDP buffer ceilings, TCP Fast Open). Only
+	// takes effect on Linux, running as root, outside containers; the profile is
+	// written to /etc/sysctl.d/99-xboard-node.conf. nil/absent means enabled;
+	// set to false to opt out.
+	SysctlTune *bool `yaml:"sysctl_tune"`
+}
+
+// SysctlTuneEnabled reports whether startup kernel tuning is on (default true).
+func (r RuntimeConfig) SysctlTuneEnabled() bool {
+	return r.SysctlTune == nil || *r.SysctlTune
 }
 
 type PanelConfig struct {
