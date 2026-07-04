@@ -217,16 +217,15 @@ func (d *LimitDispatcher) ResetConns() {
 // GetConnectionState returns dispatcher-tracked alive IPs and connection count.
 // Traffic bytes are intentionally left to xray's built-in stats pipeline.
 func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool, connCount int) {
-	d.mu.RLock()
-	emailToUID := d.emailToUID
-	limitedIPs := d.limitedIPs
-	d.mu.RUnlock()
-
 	aliveIPs = make(map[int]map[string]bool)
 
-	// Collect IPs from limited users (under RLock snapshot).
-	for email, ipsMap := range limitedIPs {
-		uid := emailToUID[email]
+	// Collect IPs from limited users while holding the read lock. limitedIPs and
+	// its inner maps are mutated in place by checkDeviceLimit/delConn under the
+	// write lock, so we must copy them out here rather than iterate after
+	// unlocking — otherwise a concurrent map read/write triggers a fatal error.
+	d.mu.RLock()
+	for email, ipsMap := range d.limitedIPs {
+		uid := d.emailToUID[email]
 		if uid == 0 {
 			continue
 		}
@@ -238,6 +237,10 @@ func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool
 			aliveIPs[uid] = ipSet
 		}
 	}
+	// emailToUID is only ever replaced wholesale (UpdateLimits), never mutated
+	// in place, so the captured reference stays safe to read after unlocking.
+	emailToUID := d.emailToUID
+	d.mu.RUnlock()
 
 	// Collect IPs from unlimited users (lock-free).
 	d.unlimitedIPs.Range(func(key, value interface{}) bool {
@@ -294,7 +297,15 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) b
 		d.mu.RUnlock()
 		if isTCP {
 			d.mu.Lock()
-			d.limitedIPs[email][sourceIP]++
+			// The inner map may have been deleted by delConn between releasing
+			// the read lock and taking the write lock, so recreate it if needed
+			// rather than writing into a nil map (which panics).
+			m := d.limitedIPs[email]
+			if m == nil {
+				m = make(map[string]int)
+				d.limitedIPs[email] = m
+			}
+			m[sourceIP]++
 			d.mu.Unlock()
 		}
 		return false

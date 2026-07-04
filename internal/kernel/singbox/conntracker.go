@@ -29,6 +29,16 @@ var ipPool = sync.Pool{
 
 const trafficStatShardCount = 64
 
+// maxTrafficStatEntriesPerShard caps the number of distinct destination keys a
+// single shard retains between flushes. Diagnostic mode keys traffic by
+// (user, srcIP, domain, dstIP, port, network, category), so a user hitting a
+// very large number of distinct destinations (or an abusive scan) could
+// otherwise grow these maps without bound and OOM small nodes. When a shard is
+// full, new destinations for a user are folded into a per-user "other" bucket.
+// Billing totals are unaffected — they come from the tracker's per-user
+// counters, not from these diagnostic details.
+const maxTrafficStatEntriesPerShard = 1024
+
 type trafficStatKey struct {
 	userID          int
 	sourceIP        string
@@ -201,9 +211,27 @@ func (t *ConnTracker) SetTrafficStatsEnabled(enabled bool) {
 func (t *ConnTracker) SetUserMap(m map[string]int) {
 	t.usersMu.Lock()
 	t.uuidMap = m
+	valid := make(map[int]struct{}, len(m))
 	for _, uid := range m {
+		valid[uid] = struct{}{}
 		if _, ok := t.users[uid]; !ok {
 			t.users[uid] = &userStats{ips: make(map[string]int)}
+		}
+	}
+	// Prune stats for users that are no longer present AND have no active
+	// connections. Users with live connections are kept so their in-flight
+	// traffic keeps being aggregated; they get pruned on a later update once
+	// drained. We hold usersMu (write), so no new connection can attach to a
+	// pruned userStats concurrently.
+	for uid, us := range t.users {
+		if _, ok := valid[uid]; ok {
+			continue
+		}
+		us.mu.RLock()
+		idle := us.connCount == 0
+		us.mu.RUnlock()
+		if idle {
+			delete(t.users, uid)
 		}
 	}
 	t.usersMu.Unlock()
@@ -402,6 +430,12 @@ func (t *ConnTracker) addTrafficStat(key trafficStatKey, upload, download int64)
 
 	shard := &t.trafficStatShards[trafficStatShardIndex(key)]
 	shard.mu.Lock()
+	if _, exists := shard.items[key]; !exists && len(shard.items) >= maxTrafficStatEntriesPerShard {
+		// Shard is full: fold this new destination into a per-user "other"
+		// bucket so memory stays bounded. Keep the userID (>0 required for the
+		// flush) but drop the fine-grained destination fields.
+		key = trafficStatKey{userID: key.userID, category: "other"}
+	}
 	current := shard.items[key]
 	if upload > 0 {
 		current[0] += upload
@@ -732,6 +766,51 @@ func (r *RateLimitedReadCloser) Read(b []byte) (int, error) {
 	return n, err
 }
 
+// waitLimit blocks until the rate limiter permits n bytes. The amount is
+// processed in burst-sized chunks so ReserveN is never called with a value
+// larger than the limiter's burst — which would otherwise return an infinite
+// delay (rate.InfDuration) and hang the connection until ctx cancellation.
+// Returns early if ctx is cancelled. A nil limiter is a no-op.
+func waitLimit(ctx context.Context, lim *rate.Limiter, n int64) {
+	if lim == nil || n <= 0 {
+		return
+	}
+	burst := int64(lim.Burst())
+	if burst <= 0 {
+		return
+	}
+	for n > 0 {
+		chunk := n
+		if chunk > burst {
+			chunk = burst
+		}
+		n -= chunk
+
+		now := time.Now()
+		if lim.AllowN(now, int(chunk)) {
+			continue
+		}
+		resv := lim.ReserveN(now, int(chunk))
+		if !resv.OK() {
+			// Defensive: chunk <= burst guarantees OK, but never block forever.
+			continue
+		}
+		delay := resv.Delay()
+		if delay <= 0 {
+			continue
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			resv.Cancel()
+			timer.Stop()
+			return
+		}
+		timer.Stop()
+	}
+}
+
 type trackedConn struct {
 	net.Conn
 	tracker  *ConnTracker
@@ -840,20 +919,7 @@ func (c *trackedConn) makeCountFunc(counter *atomic.Int64) N.CountFunc {
 		} else {
 			c.tracker.addTrafficStat(c.statKey, 0, n)
 		}
-		// Non-blocking rate limiting with context cancellation
-		if !c.limiter.AllowN(time.Now(), int(n)) {
-			resv := c.limiter.ReserveN(time.Now(), int(n))
-			if delay := resv.Delay(); delay > 0 {
-				timer := time.NewTimer(delay)
-				defer timer.Stop()
-				select {
-				case <-timer.C:
-					// Tokens available
-				case <-c.ctx.Done():
-					resv.Cancel()
-				}
-			}
-		}
+		waitLimit(c.ctx, c.limiter, n)
 	}
 }
 
@@ -977,20 +1043,7 @@ func (c *trackedPacketConn) makeCountFunc(counter *atomic.Int64) N.CountFunc {
 		} else {
 			c.tracker.addTrafficStat(c.statKey, 0, n)
 		}
-		// Non-blocking rate limiting with context cancellation
-		if !c.limiter.AllowN(time.Now(), int(n)) {
-			resv := c.limiter.ReserveN(time.Now(), int(n))
-			if delay := resv.Delay(); delay > 0 {
-				timer := time.NewTimer(delay)
-				defer timer.Stop()
-				select {
-				case <-timer.C:
-					// Tokens available
-				case <-c.ctx.Done():
-					resv.Cancel()
-				}
-			}
-		}
+		waitLimit(c.ctx, c.limiter, n)
 	}
 }
 
@@ -998,14 +1051,14 @@ func (c *trackedPacketConn) UnwrapPacketReader() (N.PacketReader, []N.CountFunc)
 	if c.us == nil {
 		return c.PacketConn, nil
 	}
-	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.download)}
+	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.upload)} // 从入站读取 = 用户上传
 }
 
 func (c *trackedPacketConn) UnwrapPacketWriter() (N.PacketWriter, []N.CountFunc) {
 	if c.us == nil {
 		return c.PacketConn, nil
 	}
-	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.upload)}
+	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.download)} // 向入站写入 = 用户下载
 }
 
 func (c *trackedPacketConn) Upstream() any           { return c.PacketConn }

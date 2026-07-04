@@ -420,6 +420,91 @@ func TestApplyUserUpdateRestoresStateWhenKernelAndRestartFail(t *testing.T) {
 	}
 }
 
+func TestApplyPullResultConfigChangeDoesNotWipeUsersOnTransientEmpty(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.cfg = &config.Config{}
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	s.lastConfigHash = "old-config-hash"
+	users := []model.UserSpec{
+		{ID: 1, UUID: "u1"}, {ID: 2, UUID: "u2"}, {ID: 3, UUID: "u3"},
+	}
+	s.updateUserState(users)
+
+	// A poll carrying a config change AND a (transiently) empty user list — e.g.
+	// a cert renewal coinciding with a panel/DB hiccup. The empty list must not
+	// bypass the empty-sync protection: users are kept and the kernel stays up.
+	empty := []model.UserSpec{}
+	result := pullResult{
+		config:     &model.NodeSpec{Protocol: "vless", ServerPort: 443},
+		configHash: "new-config-hash",
+		users:      empty,
+		userHash:   computeUserHash(empty),
+	}
+	s.applyPullResult(context.Background(), result)
+
+	if !k.running {
+		t.Fatal("kernel must stay running through a transient empty user sync on config change")
+	}
+	if len(s.lastUsers) != 3 {
+		t.Fatalf("lastUsers = %d after transient empty on config change, want 3 preserved", len(s.lastUsers))
+	}
+}
+
+func TestApplyUserUpdateStartsKernelWhenNotRunning(t *testing.T) {
+	// Node started with zero users: kernel is not running yet. When the first
+	// user arrives it must start the kernel with the NEW user set rather than
+	// dropping the update (previously ensureRunning() saw the empty snapshot and
+	// silently discarded it, leaving the node stuck until restart).
+	k := &fakeKernel{running: false}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	s.updateUserState([]model.UserSpec{}) // zero-user start
+
+	newUsers := []model.UserSpec{{ID: 1, UUID: "uuid-1", SpeedLimit: 5}}
+	s.applyUserUpdate(context.Background(), newUsers, computeUserHash(newUsers))
+
+	if !k.running {
+		t.Fatal("kernel should be running after first user arrives")
+	}
+	if k.startCalls != 1 {
+		t.Fatalf("Start call count = %d, want 1", k.startCalls)
+	}
+	if len(s.lastUsers) != 1 || s.lastUsers[0].UUID != "uuid-1" {
+		t.Fatalf("lastUsers = %#v, want the new user", s.lastUsers)
+	}
+	if s.lastUserHash != computeUserHash(newUsers) {
+		t.Fatalf("lastUserHash not updated after starting kernel")
+	}
+	if s.speedTracker.GetLimiter("uuid-1") == nil {
+		t.Fatal("expected limiter for the new user after kernel start")
+	}
+}
+
+func TestApplyUserDeltaAddStartsKernelWhenNotRunning(t *testing.T) {
+	// Same zero-user-start scenario but the first user arrives via a delta.
+	k := &fakeKernel{running: false}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	s.updateUserState([]model.UserSpec{})
+
+	delta := []model.UserSpec{{ID: 7, UUID: "uuid-7"}}
+	s.applyUserDelta(context.Background(), "add", delta)
+
+	if !k.running {
+		t.Fatal("kernel should be running after first delta-add user")
+	}
+	if k.startCalls != 1 {
+		t.Fatalf("Start call count = %d, want 1", k.startCalls)
+	}
+	if k.addCalls != 0 {
+		t.Fatalf("AddUsers should not be called when starting fresh, got %d", k.addCalls)
+	}
+	if len(s.lastUsers) != 1 || s.lastUsers[0].UUID != "uuid-7" {
+		t.Fatalf("lastUsers = %#v, want the delta user", s.lastUsers)
+	}
+}
+
 func TestApplyUserDeltaAddPreparesLimiterBeforeKernelUpdate(t *testing.T) {
 	k := &fakeKernel{running: true}
 	s := newTestService(k)

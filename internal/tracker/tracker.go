@@ -129,6 +129,19 @@ func (t *Tracker) Process(
 		}
 	}
 
+	// Prune bookkeeping for users the kernel no longer reports (removed users).
+	// This is safe: a still-active user always reports a non-zero cumulative and
+	// therefore stays in cumTraffic, so it is never pruned here; a user that is
+	// removed and later re-added gets a fresh kernel counter, and the
+	// negative-delta reset guard above handles the restart-from-zero case.
+	if len(t.lastSeen) > len(cumTraffic) {
+		for uid := range t.lastSeen {
+			if _, ok := cumTraffic[uid]; !ok {
+				delete(t.lastSeen, uid)
+			}
+		}
+	}
+
 	// Compute online from alive IPs.
 	online := make(map[int]int, len(kernelAliveIPs))
 	for uid, ips := range kernelAliveIPs {
