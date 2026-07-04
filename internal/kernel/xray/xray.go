@@ -744,6 +744,21 @@ func (x *Xray) aggregateStats() (map[int][2]int64, error) {
 			traffic[u.ID] = cum
 		}
 	}
+
+	// Prune cumulative entries for users no longer present so the map does not
+	// grow unbounded across user churn within a single running instance. (The
+	// map is also fully reset on every kernel Start.)
+	if len(x.cumTraffic) > len(x.users) {
+		valid := make(map[int]struct{}, len(x.users))
+		for _, u := range x.users {
+			valid[u.ID] = struct{}{}
+		}
+		for id := range x.cumTraffic {
+			if _, ok := valid[id]; !ok {
+				delete(x.cumTraffic, id)
+			}
+		}
+	}
 	return traffic, nil
 }
 

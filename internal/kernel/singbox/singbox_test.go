@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"strconv"
 	"testing"
 	"time"
 
@@ -177,6 +178,111 @@ func TestConnTrackerCloseByIDClosesTrackedConnection(t *testing.T) {
 	}
 	if !base.closed {
 		t.Fatal("expected underlying connection to be closed")
+	}
+}
+
+func TestTrackedPacketConnUnwrapDirection(t *testing.T) {
+	// Reading a packet from the inbound = user upload; writing a packet to the
+	// inbound = user download. Regression guard for the previously-swapped
+	// UnwrapPacketReader/UnwrapPacketWriter counters.
+	tracker := NewConnTracker(0)
+	us := &userStats{ips: make(map[string]int)}
+	c := &trackedPacketConn{tracker: tracker, us: us, ctx: context.Background()}
+
+	_, readFns := c.UnwrapPacketReader()
+	if len(readFns) != 1 {
+		t.Fatalf("UnwrapPacketReader funcs = %d, want 1", len(readFns))
+	}
+	readFns[0](100)
+	if got := us.upload.Load(); got != 100 {
+		t.Fatalf("after packet read, upload = %d, want 100", got)
+	}
+	if got := us.download.Load(); got != 0 {
+		t.Fatalf("after packet read, download = %d, want 0", got)
+	}
+
+	_, writeFns := c.UnwrapPacketWriter()
+	if len(writeFns) != 1 {
+		t.Fatalf("UnwrapPacketWriter funcs = %d, want 1", len(writeFns))
+	}
+	writeFns[0](50)
+	if got := us.download.Load(); got != 50 {
+		t.Fatalf("after packet write, download = %d, want 50", got)
+	}
+	if got := us.upload.Load(); got != 100 {
+		t.Fatalf("upload changed unexpectedly = %d, want 100", got)
+	}
+}
+
+func TestWaitLimitDoesNotHangWhenAmountExceedsBurst(t *testing.T) {
+	// ReserveN with n > burst returns an infinite delay; waitLimit must chunk
+	// the amount so it never blocks forever.
+	lim := rate.NewLimiter(rate.Limit(1<<30), 64*1024) // 1 GiB/s, 64 KiB burst
+	done := make(chan struct{})
+	go func() {
+		waitLimit(context.Background(), lim, 4<<20) // 4 MiB, far exceeds burst
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("waitLimit hung on an amount larger than the burst")
+	}
+}
+
+func TestWaitLimitReturnsOnContextCancel(t *testing.T) {
+	lim := rate.NewLimiter(rate.Limit(1), 1) // 1 B/s: any real wait is long
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		waitLimit(ctx, lim, 1<<20)
+		close(done)
+	}()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("waitLimit did not return promptly after context cancel")
+	}
+}
+
+func TestTrafficStatsBoundedUnderKeyExplosion(t *testing.T) {
+	tracker := NewConnTracker(0)
+	tracker.SetTrafficStatsEnabled(true)
+
+	const n = 200000
+	var total int64
+	for i := 0; i < n; i++ {
+		key := trafficStatKey{
+			userID:      1,
+			sourceIP:    "1.1.1.1",
+			destination: "host-" + strconv.Itoa(i) + ".example.com",
+			category:    "domain",
+		}
+		tracker.addTrafficStat(key, 1, 0)
+		total++
+	}
+
+	retained := 0
+	for i := range tracker.trafficStatShards {
+		retained += len(tracker.trafficStatShards[i].items)
+	}
+	if retained >= n {
+		t.Fatalf("retained %d keys, expected bounded folding well below %d", retained, n)
+	}
+	maxExpected := trafficStatShardCount * (maxTrafficStatEntriesPerShard + 1)
+	if retained > maxExpected {
+		t.Fatalf("retained %d keys exceeds cap %d", retained, maxExpected)
+	}
+
+	// Folding into the per-user "other" bucket must preserve totals.
+	stats := tracker.FlushTrafficStats()
+	var sum int64
+	for _, s := range stats {
+		sum += s.U
+	}
+	if sum != total {
+		t.Fatalf("flushed upload sum = %d, want %d (folding must preserve totals)", sum, total)
 	}
 }
 

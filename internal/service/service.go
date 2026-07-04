@@ -898,7 +898,16 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 		if usersChanged && !configChanged {
 			s.applyUserUpdate(ctx, result.users, result.userHash)
 		} else if usersChanged {
-			s.updateUserState(result.users)
+			// Config-change path: applyChanges below will (re)start or stop the
+			// kernel using s.lastUsers, so a transient empty user list here must
+			// be guarded the same way applyUserUpdate guards it — otherwise a
+			// panel hiccup that coincides with a config or cert change wipes all
+			// users, bypassing the empty-sync protection. ignoreEmptyUserSync is
+			// only called on this branch (applyUserUpdate does its own on the
+			// other), so the streak is never double-counted.
+			if !s.ignoreEmptyUserSync(result.users) {
+				s.updateUserState(result.users)
+			}
 		}
 	}
 
@@ -971,18 +980,6 @@ func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
 	return true
 }
 
-// ensureRunning starts the kernel if it is not running and there are users +
-// config available. Returns true if the kernel is running afterwards.
-func (s *Service) ensureRunning() bool {
-	if s.kernel.IsRunning() {
-		return true
-	}
-	if len(s.lastUsers) > 0 && s.lastConfig != nil {
-		return s.startKernel(s.lastConfig, s.lastUsers)
-	}
-	return false
-}
-
 // ─── User update entry points ───────────────────────────────────────────────
 
 // emptyUserSyncThreshold is how many consecutive empty full-sync responses must
@@ -1040,11 +1037,35 @@ func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, n
 	if s.ignoreEmptyUserSync(users) {
 		return
 	}
-	if !s.ensureRunning() {
+
+	// Record the new user set (limiter + snapshot) BEFORE deciding how to apply
+	// it to the kernel. This matters when the node started with zero users and
+	// the kernel is not running yet: the update must be based on the incoming
+	// users, not the (empty) previous snapshot. Doing this first also gives us
+	// prevUsers/prevHash for rollback.
+	prevUsers, prevHash := s.prepareUserState(users)
+
+	// Kernel not yet running (e.g. first user arriving after a zero-user start):
+	// start it fresh with the new user set instead of dropping the update.
+	if !s.kernel.IsRunning() {
+		if s.lastConfig == nil || len(users) == 0 {
+			// No config yet, or genuinely no users to run — keep the recorded
+			// snapshot and wait for a config/user update to start the kernel.
+			if newHash != "" {
+				s.lastUserHash = newHash
+			}
+			return
+		}
+		if !s.startKernel(s.lastConfig, users) {
+			s.restoreUserState(prevUsers, prevHash)
+			return
+		}
+		if newHash != "" {
+			s.lastUserHash = newHash
+		}
 		return
 	}
 
-	prevUsers, prevHash := s.prepareUserState(users)
 	added, removed, err := s.kernel.UpdateUsers(users)
 	if err != nil {
 		nlog.Core().Warn(fmt.Sprintf("UpdateUsers failed, restarting kernel: %v", err))
@@ -1067,12 +1088,22 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 	switch action {
 	case "add":
 		// Defensive check for empty or nil deltaUsers
-		if deltaUsers == nil || len(deltaUsers) == 0 {
+		if len(deltaUsers) == 0 {
 			return
 		}
 		merged := mergeUsers(s.lastUsers, deltaUsers)
 
-		if !s.ensureRunning() {
+		// Kernel not running yet (e.g. first users arriving via a delta after a
+		// zero-user start): start it fresh with the merged set instead of
+		// dropping the delta.
+		if !s.kernel.IsRunning() {
+			prevUsers, prevHash := s.prepareUserState(merged)
+			if s.lastConfig == nil || len(merged) == 0 {
+				return
+			}
+			if !s.startKernel(s.lastConfig, merged) {
+				s.restoreUserState(prevUsers, prevHash)
+			}
 			return
 		}
 

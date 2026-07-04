@@ -9,7 +9,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestDownloadURL(t *testing.T) {
@@ -163,4 +165,59 @@ type recordingSender struct {
 
 func (r *recordingSender) SendRaw(event string, data json.RawMessage) {
 	r.events = append(r.events, event)
+}
+
+// TestDownload verifies download writes the response body to dest intact.
+func TestDownload(t *testing.T) {
+	content := make([]byte, 1<<20) // 1 MiB
+	for i := range content {
+		content[i] = byte(i)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(content)))
+		w.Write(content)
+	}))
+	defer srv.Close()
+
+	dest := filepath.Join(t.TempDir(), "artifact.bin")
+	if err := download(srv.URL, dest, "xboard-node-linux-amd64"); err != nil {
+		t.Fatalf("download: %v", err)
+	}
+
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(content) {
+		t.Fatalf("downloaded %d bytes, want %d", len(got), len(content))
+	}
+}
+
+// TestDownloadStall verifies a download that goes silent is aborted by the
+// inactivity watchdog rather than hanging until the absolute cap.
+func TestDownloadStall(t *testing.T) {
+	// Shrink the stall window so the test is fast; restore afterwards.
+	oldStall := downloadStallTimeout
+	downloadStallTimeout = 200 * time.Millisecond
+	defer func() { downloadStallTimeout = oldStall }()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1000000")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		// Send a couple of bytes, then hang forever (no more data).
+		w.Write([]byte{1, 2})
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	dest := filepath.Join(t.TempDir(), "artifact.bin")
+	err := download(srv.URL, dest, "xbctl-linux-amd64")
+	if err == nil {
+		t.Fatal("expected stall error, got nil")
+	}
+	if !strings.Contains(err.Error(), "stalled") {
+		t.Fatalf("expected stall error, got: %v", err)
+	}
 }

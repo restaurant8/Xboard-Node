@@ -143,8 +143,10 @@ type WSClient struct {
 	connected atomic.Bool
 
 	// writeCh allows sending messages from outside the connect loop.
-	// It is set in connect() and cleared on disconnect.
-	writeCh chan wsMessage
+	// It is set in connect() and cleared on disconnect. Accessed from multiple
+	// goroutines (the connect loop vs. external Send* callers), so it is stored
+	// atomically to avoid a data race on the field itself.
+	writeCh atomic.Pointer[chan wsMessage]
 }
 
 // NewWSClient creates a new WebSocket client.
@@ -257,11 +259,15 @@ func (w *WSClient) connect(ctx context.Context) error {
 
 	conn.SetReadLimit(10 << 20) // 10MB max message size
 
-	// Read first message — expect auth.success or error
+	// Read first message — expect auth.success or error. Bound this read so a
+	// server that completes the WS handshake but never sends an app message
+	// can't wedge the client here forever.
+	conn.SetReadDeadline(time.Now().Add(w.cfg.HandshakeTimeout))
 	var firstMsg wsMessage
 	if err := conn.ReadJSON(&firstMsg); err != nil {
 		return fmt.Errorf("read auth response: %w", err)
 	}
+	conn.SetReadDeadline(time.Time{}) // clear; the read loop relies on server pings
 	nlog.Core().Debug("ws recv", "event", firstMsg.Event, "data", string(firstMsg.Data))
 
 	if firstMsg.Event == "error" {
@@ -292,8 +298,8 @@ func (w *WSClient) connect(ctx context.Context) error {
 
 	// writeCh decouples data collection from network I/O.
 	writeCh := make(chan wsMessage, 16)
-	w.writeCh = writeCh
-	defer func() { w.writeCh = nil }()
+	w.writeCh.Store(&writeCh)
+	defer w.writeCh.Store(nil)
 
 	errCh := make(chan error, 1)
 	done := make(chan struct{})
@@ -552,8 +558,12 @@ func (w *WSClient) SendDeviceReportForNode(nodeID int, devices map[int][]string)
 		Timestamp: time.Now().Unix(),
 	}
 
+	chp := w.writeCh.Load()
+	if chp == nil {
+		return
+	}
 	select {
-	case w.writeCh <- msg:
+	case *chp <- msg:
 	default:
 		nlog.Core().Warn("ws write channel full, skipping device report")
 	}
@@ -573,8 +583,12 @@ func (w *WSClient) SendNodeStatus(nodeID int, stats map[string]interface{}) {
 		Data:      data,
 		Timestamp: time.Now().Unix(),
 	}
+	chp := w.writeCh.Load()
+	if chp == nil {
+		return
+	}
 	select {
-	case w.writeCh <- msg:
+	case *chp <- msg:
 	default:
 		nlog.Core().Warn("ws write channel full, skipping node status")
 	}
@@ -592,8 +606,12 @@ func (w *WSClient) SendRaw(event string, data json.RawMessage) {
 		Timestamp: time.Now().Unix(),
 	}
 
+	chp := w.writeCh.Load()
+	if chp == nil {
+		return
+	}
 	select {
-	case w.writeCh <- msg:
+	case *chp <- msg:
 	default:
 		nlog.Core().Warn("ws write channel full, skipping raw message", "event", event)
 	}

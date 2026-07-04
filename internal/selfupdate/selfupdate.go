@@ -17,12 +17,14 @@ package selfupdate
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -48,6 +50,18 @@ const (
 	EventResult  = "upgrade.result"
 	EventRestart = "restart.result"
 )
+
+// downloadStallTimeout aborts a download that receives no bytes for this long —
+// a genuine stall, not merely a slow link. We deliberately do NOT cap the total
+// download time with a fixed deadline: the node binary is ~64MB and a small
+// fixed timeout (the old behaviour) would abort a perfectly healthy download on
+// slow links. A slow-but-steady transfer keeps resetting the stall timer and
+// runs to completion. It is a var so tests can shrink it.
+var downloadStallTimeout = 60 * time.Second
+
+// downloadMaxDuration is an absolute safety cap on a single artifact download so
+// a pathologically slow link cannot hang the upgrade forever.
+const downloadMaxDuration = 30 * time.Minute
 
 // Install paths — vars (not consts) so tests can redirect them to a temp dir.
 var (
@@ -92,8 +106,24 @@ var exitFn = func() {
 	}
 }
 
-// httpClient is used for downloads; overridable in tests.
-var httpClient = &http.Client{Timeout: 120 * time.Second}
+// httpClient is used for downloads; overridable in tests. It deliberately has
+// no overall Client.Timeout: that timeout also bounds body reads, so a fixed
+// value would abort a large, slow-but-healthy artifact download mid-stream.
+// Connection setup is bounded by the transport timeouts below; an in-flight
+// stall is caught by the per-download inactivity watchdog (see download).
+var httpClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   30 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		ExpectContinueTimeout: 10 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+	},
+}
 
 // Apply runs the full upgrade flow for a panel-issued command, reporting
 // progress through sender. It is safe to call from multiple goroutines: only
@@ -193,10 +223,10 @@ func run(cmd Command) (string, error) {
 	newBinary := filepath.Join(filepath.Dir(binaryPath), ".xboard-node.new")
 	newCLI := filepath.Join(filepath.Dir(cliPath), ".xbctl.new")
 
-	if err := download(downloadURL(base, version, binaryArtifact), newBinary); err != nil {
+	if err := download(downloadURL(base, version, binaryArtifact), newBinary, binaryArtifact); err != nil {
 		return "", fmt.Errorf("download binary: %w", err)
 	}
-	if err := download(downloadURL(base, version, cliArtifact), newCLI); err != nil {
+	if err := download(downloadURL(base, version, cliArtifact), newCLI, cliArtifact); err != nil {
 		os.Remove(newBinary)
 		return "", fmt.Errorf("download xbctl: %w", err)
 	}
@@ -322,8 +352,19 @@ func downloadURL(base, version, artifact string) string {
 	return base + "/download/" + version + "/" + artifact
 }
 
-func download(url, dest string) error {
-	resp, err := httpClient.Get(url)
+// download fetches url into dest. It aborts on a stall — no bytes received for
+// downloadStallTimeout — rather than on a fixed overall deadline, so a
+// slow-but-steady link can still finish a large artifact (the node binary is
+// ~64MB). label identifies the artifact in local logs only.
+func download(url, dest, label string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), downloadMaxDuration)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -331,13 +372,113 @@ func download(url, dest string) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
 	}
+
 	f, err := os.Create(dest)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	_, err = io.Copy(f, resp.Body)
-	return err
+
+	pr := &progressReader{
+		r:     resp.Body,
+		total: resp.ContentLength,
+		label: label,
+		start: time.Now(),
+	}
+	pr.lastData.Store(time.Now().UnixNano())
+
+	// Inactivity watchdog: cancel the request if no bytes arrive within the stall
+	// window. A slow but steady link keeps resetting lastData and is unaffected.
+	// Poll several times per stall window (bounded) so detection is timely.
+	interval := downloadStallTimeout / 4
+	if interval > 10*time.Second {
+		interval = 10 * time.Second
+	}
+	if interval < 50*time.Millisecond {
+		interval = 50 * time.Millisecond
+	}
+	stop := make(chan struct{})
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				if time.Since(time.Unix(0, pr.lastData.Load())) > downloadStallTimeout {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	_, copyErr := io.Copy(f, pr)
+	close(stop)
+	if copyErr != nil {
+		switch ctx.Err() {
+		case context.Canceled:
+			return fmt.Errorf("download stalled: no data for %s", downloadStallTimeout)
+		case context.DeadlineExceeded:
+			return fmt.Errorf("download exceeded %s", downloadMaxDuration)
+		default:
+			return copyErr
+		}
+	}
+	pr.logComplete()
+	return nil
+}
+
+// progressReader wraps the response body to track bytes read and drive the stall
+// watchdog (via lastData). It logs download progress locally; it does not report
+// anything back to the panel.
+type progressReader struct {
+	r     io.Reader
+	total int64 // Content-Length, or -1 when unknown
+	read  int64
+	label string
+	start time.Time
+
+	lastData    atomic.Int64 // UnixNano of the last successful Read; read by the watchdog
+	lastReport  time.Time
+	lastPercent int
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.read += int64(n)
+		p.lastData.Store(time.Now().UnixNano())
+		p.maybeLog()
+	}
+	return n, err
+}
+
+// maybeLog writes a local progress line at most every 3s, and (when the size is
+// known) only when the whole-percent figure advances, to avoid log spam.
+func (p *progressReader) maybeLog() {
+	percent := -1
+	if p.total > 0 {
+		percent = int(p.read * 100 / p.total)
+	}
+	now := time.Now()
+	if now.Sub(p.lastReport) < 3*time.Second {
+		return
+	}
+	if percent >= 0 && percent == p.lastPercent {
+		return
+	}
+	p.lastReport = now
+	p.lastPercent = percent
+	nlog.Core().Info("self-upgrade download progress",
+		"artifact", p.label, "downloaded", p.read, "total", p.total, "percent", percent)
+}
+
+func (p *progressReader) logComplete() {
+	nlog.Core().Info("self-upgrade download complete",
+		"artifact", p.label, "bytes", p.read,
+		"elapsed", time.Since(p.start).Round(time.Millisecond).String())
 }
 
 // fetchChecksums downloads and parses a SHA256SUMS manifest (lines of
