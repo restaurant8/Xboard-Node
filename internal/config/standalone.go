@@ -22,6 +22,7 @@ type StandaloneNodeConfig struct {
 	NetworkSettings  map[string]any              `yaml:"network_settings,omitempty"`
 	Routes           []StandaloneRouteRule       `yaml:"routes,omitempty"`
 	CustomRouteRules []StandaloneCustomRouteRule `yaml:"custom_route_rules,omitempty"`
+	UDPEnabled       *bool                       `yaml:"udp_enabled,omitempty"`
 
 	Cipher    string `yaml:"cipher,omitempty"`
 	Plugin    string `yaml:"plugin,omitempty"`

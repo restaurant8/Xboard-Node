@@ -163,6 +163,7 @@ func cloneNodeSpec(spec *model.NodeSpec) *model.NodeSpec {
 		return nil
 	}
 	clone := *spec
+	clone.UDPEnabled = cloneBoolPtr(spec.UDPEnabled)
 	if spec.NetworkSettings != nil {
 		clone.NetworkSettings = make(map[string]interface{}, len(spec.NetworkSettings))
 		for k, v := range spec.NetworkSettings {
@@ -216,6 +217,14 @@ func cloneNodeSpec(spec *model.NodeSpec) *model.NodeSpec {
 		clone.Multiplex = &muxCopy
 	}
 	return &clone
+}
+
+func cloneBoolPtr(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func cloneUsers(users []model.UserSpec) []model.UserSpec {

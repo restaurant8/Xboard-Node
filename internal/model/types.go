@@ -9,6 +9,9 @@ type NodeSpec struct {
 	Network         string
 	NetworkSettings map[string]any
 	Routes          []RouteRule
+	// UDPEnabled controls proxied UDP relay. nil preserves the legacy default
+	// (enabled) when an older panel omits the field.
+	UDPEnabled *bool
 
 	KernelType       string
 	KernelLogLevel   string
@@ -101,6 +104,12 @@ func (n *NodeSpec) GetProxyProtocol() bool {
 	return false
 }
 
+// AllowsUDP reports whether user traffic may be relayed over UDP.
+// It does not govern the node process or host's own UDP traffic.
+func (n *NodeSpec) AllowsUDP() bool {
+	return n == nil || n.UDPEnabled == nil || *n.UDPEnabled
+}
+
 func cloneAnyMap(src map[string]any) map[string]any {
 	if len(src) == 0 {
 		return nil
@@ -130,4 +139,12 @@ func cloneStringSlice(src []string) []string {
 	out := make([]string, len(src))
 	copy(out, src)
 	return out
+}
+
+func cloneBoolPtr(src *bool) *bool {
+	if src == nil {
+		return nil
+	}
+	value := *src
+	return &value
 }

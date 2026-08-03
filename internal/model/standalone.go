@@ -63,6 +63,7 @@ func NodeSpecFromStandalone(cfg *config.Config) *NodeSpec {
 		NetworkSettings:     cloneAnyMap(sc.Node.NetworkSettings),
 		Routes:              routes,
 		CustomRouteRules:    customRouteRules,
+		UDPEnabled:          cloneBoolPtr(sc.Node.UDPEnabled),
 		KernelType:          cfg.Kernel.Type,
 		KernelLogLevel:      cfg.Kernel.LogLevel,
 		Cipher:              sc.Node.Cipher,

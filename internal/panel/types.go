@@ -96,6 +96,9 @@ type NodeConfig struct {
 	NetworkSettings map[string]interface{} `json:"networkSettings"`
 	BaseConfig      BaseConfig             `json:"base_config"`
 	Routes          []RouteRule            `json:"routes"`
+	// UDPEnabled controls proxied UDP relay. nil means enabled for compatibility
+	// with panels that predate this field.
+	UDPEnabled *bool `json:"udp_enabled,omitempty"`
 
 	// Kernel settings (Xboard extension)
 	KernelType       string            `json:"kernel_type,omitempty"`      // "singbox" or "xray"

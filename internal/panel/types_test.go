@@ -117,6 +117,28 @@ func TestNodeConfig_UnmarshalFullPanelResponse(t *testing.T) {
 	}
 }
 
+func TestNodeConfig_UDPEnabledCompatibility(t *testing.T) {
+	t.Run("missing field keeps legacy behavior", func(t *testing.T) {
+		var nc NodeConfig
+		if err := json.Unmarshal([]byte(`{"protocol":"shadowsocks"}`), &nc); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if nc.UDPEnabled != nil {
+			t.Fatalf("udp_enabled: got %v, want nil", *nc.UDPEnabled)
+		}
+	})
+
+	t.Run("explicit false is preserved", func(t *testing.T) {
+		var nc NodeConfig
+		if err := json.Unmarshal([]byte(`{"protocol":"shadowsocks","udp_enabled":false}`), &nc); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if nc.UDPEnabled == nil || *nc.UDPEnabled {
+			t.Fatalf("udp_enabled: got %v, want false", nc.UDPEnabled)
+		}
+	})
+}
+
 func TestUsersResponse_Unmarshal(t *testing.T) {
 	input := `{
 		"users": [

@@ -74,7 +74,75 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 	}
 
 	mergeCustomSingbox(cfg, kcfg)
+	enforceUDPPolicy(cfg, nc)
 	return cfg
+}
+
+const udpBlockOutboundTag = "xboard-udp-block"
+
+// enforceUDPPolicy runs after every panel and local custom-config merge so the
+// panel switch remains authoritative over all user-defined routing rules. The
+// dedicated outbound also prevents a custom outbound named "block" from
+// changing the meaning of this policy.
+// The rule is scoped to the user inbound so only proxied traffic is affected,
+// never the node's own UDP (DNS, NTP, control plane).
+func enforceUDPPolicy(cfg M, nc *model.NodeSpec) {
+	if nc.AllowsUDP() {
+		return
+	}
+
+	// Referencing a tag we failed to install would keep the kernel from
+	// starting, so fall back to the always-present shared block outbound
+	// instead of silently relaying UDP.
+	blockTag := udpBlockOutboundTag
+	if outbounds, ok := normalizeOutbounds(cfg["outbounds"]); ok {
+		filtered := make([]M, 0, len(outbounds)+1)
+		for _, outbound := range outbounds {
+			if outbound["tag"] != udpBlockOutboundTag {
+				filtered = append(filtered, outbound)
+			}
+		}
+		cfg["outbounds"] = append(filtered, M{
+			"type": "block",
+			"tag":  udpBlockOutboundTag,
+		})
+	} else {
+		blockTag = "block"
+		nlog.Core().Error("singbox: unexpected outbounds type, enforcing UDP policy through the shared block outbound")
+	}
+
+	route, ok := cfg["route"].(M)
+	if !ok {
+		route = M{}
+		cfg["route"] = route
+	}
+	existing, _ := route["rules"].([]M)
+	udpRule := M{
+		"inbound":  []string{nc.Protocol + "-in"},
+		"network":  []string{"udp"},
+		"outbound": blockTag,
+	}
+	route["rules"] = append([]M{udpRule}, existing...)
+}
+
+// normalizeOutbounds accepts both the natively built []M and the []any shape a
+// JSON-decoded custom config could introduce.
+func normalizeOutbounds(raw any) ([]M, bool) {
+	switch items := raw.(type) {
+	case []M:
+		return items, true
+	case []any:
+		out := make([]M, 0, len(items))
+		for _, item := range items {
+			entry, ok := item.(map[string]any)
+			if !ok {
+				return nil, false
+			}
+			out = append(out, entry)
+		}
+		return out, true
+	}
+	return nil, false
 }
 
 // outboundConfigToSingbox converts a structured OutboundConfig (from the panel)

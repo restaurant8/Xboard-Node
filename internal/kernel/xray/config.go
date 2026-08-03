@@ -81,7 +81,79 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 	cfg["routing"] = buildRouting(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute))
 
 	mergeCustomXray(cfg, kcfg)
+	enforceUDPPolicy(cfg, nc)
 	return cfg
+}
+
+const udpBlockOutboundTag = "xboard-udp-block"
+
+// enforceUDPPolicy runs after every panel and local custom-config merge so the
+// panel switch remains authoritative over all user-defined routing rules. The
+// dedicated outbound also prevents a custom outbound named "block" from
+// changing the meaning of this policy.
+//
+// The rule is scoped to the user inbound on purpose: Xray routes its built-in
+// DNS client's queries through the same rule set, so an unscoped UDP block
+// would take down name resolution whenever a custom config points "dns" at a
+// UDP upstream.
+func enforceUDPPolicy(cfg M, nc *model.NodeSpec) {
+	if nc.AllowsUDP() {
+		return
+	}
+
+	// Referencing a tag we failed to install would keep the kernel from
+	// starting, so fall back to the always-present shared blackhole instead of
+	// silently relaying UDP.
+	blockTag := udpBlockOutboundTag
+	if outbounds, ok := normalizeOutbounds(cfg["outbounds"]); ok {
+		filtered := make([]M, 0, len(outbounds)+1)
+		for _, outbound := range outbounds {
+			if outbound["tag"] != udpBlockOutboundTag {
+				filtered = append(filtered, outbound)
+			}
+		}
+		cfg["outbounds"] = append(filtered, M{
+			"protocol": "blackhole",
+			"tag":      udpBlockOutboundTag,
+		})
+	} else {
+		blockTag = "block"
+		nlog.Core().Error("xray: unexpected outbounds type, enforcing UDP policy through the shared block outbound")
+	}
+
+	routing, ok := cfg["routing"].(M)
+	if !ok {
+		routing = M{}
+		cfg["routing"] = routing
+	}
+	existing, _ := routing["rules"].([]M)
+	udpRule := M{
+		"type":        "field",
+		"network":     "udp",
+		"inboundTag":  []string{nc.Protocol + "-in"},
+		"outboundTag": blockTag,
+	}
+	routing["rules"] = append([]M{udpRule}, existing...)
+}
+
+// normalizeOutbounds accepts both the natively built []M and the []any shape a
+// JSON-decoded custom config could introduce.
+func normalizeOutbounds(raw any) ([]M, bool) {
+	switch items := raw.(type) {
+	case []M:
+		return items, true
+	case []any:
+		out := make([]M, 0, len(items))
+		for _, item := range items {
+			entry, ok := item.(map[string]any)
+			if !ok {
+				return nil, false
+			}
+			out = append(out, entry)
+		}
+		return out, true
+	}
+	return nil, false
 }
 
 // outboundConfigToXray converts a structured OutboundConfig (from the panel)

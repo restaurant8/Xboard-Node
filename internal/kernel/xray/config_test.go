@@ -382,6 +382,87 @@ func TestBuildRouting_StructuredCustomRulesRemainFirst(t *testing.T) {
 	}
 }
 
+func TestBuildConfig_UDPPolicyIsAuthoritative(t *testing.T) {
+	disabled := false
+	nc := &panel.NodeConfig{
+		Protocol:   "shadowsocks",
+		ServerPort: 8388,
+		Cipher:     "aes-128-gcm",
+		UDPEnabled: &disabled,
+		CustomRouteRules: []panel.CustomRouteRule{{
+			Match:  panel.RouteMatch{Networks: []string{"udp"}},
+			Action: panel.RouteAction{Type: "direct"},
+		}},
+	}
+	cfg := buildConfig(testKernelCfg, testNodeSpec(nc), testUsers, kernel.TLSCert{})
+
+	rules := cfg["routing"].(M)["rules"].([]M)
+	if len(rules) < 2 || rules[0]["network"] != "udp" || rules[0]["outboundTag"] != udpBlockOutboundTag {
+		t.Fatalf("forced UDP block must be the first route, got %#v", rules)
+	}
+	// Scoped to the user inbound: Xray routes its built-in DNS queries through
+	// the same rule set, an unscoped block would kill name resolution.
+	inboundTags, ok := rules[0]["inboundTag"].([]string)
+	if !ok || len(inboundTags) != 1 || inboundTags[0] != "shadowsocks-in" {
+		t.Fatalf("UDP block must be scoped to the user inbound, got %#v", rules[0]["inboundTag"])
+	}
+	if rules[1]["outboundTag"] != "direct" {
+		t.Fatalf("expected custom direct rule after forced policy, got %#v", rules[1])
+	}
+
+	foundBlock := false
+	for _, outbound := range cfg["outbounds"].([]M) {
+		if outbound["tag"] == udpBlockOutboundTag {
+			foundBlock = outbound["protocol"] == "blackhole"
+		}
+	}
+	if !foundBlock {
+		t.Fatalf("missing dedicated UDP blackhole outbound: %#v", cfg["outbounds"])
+	}
+}
+
+func TestBuildConfig_MissingUDPPolicyKeepsLegacyDefault(t *testing.T) {
+	nc := &panel.NodeConfig{Protocol: "shadowsocks", ServerPort: 8388, Cipher: "aes-128-gcm"}
+	cfg := buildConfig(testKernelCfg, testNodeSpec(nc), testUsers, kernel.TLSCert{})
+	for _, outbound := range cfg["outbounds"].([]M) {
+		if outbound["tag"] == udpBlockOutboundTag {
+			t.Fatal("legacy config without udp_enabled must not install a UDP block")
+		}
+	}
+}
+
+func TestEnforceUDPPolicy_AcceptsDecodedOutbounds(t *testing.T) {
+	disabled := false
+	spec := testNodeSpec(&panel.NodeConfig{Protocol: "shadowsocks", UDPEnabled: &disabled})
+	cfg := M{"outbounds": []any{map[string]any{"protocol": "freedom", "tag": "direct"}}}
+
+	enforceUDPPolicy(cfg, spec)
+
+	rules := cfg["routing"].(M)["rules"].([]M)
+	if rules[0]["outboundTag"] != udpBlockOutboundTag {
+		t.Fatalf("expected the dedicated block tag, got %#v", rules[0])
+	}
+	outbounds := cfg["outbounds"].([]M)
+	if outbounds[len(outbounds)-1]["tag"] != udpBlockOutboundTag {
+		t.Fatalf("dedicated block outbound was not installed: %#v", outbounds)
+	}
+}
+
+// The policy must never degrade into "UDP relayed": if the dedicated outbound
+// cannot be installed, the rule falls back to the shared block outbound.
+func TestEnforceUDPPolicy_FailsClosedOnUnexpectedOutbounds(t *testing.T) {
+	disabled := false
+	spec := testNodeSpec(&panel.NodeConfig{Protocol: "shadowsocks", UDPEnabled: &disabled})
+	cfg := M{"outbounds": "not-a-list"}
+
+	enforceUDPPolicy(cfg, spec)
+
+	rules := cfg["routing"].(M)["rules"].([]M)
+	if rules[0]["network"] != "udp" || rules[0]["outboundTag"] != "block" {
+		t.Fatalf("UDP must still be blocked through the shared outbound, got %#v", rules[0])
+	}
+}
+
 func TestBuildConfig_LogLevel(t *testing.T) {
 	tests := []struct {
 		input    string

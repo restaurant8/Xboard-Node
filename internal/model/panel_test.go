@@ -8,6 +8,25 @@ import (
 	"github.com/cedar2025/xboard-node/internal/panel"
 )
 
+func TestNodeSpecUDPPolicy(t *testing.T) {
+	legacy := NodeSpecFromPanel(&panel.NodeConfig{})
+	if !legacy.AllowsUDP() {
+		t.Fatal("an omitted udp_enabled field must preserve the legacy enabled default")
+	}
+
+	disabled := false
+	spec := NodeSpecFromPanel(&panel.NodeConfig{UDPEnabled: &disabled})
+	if spec.AllowsUDP() {
+		t.Fatal("explicit udp_enabled=false must disable UDP relay")
+	}
+	if spec.UDPEnabled == &disabled {
+		t.Fatal("NodeSpecFromPanel must clone the udp_enabled pointer")
+	}
+	if roundTrip := spec.ToPanel(); roundTrip.UDPEnabled == nil || *roundTrip.UDPEnabled {
+		t.Fatal("udp_enabled=false was lost during panel round trip")
+	}
+}
+
 func TestNodeSpecFromPanelValidated(t *testing.T) {
 	t.Run("valid custom outbounds and route targets", func(t *testing.T) {
 		node, err := NodeSpecFromPanelValidated(&panel.NodeConfig{
