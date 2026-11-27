@@ -1244,13 +1244,13 @@ func (s *Service) trackAndEnforce(ctx context.Context) {
 		return
 	}
 
-	traffic, aliveIPs, connCount, err := s.kernel.GetUserTraffic(ctx)
+	traffic, aliveIPs, userConns, connCount, err := s.kernel.GetUserTraffic(ctx)
 	if err != nil {
 		nlog.Core().Debug("get user traffic failed", "error", err)
 		return
 	}
 
-	s.tracker.Process(traffic, aliveIPs, connCount)
+	s.tracker.ProcessWithUserConns(traffic, aliveIPs, userConns, connCount)
 
 	// Only log stats if there's actual traffic or connections
 	if connCount > 0 || len(traffic) > 0 {
@@ -1281,6 +1281,7 @@ func (s *Service) pushReportAsync() {
 	traffic, reportID, retrying := s.takeTrafficReport()
 	aliveIPs := s.tracker.FlushAliveIPs()
 	online := s.tracker.CurrentOnline()
+	userConns := s.tracker.CurrentUserConns()
 	status := monitor.Collect()
 	metrics := s.buildMetrics(status)
 	metrics["kernel_status"] = s.kernel.IsRunning()
@@ -1293,12 +1294,12 @@ func (s *Service) pushReportAsync() {
 
 	go func() {
 		defer s.pushActive.Store(false)
-		if err := s.sink.Report(controlplane.ReportPayload{ReportID: reportID, Traffic: traffic, TrafficStats: trafficStats, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
+		if err := s.sink.Report(controlplane.ReportPayload{ReportID: reportID, Traffic: traffic, TrafficStats: trafficStats, Alive: aliveIPs, Online: online, UserConns: userConns, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
 			nlog.Core().Warn("failed to push report", "error", err)
 			if len(traffic) > 0 || len(trafficStats) > 0 {
 				s.rememberFailedTraffic(reportID, traffic, trafficStats, retrying)
 			}
-			if len(aliveIPs) > 0 {
+			if aliveIPs != nil {
 				s.tracker.RestoreAliveIPs(aliveIPs)
 			}
 			s.pushBackoff.onFailure()
@@ -1320,6 +1321,7 @@ func (s *Service) pushReportSync() {
 		traffic, reportID, retrying := s.takeTrafficReport()
 		aliveIPs := s.tracker.FlushAliveIPs()
 		online := s.tracker.CurrentOnline()
+		userConns := s.tracker.CurrentUserConns()
 		status := monitor.Collect()
 		metrics := s.buildMetrics(status)
 		metrics["kernel_status"] = s.kernel.IsRunning()
@@ -1330,16 +1332,16 @@ func (s *Service) pushReportSync() {
 			s.reportMu.Unlock()
 		}
 
-		if len(traffic) == 0 && len(aliveIPs) == 0 && len(online) == 0 && len(metrics) == 0 {
+		if len(traffic) == 0 && len(aliveIPs) == 0 && len(online) == 0 && len(userConns) == 0 && len(metrics) == 0 {
 			return
 		}
 
-		if err := s.sink.Report(controlplane.ReportPayload{ReportID: reportID, Traffic: traffic, TrafficStats: trafficStats, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
+		if err := s.sink.Report(controlplane.ReportPayload{ReportID: reportID, Traffic: traffic, TrafficStats: trafficStats, Alive: aliveIPs, Online: online, UserConns: userConns, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
 			nlog.Core().Warn("failed to push final report", "error", err)
 			if len(traffic) > 0 || len(trafficStats) > 0 {
 				s.rememberFailedTraffic(reportID, traffic, trafficStats, retrying)
 			}
-			if len(aliveIPs) > 0 {
+			if aliveIPs != nil {
 				s.tracker.RestoreAliveIPs(aliveIPs)
 			}
 			return
@@ -1487,7 +1489,10 @@ func (s *Service) sendDeviceBatch() {
 		nlog.Core().Debug("device snapshot unchanged, skipping")
 		return
 	}
-	s.sink.ReportDevices(s.wsClient, devices)
+	if !s.sink.ReportDevices(s.wsClient, devices) {
+		s.tracker.MarkAliveDirty()
+		return
+	}
 	nlog.Core().Debug("device snapshot sent", "users", len(devices))
 }
 

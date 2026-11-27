@@ -49,9 +49,12 @@ func limitDispatcherFactory(ctx context.Context, config interface{}) (interface{
 		return orig, nil
 	}
 	ld := &LimitDispatcher{
-		inner:      orig,
-		innerDisp:  inner,
-		limitedIPs: make(map[string]map[string]int),
+		inner:        orig,
+		innerDisp:    inner,
+		limitedIPs:   make(map[string]map[string]int),
+		unlimitedIPs: make(map[string]map[string]int),
+		userConns:    make(map[string]int),
+		udpIPs:       make(map[string]map[string]int),
 	}
 	globalLimitDispatcher.Store(ld)
 	nlog.Core().Debug("xray: limit dispatcher installed")
@@ -76,28 +79,16 @@ type LimitDispatcher struct {
 	deviceLimits map[string]int            // email → max devices
 	emailToUID   map[string]int            // email → panel user ID
 
-	// unlimitedIPs: users without device limit — sync.Map for lock-free access.
-	// Each entry is *ipCounter{ips sync.Map}.
-	unlimitedIPs sync.Map // email → *ipCounter
+	// connStatsMu protects per-user active TCP+UDP counts, unlimited-user TCP IPs,
+	// and UDP active IPs. Never nested with mu to avoid deadlock and eliminate
+	// sync.Map LoadOrStore/Delete races during rapid TCP/UDP connection handovers;
+	// zero-count entries are deleted immediately to prevent unbounded memory growth.
+	connStatsMu  sync.Mutex
+	unlimitedIPs map[string]map[string]int // email → sourceIP → active TCP refcount (no device limit)
+	udpIPs       map[string]map[string]int // email → sourceIP → active UDP refcount
+	userConns    map[string]int            // email → active TCP+UDP connections
 
 	connCount atomic.Int64 // total active connections tracked by dispatcher
-}
-
-// ipCounter tracks IPs for unlimited users without any lock.
-type ipCounter struct {
-	ips sync.Map // sourceIP → *atomic.Int64 (refcount)
-}
-
-// aliveIPs returns a snapshot of distinct IPs.
-func (ic *ipCounter) aliveIPs() map[string]bool {
-	result := make(map[string]bool)
-	ic.ips.Range(func(key, _ interface{}) bool {
-		if rv, ok := ic.ips.Load(key); ok && rv.(*atomic.Int64).Load() > 0 {
-			result[key.(string)] = true
-		}
-		return true
-	})
-	return result
 }
 
 // ─── routing.Dispatcher ──────────────────────────────────────────────────────
@@ -128,10 +119,15 @@ func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination
 		return err
 	}
 
+	var release func()
 	if email != "" {
-		d.trackLink(link, email, sourceIP, isTCP)
+		release = d.trackLink(link, email, sourceIP, isTCP)
 	}
-	return d.innerDisp.DispatchLink(ctx, dest, link)
+	err = d.innerDisp.DispatchLink(ctx, dest, link)
+	if err != nil && release != nil {
+		release()
+	}
+	return err
 }
 
 // identifyAndCheck extracts user identity from the session context, enforces
@@ -155,21 +151,31 @@ func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destina
 
 // trackLink records connection lifecycle without mutating xray-core owned
 // transport primitives. This keeps mux/XUDP compatible while still allowing
-// the dispatcher to release device-limit state when the link closes.
-func (d *LimitDispatcher) trackLink(link *transport.Link, email, sourceIP string, isTCP bool) {
+// the dispatcher to release device-limit and per-user concurrency state when
+// the link closes.
+func (d *LimitDispatcher) trackLink(link *transport.Link, email, sourceIP string, isTCP bool) func() {
 	d.connCount.Add(1)
+	d.incUserConn(email)
+	if !isTCP && sourceIP != "" {
+		d.addUDPIP(email, sourceIP)
+	}
 
 	onClose := func() {
 		if isTCP {
 			d.delConn(email, sourceIP)
+		} else if sourceIP != "" {
+			d.delUDPIP(email, sourceIP)
 		}
+		d.decUserConn(email)
 		d.connCount.Add(-1)
 	}
 
-	link.Writer = &closeTrackingWriter{
+	w := &closeTrackingWriter{
 		Writer:  link.Writer,
 		onClose: onClose,
 	}
+	link.Writer = w
+	return w.release
 }
 
 // ─── features.Feature (delegated) ───────────────────────────────────────────
@@ -205,19 +211,22 @@ func (d *LimitDispatcher) ResetConns() {
 	d.limitedIPs = make(map[string]map[string]int)
 	d.mu.Unlock()
 
-	// Clear unlimited IPs
-	d.unlimitedIPs.Range(func(key, _ interface{}) bool {
-		d.unlimitedIPs.Delete(key)
-		return true
-	})
+	// Clear unlimited TCP IPs, UDP IPs, and per-user connection counters atomically
+	d.connStatsMu.Lock()
+	d.unlimitedIPs = make(map[string]map[string]int)
+	d.udpIPs = make(map[string]map[string]int)
+	d.userConns = make(map[string]int)
+	d.connStatsMu.Unlock()
 
 	d.connCount.Store(0)
 }
 
-// GetConnectionState returns dispatcher-tracked alive IPs and connection count.
+// GetConnectionState returns dispatcher-tracked alive IPs, per-user active
+// TCP+UDP connection counts, and total connection count.
 // Traffic bytes are intentionally left to xray's built-in stats pipeline.
-func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool, connCount int) {
+func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool, userConns map[int]int, connCount int) {
 	aliveIPs = make(map[int]map[string]bool)
+	userConns = make(map[int]int)
 
 	// Collect IPs from limited users while holding the read lock. limitedIPs and
 	// its inner maps are mutated in place by checkDeviceLimit/delConn under the
@@ -242,29 +251,138 @@ func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool
 	emailToUID := d.emailToUID
 	d.mu.RUnlock()
 
-	// Collect IPs from unlimited users (lock-free).
-	d.unlimitedIPs.Range(func(key, value interface{}) bool {
-		email := key.(string)
+	// Collect unlimited TCP IPs, UDP active IPs, and per-user active TCP+UDP
+	// connection counts together under connStatsMu so rapid TCP/UDP handovers
+	// never observe active connections with a missing source IP.
+	d.connStatsMu.Lock()
+	for email, ips := range d.unlimitedIPs {
 		uid := emailToUID[email]
-		if uid == 0 {
-			return true
+		if uid == 0 || len(ips) == 0 {
+			continue
 		}
-		ic := value.(*ipCounter)
-		if ips := ic.aliveIPs(); len(ips) > 0 {
-			// Merge with limited IPs if any
-			if existing, ok := aliveIPs[uid]; ok {
-				for ip := range ips {
-					existing[ip] = true
-				}
-			} else {
-				aliveIPs[uid] = ips
+		existing := aliveIPs[uid]
+		if existing == nil {
+			existing = make(map[string]bool, len(ips))
+			aliveIPs[uid] = existing
+		}
+		for ip, ref := range ips {
+			if ref > 0 {
+				existing[ip] = true
 			}
 		}
-		return true
-	})
+	}
+	for email, ips := range d.udpIPs {
+		uid := emailToUID[email]
+		if uid == 0 || len(ips) == 0 {
+			continue
+		}
+		existing := aliveIPs[uid]
+		if existing == nil {
+			existing = make(map[string]bool, len(ips))
+			aliveIPs[uid] = existing
+		}
+		for ip, ref := range ips {
+			if ref > 0 {
+				existing[ip] = true
+			}
+		}
+	}
+	for email, cnt := range d.userConns {
+		uid := emailToUID[email]
+		if uid == 0 || cnt <= 0 {
+			continue
+		}
+		userConns[uid] += cnt
+	}
+	d.connStatsMu.Unlock()
 
 	connCount = int(d.connCount.Load())
 	return
+}
+
+func (d *LimitDispatcher) incUserConn(email string) {
+	d.connStatsMu.Lock()
+	if d.userConns == nil {
+		d.userConns = make(map[string]int)
+	}
+	d.userConns[email]++
+	d.connStatsMu.Unlock()
+}
+
+func (d *LimitDispatcher) decUserConn(email string) {
+	d.connStatsMu.Lock()
+	if d.userConns != nil {
+		if n := d.userConns[email] - 1; n > 0 {
+			d.userConns[email] = n
+		} else {
+			delete(d.userConns, email)
+		}
+	}
+	d.connStatsMu.Unlock()
+}
+
+func (d *LimitDispatcher) addUnlimitedIP(email, sourceIP string) {
+	d.connStatsMu.Lock()
+	if d.unlimitedIPs == nil {
+		d.unlimitedIPs = make(map[string]map[string]int)
+	}
+	m := d.unlimitedIPs[email]
+	if m == nil {
+		m = make(map[string]int)
+		d.unlimitedIPs[email] = m
+	}
+	m[sourceIP]++
+	d.connStatsMu.Unlock()
+}
+
+func (d *LimitDispatcher) delUnlimitedIP(email, sourceIP string) bool {
+	d.connStatsMu.Lock()
+	defer d.connStatsMu.Unlock()
+	m := d.unlimitedIPs[email]
+	if m == nil {
+		return false
+	}
+	if _, exists := m[sourceIP]; !exists {
+		return false
+	}
+	if n := m[sourceIP] - 1; n > 0 {
+		m[sourceIP] = n
+	} else {
+		delete(m, sourceIP)
+	}
+	if len(m) == 0 {
+		delete(d.unlimitedIPs, email)
+	}
+	return true
+}
+
+func (d *LimitDispatcher) addUDPIP(email, sourceIP string) {
+	d.connStatsMu.Lock()
+	if d.udpIPs == nil {
+		d.udpIPs = make(map[string]map[string]int)
+	}
+	m := d.udpIPs[email]
+	if m == nil {
+		m = make(map[string]int)
+		d.udpIPs[email] = m
+	}
+	m[sourceIP]++
+	d.connStatsMu.Unlock()
+}
+
+func (d *LimitDispatcher) delUDPIP(email, sourceIP string) {
+	d.connStatsMu.Lock()
+	if m := d.udpIPs[email]; m != nil {
+		if n := m[sourceIP] - 1; n > 0 {
+			m[sourceIP] = n
+		} else {
+			delete(m, sourceIP)
+		}
+		if len(m) == 0 {
+			delete(d.udpIPs, email)
+		}
+	}
+	d.connStatsMu.Unlock()
 }
 
 // ─── Internal helpers ───────────────────────────────────────────────────────
@@ -277,15 +395,10 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) b
 	limit, hasLimit := d.deviceLimits[email]
 	d.mu.RUnlock()
 
-	// Fast path: no device limit — use lock-free sync.Map.
+	// Fast path: no device limit — guarded by connStatsMu (race-free on TCP handover).
 	if !hasLimit || limit <= 0 {
 		if isTCP {
-			v, _ := d.unlimitedIPs.LoadOrStore(email, &ipCounter{})
-			ic := v.(*ipCounter)
-
-			// Increment IP refcount atomically.
-			rv, _ := ic.ips.LoadOrStore(sourceIP, &atomic.Int64{})
-			rv.(*atomic.Int64).Add(1)
+			d.addUnlimitedIP(email, sourceIP)
 		}
 		return false
 	}
@@ -371,15 +484,8 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) b
 
 // delConn decrements the IP refcount when a connection closes.
 func (d *LimitDispatcher) delConn(email, sourceIP string) {
-	// Check if this is an unlimited user first (lock-free).
-	if v, ok := d.unlimitedIPs.Load(email); ok {
-		ic := v.(*ipCounter)
-		if rv, ok := ic.ips.Load(sourceIP); ok {
-			counter := rv.(*atomic.Int64)
-			if counter.Add(-1) <= 0 {
-				ic.ips.Delete(sourceIP)
-			}
-		}
+	// Check unlimited TCP tracking first (atomic decrement+delete under connStatsMu).
+	if d.delUnlimitedIP(email, sourceIP) {
 		return
 	}
 
@@ -403,16 +509,18 @@ type closeTrackingWriter struct {
 	closed  atomic.Bool
 }
 
-func (w *closeTrackingWriter) Close() error {
+func (w *closeTrackingWriter) release() {
 	if w.closed.CompareAndSwap(false, true) {
 		w.onClose()
 	}
+}
+
+func (w *closeTrackingWriter) Close() error {
+	w.release()
 	return common.Close(w.Writer)
 }
 
 func (w *closeTrackingWriter) Interrupt() {
-	if w.closed.CompareAndSwap(false, true) {
-		w.onClose()
-	}
+	w.release()
 	common.Interrupt(w.Writer)
 }

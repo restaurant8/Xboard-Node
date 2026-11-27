@@ -80,13 +80,13 @@ type Kernel interface {
 	UpdateUsers(users []model.UserSpec) (added, removed int, err error)
 
 	// ─── Observability ──────────────────────────────────────────────────
-	// GetUserTraffic returns per-user cumulative traffic counters and
-	// per-user alive IP sets. The kernel maintains these internally using
-	// per-user atomic counters — no per-connection iteration needed.
+	// GetUserTraffic returns per-user cumulative traffic counters, per-user
+	// alive IP sets, and per-user active TCP+UDP connection counts.
 	// aliveIPs maps userID → set of source IPs currently connected.
+	// userConns maps userID → number of active TCP connections + UDP sessions.
 	// traffic maps userID → [upload, download] cumulative bytes.
 	// connCount is the total number of active connections (for metrics).
-	GetUserTraffic(ctx context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error)
+	GetUserTraffic(ctx context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, userConns map[int]int, connCount int, err error)
 	// FlushTrafficStats returns per-user diagnostic traffic details accumulated
 	// since the previous flush. Kernels that cannot expose destination metadata
 	// may return nil.

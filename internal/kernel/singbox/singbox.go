@@ -627,13 +627,13 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 }
 
 // ─── Observability ──────────────────────────────────────────────────────────
-func (s *SingBox) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error) {
+func (s *SingBox) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, userConns map[int]int, connCount int, err error) {
 	ct := s.connTrackerSafe()
 	if ct == nil {
-		return nil, nil, 0, nil
+		return nil, nil, nil, 0, nil
 	}
-	traffic, aliveIPs, connCount = ct.GetUserTraffic()
-	return traffic, aliveIPs, connCount, nil
+	traffic, aliveIPs, userConns, connCount = ct.GetUserTraffic()
+	return traffic, aliveIPs, userConns, connCount, nil
 }
 
 func (s *SingBox) FlushTrafficStats() []report.TrafficStat {

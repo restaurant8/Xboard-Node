@@ -623,12 +623,13 @@ func formatInt36(n int64) string {
 
 // ─── Public API ─────────────────────────────────────────────────────────────
 
-// GetUserTraffic returns per-user cumulative traffic and alive IPs.
-// This is O(users), not O(connections).
-func (t *ConnTracker) GetUserTraffic() (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int) {
+// GetUserTraffic returns per-user cumulative traffic, alive IPs, and active
+// per-user TCP+UDP connection counts. This is O(users), not O(connections).
+func (t *ConnTracker) GetUserTraffic() (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, userConns map[int]int, connCount int) {
 	t.usersMu.RLock()
 	traffic = make(map[int][2]int64, len(t.users))
 	aliveIPs = make(map[int]map[string]bool, len(t.users))
+	userConns = make(map[int]int)
 	for uid, us := range t.users {
 		up := us.upload.Load()
 		down := us.download.Load()
@@ -636,13 +637,18 @@ func (t *ConnTracker) GetUserTraffic() (traffic map[int][2]int64, aliveIPs map[i
 			traffic[uid] = [2]int64{up, down}
 		}
 
-		ips := us.aliveIPList()
-		if ips != nil {
+		us.mu.Lock()
+		if len(us.ips) > 0 {
+			ips := make(map[string]bool, len(us.ips))
+			for ip := range us.ips {
+				ips[ip] = true
+			}
 			aliveIPs[uid] = ips
 		}
-
-		us.mu.Lock()
-		connCount += us.connCount
+		if us.connCount > 0 {
+			userConns[uid] = us.connCount
+			connCount += us.connCount
+		}
 		us.mu.Unlock()
 	}
 	t.usersMu.RUnlock()

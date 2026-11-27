@@ -3,7 +3,6 @@ package xray
 import (
 	"context"
 	"fmt"
-	"sync/atomic"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -66,11 +65,10 @@ func TestXrayGetUserTrafficUsesBuiltInStatsAndDispatcherState(t *testing.T) {
 	ld.mu.Lock()
 	ld.limitedIPs[email1] = map[string]int{"1.1.1.1": 1}
 	ld.mu.Unlock()
-	ref := &atomic.Int64{}
-	ref.Store(1)
-	ic := &ipCounter{}
-	ic.ips.Store("2.2.2.2", ref)
-	ld.unlimitedIPs.Store(email2, ic)
+	ld.addUnlimitedIP(email2, "2.2.2.2")
+	ld.incUserConn(email1)
+	ld.incUserConn(email1)
+	ld.incUserConn(email2)
 	ld.connCount.Store(7)
 
 	x, mgr := newStatsBackedXray(t, users, ld)
@@ -83,12 +81,15 @@ func TestXrayGetUserTrafficUsesBuiltInStatsAndDispatcherState(t *testing.T) {
 	up2.Add(50)
 	down2.Add(80)
 
-	traffic, aliveIPs, connCount, err := x.GetUserTraffic(context.Background())
+	traffic, aliveIPs, userConns, connCount, err := x.GetUserTraffic(context.Background())
 	if err != nil {
 		t.Fatalf("GetUserTraffic() error = %v", err)
 	}
 	if connCount != 7 {
 		t.Fatalf("connCount = %d, want 7", connCount)
+	}
+	if userConns[1] != 2 || userConns[2] != 1 {
+		t.Fatalf("userConns = %#v, want map[1:2 2:1]", userConns)
 	}
 	if got := traffic[1]; got != [2]int64{100, 200} {
 		t.Fatalf("traffic[1] = %v, want [100 200]", got)
@@ -105,7 +106,7 @@ func TestXrayGetUserTrafficUsesBuiltInStatsAndDispatcherState(t *testing.T) {
 
 	up1.Add(30)
 	down1.Add(40)
-	traffic, _, _, err = x.GetUserTraffic(context.Background())
+	traffic, _, _, _, err = x.GetUserTraffic(context.Background())
 	if err != nil {
 		t.Fatalf("second GetUserTraffic() error = %v", err)
 	}

@@ -61,6 +61,7 @@ type ReportPayload struct {
 	TrafficStats []report.TrafficStat
 	Alive        map[int][]string
 	Online       map[int]int
+	UserConns    map[int]int
 	CPU          float64
 	Mem          [2]uint64
 	Swap         [2]uint64
@@ -71,7 +72,7 @@ type ReportPayload struct {
 type PushClient interface {
 	Run(ctx context.Context)
 	IsConnected() bool
-	SendDeviceReport(devices map[int][]string)
+	SendDeviceReport(devices map[int][]string) bool
 }
 
 type Source interface {
@@ -85,7 +86,7 @@ type Source interface {
 
 type Sink interface {
 	Report(payload ReportPayload) error
-	ReportDevices(push PushClient, devices map[int][]string)
+	ReportDevices(push PushClient, devices map[int][]string) bool
 	SupportsReporting() bool
 	SupportsDeviceReports() bool
 }

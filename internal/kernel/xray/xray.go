@@ -226,9 +226,9 @@ func tlsEqual(a, b kernel.TLSCert) bool {
 // stats pipeline and connection state from the admission dispatcher when
 // available. The dispatcher intentionally no longer wraps transport links,
 // so traffic accounting must come from xray-core itself.
-func (x *Xray) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error) {
+func (x *Xray) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, userConns map[int]int, connCount int, err error) {
 	if !x.running.Load() {
-		return nil, nil, 0, nil
+		return nil, nil, nil, 0, nil
 	}
 
 	x.mu.Lock()
@@ -236,13 +236,13 @@ func (x *Xray) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliv
 	traffic, err = x.aggregateStats()
 	x.mu.Unlock()
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, nil, 0, err
 	}
 
 	if ld != nil {
-		aliveIPs, connCount = ld.GetConnectionState()
+		aliveIPs, userConns, connCount = ld.GetConnectionState()
 	}
-	return traffic, aliveIPs, connCount, nil
+	return traffic, aliveIPs, userConns, connCount, nil
 }
 
 func (x *Xray) FlushTrafficStats() []report.TrafficStat {

@@ -6,8 +6,17 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cedar2025/xboard-node/internal/nlog"
+)
+
+// defaultAliveRefreshInterval forces a periodic resend of non-empty alive IPs
+// even when the IP set has not changed, keeping panel-side 300s device state
+// fresh for long-lived connections.
+const (
+	defaultAliveRefreshInterval = 120 * time.Second
+	dirtyAliveIPsHash           = "__dirty__"
 )
 
 // snapshot is an immutable point-in-time view of tracker state.
@@ -15,7 +24,8 @@ import (
 type snapshot struct {
 	traffic   map[int][2]int64        // userID → [upload, download] delta
 	aliveIPs  map[int]map[string]bool // userID → set of source IPs
-	online    map[int]int             // userID → distinct IP count
+	online    map[int]int             // userID → distinct IP count (legacy)
+	userConns map[int]int             // userID → active TCP connections + UDP sessions (nil = unsupported)
 	connCount int
 	inSpeed   int64
 	outSpeed  int64
@@ -56,6 +66,12 @@ type Tracker struct {
 	// lastAliveIPsHash detects changes to avoid duplicate reports.
 	lastAliveIPsHash string
 
+	// lastAliveFlushAt tracks when alive IPs were last emitted so non-empty
+	// snapshots are periodically re-sent before panel-side TTL (300s) expires.
+	lastAliveFlushAt     time.Time
+	aliveRefreshInterval time.Duration
+	nowFunc              func() time.Time
+
 	// intervalSec is the Process() tick interval in seconds, used to convert
 	// per-cycle byte deltas into bytes/second. Defaults to 10; override with
 	// SetIntervalSeconds to match the configured track_interval.
@@ -64,10 +80,12 @@ type Tracker struct {
 
 func New() *Tracker {
 	t := &Tracker{
-		lastSeen:       make(map[int][2]int64),
-		pendingTraffic: make(map[int][2]int64),
-		aliveIPsBuf:    make(map[int][]string),
-		intervalSec:    10,
+		lastSeen:             make(map[int][2]int64),
+		pendingTraffic:       make(map[int][2]int64),
+		aliveIPsBuf:          make(map[int][]string),
+		aliveRefreshInterval: defaultAliveRefreshInterval,
+		nowFunc:              time.Now,
+		intervalSec:          10,
 	}
 	// Publish initial empty snapshot.
 	t.live.Store(&snapshot{
@@ -91,11 +109,23 @@ func (t *Tracker) SetIntervalSeconds(sec int) {
 // Process computes per-user traffic deltas from cumulative kernel counters.
 // Also stores alive IPs and connection count. O(users).
 //
-// This is the only writer to lastSeen and pendingTraffic.
-// After computing deltas, it publishes a new snapshot for lock-free reads.
+// Kept for callers/tests that do not supply per-user concurrency counts;
+// production callers should use ProcessWithUserConns.
 func (t *Tracker) Process(
 	cumTraffic map[int][2]int64,
 	kernelAliveIPs map[int]map[string]bool,
+	connCount int,
+) {
+	t.ProcessWithUserConns(cumTraffic, kernelAliveIPs, nil, connCount)
+}
+
+// ProcessWithUserConns computes per-user traffic deltas and atomically
+// publishes alive IPs, legacy distinct-IP online counts, and per-user
+// active TCP+UDP connection counts.
+func (t *Tracker) ProcessWithUserConns(
+	cumTraffic map[int][2]int64,
+	kernelAliveIPs map[int]map[string]bool,
+	kernelUserConns map[int]int,
 	connCount int,
 ) {
 	t.mu.Lock()
@@ -142,10 +172,22 @@ func (t *Tracker) Process(
 		}
 	}
 
-	// Compute online from alive IPs.
+	// Compute legacy online from alive IPs (distinct IP count).
 	online := make(map[int]int, len(kernelAliveIPs))
 	for uid, ips := range kernelAliveIPs {
 		online[uid] = len(ips)
+	}
+
+	// Preserve non-nil empty map when kernel explicitly reported 0 active user connections
+	// so the panel can immediately zero out the node instance instead of waiting for TTL.
+	var userConns map[int]int
+	if kernelUserConns != nil {
+		userConns = make(map[int]int, len(kernelUserConns))
+		for uid, count := range kernelUserConns {
+			if count > 0 {
+				userConns[uid] = count
+			}
+		}
 	}
 
 	// Publish new snapshot (readers will see this atomically).
@@ -153,6 +195,7 @@ func (t *Tracker) Process(
 		traffic:   copyTrafficMap(t.pendingTraffic),
 		aliveIPs:  kernelAliveIPs, // kernel provides fresh copy each tick
 		online:    online,
+		userConns: userConns,
 		connCount: connCount,
 		inSpeed:   cycleIn,
 		outSpeed:  cycleOut,
@@ -189,22 +232,37 @@ func (t *Tracker) HasTraffic() bool {
 }
 
 // FlushAliveIPs returns per-user alive IPs.
-// Reuses internal buffer. Returns nil if unchanged.
+// Reuses internal buffer. Returns nil when unchanged, except that non-empty
+// active IP sets are periodically re-emitted (every 120s by default) so
+// long-lived connections do not expire from the panel's 300s device cache.
 func (t *Tracker) FlushAliveIPs() map[int][]string {
 	s := t.live.Load()
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	nowFn := t.nowFunc
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	now := nowFn()
+	refreshInterval := t.aliveRefreshInterval
+	if refreshInterval <= 0 {
+		refreshInterval = defaultAliveRefreshInterval
+	}
+
 	// Calculate hash of current aliveIPs
 	currentHash := calcAliveIPsHash(s.aliveIPs)
 
-	// If no changes, return nil to avoid duplicate reporting
+	// If no changes, only emit when non-empty and refresh interval has elapsed.
 	if currentHash == t.lastAliveIPsHash {
-		return nil
+		if len(s.aliveIPs) == 0 || t.lastAliveFlushAt.IsZero() || now.Sub(t.lastAliveFlushAt) < refreshInterval {
+			return nil
+		}
 	}
 
 	t.lastAliveIPsHash = currentHash
+	t.lastAliveFlushAt = now
 
 	// Clear old buffer entries.
 	for k := range t.aliveIPsBuf {
@@ -282,11 +340,39 @@ func (t *Tracker) CurrentOnline() map[int]int {
 	return cp
 }
 
-// RestoreAliveIPs merges alive IPs back in (used when push to panel fails).
-// Note: this operates on the buffer, which will be overwritten next Process().
+// CurrentUserConns returns a snapshot copy of user_id → active TCP+UDP connections.
+// Returns nil when the underlying kernel has not produced a per-user connection
+// snapshot; returns a non-nil empty map when all connections have drained to zero.
+func (t *Tracker) CurrentUserConns() map[int]int {
+	s := t.live.Load()
+	if s.userConns == nil {
+		return nil
+	}
+	cp := make(map[int]int, len(s.userConns))
+	for k, v := range s.userConns {
+		if v > 0 {
+			cp[k] = v
+		}
+	}
+	return cp
+}
+
+// MarkAliveDirty forces the next FlushAliveIPs call to emit the current
+// alive IP snapshot (including an empty drain map) even if s.aliveIPs has not
+// changed since the failed attempt.
+func (t *Tracker) MarkAliveDirty() {
+	t.mu.Lock()
+	t.lastAliveIPsHash = dirtyAliveIPsHash
+	t.mu.Unlock()
+}
+
+// RestoreAliveIPs merges alive IPs back in and marks the alive snapshot dirty
+// so the next report / WS flush retries sending the latest state (including an
+// empty drain map when all connections have closed).
 func (t *Tracker) RestoreAliveIPs(data map[int][]string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.lastAliveIPsHash = dirtyAliveIPsHash
 	for uid, ipList := range data {
 		ips := t.aliveIPsBuf[uid]
 		if ips == nil {

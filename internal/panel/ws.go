@@ -125,6 +125,7 @@ type WSClientConfig struct {
 	BackoffInitial   time.Duration
 	BackoffMax       time.Duration
 	MachineID        int
+	InstanceID       string
 }
 
 // WSClient connects to the panel's Workerman WS server using native WebSocket.
@@ -243,6 +244,9 @@ func (w *WSClient) connect(ctx context.Context) error {
 		q.Set("machine_id", strconv.Itoa(w.cfg.MachineID))
 	} else {
 		q.Set("node_id", strconv.Itoa(w.nodeID))
+		if w.cfg.InstanceID != "" {
+			q.Set("instance_id", w.cfg.InstanceID)
+		}
 	}
 	u.RawQuery = q.Encode()
 
@@ -530,15 +534,16 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 }
 
 // SendDeviceReport sends local device snapshot to panel via WS.
-func (w *WSClient) SendDeviceReport(devices map[int][]string) {
-	w.SendDeviceReportForNode(0, devices)
+// Returns false if WS is disconnected or the outbound write queue is full.
+func (w *WSClient) SendDeviceReport(devices map[int][]string) bool {
+	return w.SendDeviceReportForNode(0, devices)
 }
 
 // SendDeviceReportForNode sends a device report tagged with a specific node_id.
 // nodeID == 0 omits the field (legacy single-node mode).
-func (w *WSClient) SendDeviceReportForNode(nodeID int, devices map[int][]string) {
+func (w *WSClient) SendDeviceReportForNode(nodeID int, devices map[int][]string) bool {
 	if !w.connected.Load() {
-		return
+		return false
 	}
 
 	var payload interface{}
@@ -550,7 +555,7 @@ func (w *WSClient) SendDeviceReportForNode(nodeID int, devices map[int][]string)
 
 	d, err := json.Marshal(payload)
 	if err != nil {
-		return
+		return false
 	}
 	msg := wsMessage{
 		Event:     WSEventReportDevices,
@@ -560,12 +565,14 @@ func (w *WSClient) SendDeviceReportForNode(nodeID int, devices map[int][]string)
 
 	chp := w.writeCh.Load()
 	if chp == nil {
-		return
+		return false
 	}
 	select {
 	case *chp <- msg:
+		return true
 	default:
 		nlog.Core().Warn("ws write channel full, skipping device report")
+		return false
 	}
 }
 
@@ -596,8 +603,13 @@ func (w *WSClient) SendNodeStatus(nodeID int, stats map[string]interface{}) {
 
 // SendRaw sends a raw message to the panel via WebSocket.
 func (w *WSClient) SendRaw(event string, data json.RawMessage) {
+	_ = w.TrySendRaw(event, data)
+}
+
+// TrySendRaw sends a raw message and reports whether it was enqueued.
+func (w *WSClient) TrySendRaw(event string, data json.RawMessage) bool {
 	if !w.connected.Load() {
-		return
+		return false
 	}
 
 	msg := wsMessage{
@@ -608,11 +620,13 @@ func (w *WSClient) SendRaw(event string, data json.RawMessage) {
 
 	chp := w.writeCh.Load()
 	if chp == nil {
-		return
+		return false
 	}
 	select {
 	case *chp <- msg:
+		return true
 	default:
 		nlog.Core().Warn("ws write channel full, skipping raw message", "event", event)
+		return false
 	}
 }

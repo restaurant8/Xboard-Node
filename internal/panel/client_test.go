@@ -226,6 +226,7 @@ func TestReportIncludesTrafficStats(t *testing.T) {
 		stats,
 		nil,
 		nil,
+		map[int]int{1: 50},
 		0,
 		[2]uint64{},
 		[2]uint64{},
@@ -239,6 +240,13 @@ func TestReportIncludesTrafficStats(t *testing.T) {
 	if received["report_id"] != "report-1" {
 		t.Fatalf("report_id = %v", received["report_id"])
 	}
+	if received["instance_id"] == "" {
+		t.Fatalf("expected non-empty instance_id, got %#v", received["instance_id"])
+	}
+	rawUserConns, ok := received["user_conns"].(map[string]interface{})
+	if !ok || rawUserConns["1"].(float64) != 50 {
+		t.Fatalf("user_conns = %#v, want {\"1\":50}", received["user_conns"])
+	}
 	rawStats, ok := received["traffic_stats"].([]interface{})
 	if !ok || len(rawStats) != 1 {
 		t.Fatalf("traffic_stats = %#v", received["traffic_stats"])
@@ -249,6 +257,62 @@ func TestReportIncludesTrafficStats(t *testing.T) {
 	}
 	if first["u"].(float64) != 1024 || first["d"].(float64) != 2048 {
 		t.Fatalf("traffic stats bytes = %#v", first)
+	}
+}
+
+func TestReportSendsEmptyUserConnsMapToZeroOutPanel(t *testing.T) {
+	var received map[string]interface{}
+	ts, client := newTestServer(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	defer ts.Close()
+
+	err := client.Report(
+		"",
+		nil,
+		nil,
+		map[int][]string{},
+		nil,
+		map[int]int{},
+		0,
+		[2]uint64{},
+		[2]uint64{},
+		[2]uint64{},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+	rawUserConns, ok := received["user_conns"].(map[string]interface{})
+	if !ok || len(rawUserConns) != 0 {
+		t.Fatalf("expected empty user_conns object, got %#v", received["user_conns"])
+	}
+	rawAlive, ok := received["alive"].(map[string]interface{})
+	if !ok || len(rawAlive) != 0 {
+		t.Fatalf("expected empty alive object, got %#v", received["alive"])
+	}
+}
+
+func TestStableInstanceID_RestartConsistentAndOverrides(t *testing.T) {
+	cfg := config.PanelConfig{URL: "http://127.0.0.1", Token: "tok", NodeID: 7, NodeType: "vless"}
+	c1 := NewClient(cfg)
+	c2 := NewClient(cfg)
+	if c1.instanceID == "" || c1.instanceID != c2.instanceID {
+		t.Fatalf("expected restart-stable instanceID, got %q vs %q", c1.instanceID, c2.instanceID)
+	}
+
+	mc := NewClient(config.PanelConfig{URL: "http://127.0.0.1", Token: "tok", MachineID: 12})
+	if mc.instanceID != "machine-12" {
+		t.Fatalf("machine mode instanceID = %q, want machine-12", mc.instanceID)
+	}
+
+	t.Setenv("XBOARD_INSTANCE_ID", "edge-pod-a")
+	ec := NewClient(cfg)
+	if ec.instanceID != "edge-pod-a" {
+		t.Fatalf("env override instanceID = %q, want edge-pod-a", ec.instanceID)
 	}
 }
 

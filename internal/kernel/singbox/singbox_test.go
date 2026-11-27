@@ -94,12 +94,15 @@ func TestConnTrackerRoutedConnectionTracksTrafficAndAliveIPs(t *testing.T) {
 		t.Fatalf("Write() error = %v", err)
 	}
 
-	traffic, aliveIPs, connCount := tracker.GetUserTraffic()
+	traffic, aliveIPs, userConns, connCount := tracker.GetUserTraffic()
 	if got := traffic[1]; got != [2]int64{5, 3} {
 		t.Fatalf("traffic[1] = %v, want [5 3]", got)
 	}
 	if !aliveIPs[1]["1.1.1.1"] {
 		t.Fatal("expected alive IP to include source address")
+	}
+	if userConns[1] != 1 {
+		t.Fatalf("userConns[1] = %d, want 1", userConns[1])
 	}
 	if connCount != 1 {
 		t.Fatalf("connCount = %d, want 1", connCount)
@@ -108,9 +111,12 @@ func TestConnTrackerRoutedConnectionTracksTrafficAndAliveIPs(t *testing.T) {
 	if err := wrapped.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-	_, aliveIPs, connCount = tracker.GetUserTraffic()
+	_, aliveIPs, userConns, connCount = tracker.GetUserTraffic()
 	if aliveIPs[1] != nil {
 		t.Fatalf("aliveIPs after close = %v, want nil", aliveIPs[1])
+	}
+	if userConns[1] != 0 {
+		t.Fatalf("userConns[1] after close = %d, want 0", userConns[1])
 	}
 	if connCount != 0 {
 		t.Fatalf("connCount after close = %d, want 0", connCount)

@@ -142,16 +142,17 @@ func (p *MachinePanelControlPlane) Discover(
 
 func (p *MachinePanelControlPlane) Report(payload ReportPayload) error {
 	return p.client.Report(
-		payload.ReportID, payload.Traffic, payload.TrafficStats, payload.Alive, payload.Online,
+		payload.ReportID, payload.Traffic, payload.TrafficStats, payload.Alive, payload.Online, payload.UserConns,
 		payload.CPU, payload.Mem, payload.Swap, payload.Disk,
 		payload.Metrics,
 	)
 }
 
-func (p *MachinePanelControlPlane) ReportDevices(push PushClient, devices map[int][]string) {
-	if push != nil {
-		push.SendDeviceReport(devices)
+func (p *MachinePanelControlPlane) ReportDevices(push PushClient, devices map[int][]string) bool {
+	if push == nil {
+		return false
 	}
+	return push.SendDeviceReport(devices)
 }
 
 func (p *MachinePanelControlPlane) Metrics() APIMetrics {

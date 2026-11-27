@@ -85,9 +85,9 @@ func (f *fakeKernel) UpdateUsers(users []model.UserSpec) (int, int, error) {
 	}
 	return len(users), 0, nil
 }
-func (f *fakeKernel) GetUserTraffic(ctx context.Context) (map[int][2]int64, map[int]map[string]bool, int, error) {
+func (f *fakeKernel) GetUserTraffic(ctx context.Context) (map[int][2]int64, map[int]map[string]bool, map[int]int, int, error) {
 	_ = ctx
-	return nil, nil, 0, nil
+	return nil, nil, nil, 0, nil
 }
 func (f *fakeKernel) FlushTrafficStats() []report.TrafficStat {
 	stats := f.trafficStats

@@ -2,6 +2,7 @@ package tracker
 
 import (
 	"testing"
+	"time"
 )
 
 func TestProcess_InitialTraffic(t *testing.T) {
@@ -168,6 +169,49 @@ func TestFlushAliveIPs(t *testing.T) {
 	flushed2 := tr.FlushAliveIPs()
 	if flushed2 != nil {
 		t.Errorf("expected nil on duplicate flush, got %v", flushed2)
+	}
+}
+
+func TestFlushAliveIPs_PeriodicRefreshBeforePanelTTL(t *testing.T) {
+	tr := New()
+	now := time.Unix(1700000000, 0)
+	tr.nowFunc = func() time.Time { return now }
+	tr.aliveRefreshInterval = 120 * time.Second
+
+	tr.ProcessWithUserConns(
+		map[int][2]int64{1: {100, 200}},
+		map[int]map[string]bool{1: {"198.51.100.7": true}},
+		map[int]int{1: 10},
+		10,
+	)
+
+	first := tr.FlushAliveIPs()
+	if len(first[1]) != 1 || first[1][0] != "198.51.100.7" {
+		t.Fatalf("first flush = %#v, want user 1 IP", first)
+	}
+
+	// Within refresh interval: unchanged IP set returns nil.
+	now = now.Add(60 * time.Second)
+	if second := tr.FlushAliveIPs(); second != nil {
+		t.Fatalf("flush at +60s = %#v, want nil", second)
+	}
+
+	// At refresh interval (+120s total): non-empty IP set is re-emitted to keep panel TTL fresh.
+	now = now.Add(60 * time.Second)
+	refreshed := tr.FlushAliveIPs()
+	if len(refreshed[1]) != 1 || refreshed[1][0] != "198.51.100.7" {
+		t.Fatalf("refresh flush at +120s = %#v, want user 1 IP", refreshed)
+	}
+
+	// After all connections drain to zero: returns non-nil empty map once, then stays nil even after +120s.
+	tr.ProcessWithUserConns(map[int][2]int64{}, map[int]map[string]bool{}, map[int]int{}, 0)
+	drained := tr.FlushAliveIPs()
+	if drained == nil || len(drained) != 0 {
+		t.Fatalf("drain flush = %#v, want empty non-nil map", drained)
+	}
+	now = now.Add(300 * time.Second)
+	if idle := tr.FlushAliveIPs(); idle != nil {
+		t.Fatalf("idle flush after drain = %#v, want nil", idle)
 	}
 }
 

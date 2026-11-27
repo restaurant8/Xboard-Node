@@ -1,10 +1,11 @@
 package xray
 
 import (
-	"sync/atomic"
+	"sync"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/model"
+	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/transport"
 )
@@ -106,27 +107,24 @@ func TestLimitDispatcher_GetConnectionState(t *testing.T) {
 	email2 := userEmail(2)
 	ld.UpdateLimits(map[string]int{email1: 1, email2: 2}, nil, nil)
 
-	ic1 := &ipCounter{}
-	r1 := &atomic.Int64{}
-	r1.Store(1)
-	ic1.ips.Store("1.1.1.1", r1)
-	r2 := &atomic.Int64{}
-	r2.Store(1)
-	ic1.ips.Store("2.2.2.2", r2)
-	ld.unlimitedIPs.Store(email1, ic1)
+	ld.addUnlimitedIP(email1, "1.1.1.1")
+	ld.addUnlimitedIP(email1, "2.2.2.2")
+	ld.addUnlimitedIP(email2, "3.3.3.3")
 
-	ic2 := &ipCounter{}
-	r3 := &atomic.Int64{}
-	r3.Store(1)
-	ic2.ips.Store("3.3.3.3", r3)
-	ld.unlimitedIPs.Store(email2, ic2)
-
+	ld.incUserConn(email1)
+	ld.incUserConn(email1)
+	ld.incUserConn(email1)
+	ld.incUserConn(email2)
+	ld.incUserConn(email2)
 	ld.connCount.Store(5)
 
-	aliveIPs, connCount := ld.GetConnectionState()
+	aliveIPs, userConns, connCount := ld.GetConnectionState()
 
 	if connCount != 5 {
 		t.Errorf("expected connCount=5, got %d", connCount)
+	}
+	if userConns[1] != 3 || userConns[2] != 2 {
+		t.Errorf("userConns = %#v, want map[1:3 2:2]", userConns)
 	}
 	if len(aliveIPs[1]) != 2 {
 		t.Errorf("user 1 IPs: got %d, want 2", len(aliveIPs[1]))
@@ -134,6 +132,81 @@ func TestLimitDispatcher_GetConnectionState(t *testing.T) {
 	if len(aliveIPs[2]) != 1 {
 		t.Errorf("user 2 IPs: got %d, want 1", len(aliveIPs[2]))
 	}
+}
+
+func TestLimitDispatcher_PerUserTCPAndUDPConcurrencyLifecycle(t *testing.T) {
+	ld := newTestDispatcher()
+	email := userEmail(42)
+	ld.UpdateLimits(map[string]int{email: 42}, nil, nil)
+
+	// Same IP opens 40 TCP connections + 10 UDP sessions => 1 IP, 50 concurrent connections.
+	tcpLinks := make([]*transport.Link, 0, 40)
+	for i := 0; i < 40; i++ {
+		if ld.checkDeviceLimit(email, "198.51.100.7", true) {
+			t.Fatalf("unexpected TCP reject at %d", i)
+		}
+		link := &transport.Link{Writer: &noopBufWriter{}}
+		ld.trackLink(link, email, "198.51.100.7", true)
+		tcpLinks = append(tcpLinks, link)
+	}
+	udpLinks := make([]*transport.Link, 0, 10)
+	for i := 0; i < 10; i++ {
+		link := &transport.Link{Writer: &noopBufWriter{}}
+		ld.trackLink(link, email, "198.51.100.7", false)
+		udpLinks = append(udpLinks, link)
+	}
+
+	aliveIPs, userConns, connCount := ld.GetConnectionState()
+	if len(aliveIPs[42]) != 1 || !aliveIPs[42]["198.51.100.7"] {
+		t.Fatalf("aliveIPs[42] = %#v, want 1 IP", aliveIPs[42])
+	}
+	if userConns[42] != 50 || connCount != 50 {
+		t.Fatalf("got userConns=%d connCount=%d, want 50/50", userConns[42], connCount)
+	}
+
+	// Close 20 TCP connections => 30 concurrent connections, IP still 1.
+	for i := 0; i < 20; i++ {
+		_ = common.Close(tcpLinks[i].Writer)
+	}
+	aliveIPs, userConns, connCount = ld.GetConnectionState()
+	if len(aliveIPs[42]) != 1 {
+		t.Fatalf("aliveIPs[42] after closing 20 TCP = %#v, want 1", aliveIPs[42])
+	}
+	if userConns[42] != 30 || connCount != 30 {
+		t.Fatalf("after closing 20 TCP got userConns=%d connCount=%d, want 30/30", userConns[42], connCount)
+	}
+
+	// Close remaining 20 TCP connections => 10 UDP sessions still keep IP=1 and conns=10.
+	for i := 20; i < 40; i++ {
+		_ = common.Close(tcpLinks[i].Writer)
+	}
+	aliveIPs, userConns, connCount = ld.GetConnectionState()
+	if len(aliveIPs[42]) != 1 || userConns[42] != 10 || connCount != 10 {
+		t.Fatalf("with 10 UDP left got ips=%#v userConns=%d connCount=%d", aliveIPs[42], userConns[42], connCount)
+	}
+
+	// Close all UDP sessions => drains to 0 and cleans up map keys (no memory retention).
+	for _, l := range udpLinks {
+		_ = common.Close(l.Writer)
+	}
+	aliveIPs, userConns, connCount = ld.GetConnectionState()
+	if len(aliveIPs[42]) != 0 || userConns[42] != 0 || connCount != 0 {
+		t.Fatalf("after closing all got ips=%#v userConns=%d connCount=%d, want 0", aliveIPs[42], userConns[42], connCount)
+	}
+	ld.connStatsMu.Lock()
+	remainingUserConns := len(ld.userConns)
+	remainingUDPIPs := len(ld.udpIPs)
+	ld.connStatsMu.Unlock()
+	if remainingUserConns != 0 || remainingUDPIPs != 0 {
+		t.Fatalf("stale keys retained after drain: userConns=%d udpIPs=%d", remainingUserConns, remainingUDPIPs)
+	}
+}
+
+type noopBufWriter struct{}
+
+func (noopBufWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	buf.ReleaseMulti(mb)
+	return nil
 }
 
 func TestLimitDispatcher_ResetConns(t *testing.T) {
@@ -174,14 +247,67 @@ func TestLimitDispatcher_UnlimitedUserFastPath(t *testing.T) {
 	}
 
 	// Verify IPs are tracked in unlimitedIPs
-	v, ok := ld.unlimitedIPs.Load(email)
-	if !ok {
-		t.Error("unlimited user should have entry in unlimitedIPs")
-	}
-	ic := v.(*ipCounter)
-	ips := ic.aliveIPs()
-	if len(ips) == 0 {
+	aliveIPs, _, _ := ld.GetConnectionState()
+	if len(aliveIPs[1]) == 0 {
 		t.Error("should have tracked some IPs")
+	}
+}
+
+// TestLimitDispatcher_UnlimitedTCPHandoverNoIPLoss verifies that rapid concurrent
+// close-old / open-new TCP handovers on the same IP for an unlimited user never
+// lose the active source IP (regression for the sync.Map LoadOrStore/Delete race).
+func TestLimitDispatcher_UnlimitedTCPHandoverNoIPLoss(t *testing.T) {
+	ld := newTestDispatcher()
+	email := userEmail(99)
+	ld.UpdateLimits(map[string]int{email: 99}, nil, nil)
+	const ip = "198.51.100.99"
+
+	for round := 0; round < 5; round++ {
+		if ld.checkDeviceLimit(email, ip, true) {
+			t.Fatalf("round %d: initial TCP rejected", round)
+		}
+		cur := &transport.Link{Writer: &noopBufWriter{}}
+		ld.trackLink(cur, email, ip, true)
+
+		for step := 0; step < 200; step++ {
+			prev := cur
+			next := &transport.Link{Writer: &noopBufWriter{}}
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				_ = common.Close(prev.Writer)
+			}()
+			go func() {
+				defer wg.Done()
+				ld.checkDeviceLimit(email, ip, true)
+				ld.trackLink(next, email, ip, true)
+			}()
+			wg.Wait()
+			cur = next
+
+			aliveIPs, userConns, _ := ld.GetConnectionState()
+			if userConns[99] != 1 {
+				t.Fatalf("round %d step %d: userConns=%d, want 1", round, step, userConns[99])
+			}
+			if !aliveIPs[99][ip] {
+				t.Fatalf("round %d step %d: active TCP connection present (userConns=1) but IP %s missing from aliveIPs=%#v", round, step, ip, aliveIPs[99])
+			}
+		}
+
+		_ = common.Close(cur.Writer)
+		aliveIPs, userConns, _ := ld.GetConnectionState()
+		if len(aliveIPs[99]) != 0 || userConns[99] != 0 {
+			t.Fatalf("round %d: expected clean drain after final close, got ips=%#v conns=%d", round, aliveIPs[99], userConns[99])
+		}
+	}
+
+	ld.connStatsMu.Lock()
+	remUnlimited := len(ld.unlimitedIPs)
+	remConns := len(ld.userConns)
+	ld.connStatsMu.Unlock()
+	if remUnlimited != 0 || remConns != 0 {
+		t.Fatalf("expected zero retained keys after drain, got unlimitedIPs=%d userConns=%d", remUnlimited, remConns)
 	}
 }
 

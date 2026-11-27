@@ -2,11 +2,14 @@ package panel
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -35,6 +38,7 @@ type Client struct {
 	nodeID     int
 	nodeType   string
 	machineID  int
+	instanceID string
 	httpClient *http.Client
 
 	configETag string
@@ -44,14 +48,41 @@ type Client struct {
 	apiFailure atomic.Uint64
 }
 
+// stableInstanceID derives a restart-stable identity for this node process so
+// multi-instance deployments sharing a node_id sum cleanly without causing
+// temporary double-counting when a single instance restarts.
+func stableInstanceID(cfg config.PanelConfig) string {
+	if env := strings.TrimSpace(os.Getenv("XBOARD_INSTANCE_ID")); env != "" {
+		return env
+	}
+	if cfg.MachineID > 0 {
+		return "machine-" + strconv.Itoa(cfg.MachineID)
+	}
+	host := ""
+	if b, err := os.ReadFile("/etc/machine-id"); err == nil {
+		host = strings.TrimSpace(string(b))
+	}
+	if host == "" {
+		if h, err := os.Hostname(); err == nil {
+			host = strings.TrimSpace(h)
+		}
+	}
+	if host == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%s", host, cfg.NodeID, cfg.NodeType)))
+	return hex.EncodeToString(sum[:8])
+}
+
 // NewClient creates a new panel API client.
 func NewClient(cfg config.PanelConfig) *Client {
 	return &Client{
-		baseURL:   strings.TrimRight(cfg.URL, "/"),
-		token:     cfg.Token,
-		nodeID:    cfg.NodeID,
-		nodeType:  cfg.NodeType,
-		machineID: cfg.MachineID,
+		baseURL:    strings.TrimRight(cfg.URL, "/"),
+		token:      cfg.Token,
+		nodeID:     cfg.NodeID,
+		nodeType:   cfg.NodeType,
+		machineID:  cfg.MachineID,
+		instanceID: stableInstanceID(cfg),
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
@@ -64,7 +95,7 @@ func NewClient(cfg config.PanelConfig) *Client {
 }
 
 // ForNode returns a new client bound to a specific node_id, sharing the
-// same base URL, auth and HTTP transport. ETags and metric counters start fresh.
+// same base URL, auth, instance identity and HTTP transport. ETags and metric counters start fresh.
 func (c *Client) ForNode(nodeID int) *Client {
 	return &Client{
 		baseURL:    c.baseURL,
@@ -72,8 +103,15 @@ func (c *Client) ForNode(nodeID int) *Client {
 		nodeID:     nodeID,
 		nodeType:   c.nodeType,
 		machineID:  c.machineID,
+		instanceID: c.instanceID,
 		httpClient: c.httpClient,
 	}
+}
+
+// InstanceID returns the restart-stable instance identifier used to bucket
+// per-instance connection and device reports on the panel across HTTP and WS.
+func (c *Client) InstanceID() string {
+	return c.instanceID
 }
 
 // ResetConfigETag clears the cached config ETag so the next GetConfig call
@@ -107,11 +145,15 @@ func (c *Client) Handshake() (*HandshakeResponse, error) {
 // The optional metrics map allows the node to submit richer telemetry
 // (active connections, per-core CPU, GC stats, limiter hits, etc.)
 // without changing the core schema of status.
-func (c *Client) Report(reportID string, traffic map[int][2]int64, trafficStats []report.TrafficStat, alive map[int][]string, online map[int]int,
+func (c *Client) Report(reportID string, traffic map[int][2]int64, trafficStats []report.TrafficStat, alive map[int][]string, online map[int]int, userConns map[int]int,
 	cpu float64, mem, swap, disk [2]uint64,
 	metrics map[string]interface{},
 ) error {
 	payload := make(map[string]interface{})
+
+	if c.instanceID != "" {
+		payload["instance_id"] = c.instanceID
+	}
 
 	if reportID != "" && (len(traffic) > 0 || len(trafficStats) > 0) {
 		payload["report_id"] = reportID
@@ -135,7 +177,7 @@ func (c *Client) Report(reportID string, traffic map[int][2]int64, trafficStats 
 		payload["traffic_stats"] = trafficStats
 	}
 
-	if len(alive) > 0 {
+	if alive != nil {
 		a := aliveMapPool.Get().(map[string][]string)
 		for uid, ips := range alive {
 			a[strconv.Itoa(uid)] = ips
@@ -161,6 +203,19 @@ func (c *Client) Report(reportID string, traffic map[int][2]int64, trafficStats 
 			}
 			onlineMapPool.Put(o)
 		}()
+	}
+
+	// Send user_conns whenever non-nil (including empty map {}) so the panel
+	// distinguishes "reported 0 active connections" from legacy nodes that do
+	// not report per-user concurrency at all.
+	if userConns != nil {
+		uc := make(map[string]int, len(userConns))
+		for uid, count := range userConns {
+			if count > 0 {
+				uc[strconv.Itoa(uid)] = count
+			}
+		}
+		payload["user_conns"] = uc
 	}
 
 	status := map[string]interface{}{
